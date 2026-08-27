@@ -620,6 +620,12 @@ def run_forever(config: dict, max_ticks: int | None = None) -> None:
     ticks = 0
     while max_ticks is None or ticks < max_ticks:
         try:
+            # 每轮现读 config：网页改的预热时刻/间隔/模板要立刻生效（8/28 工头加的 06:02
+            # 预热直到服务重启才被看见）；读坏了沿用上一份
+            try:
+                config = store.load_config()
+            except Exception:
+                logger.warning("config.json 读不了，沿用上一份")
             actions = tick(config, datetime.now(timezone.utc))
             if actions:
                 logger.info("tick：%s", "；".join(actions))

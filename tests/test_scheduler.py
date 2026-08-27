@@ -750,3 +750,14 @@ def test_waiting_wakeup_not_finished_nor_poked(monkeypatch):
     assert st["quota_resume_sent"] and st["quota_paused_until"] is None
     sched.tick(CONFIG, later)
     assert len(sent) == 1
+
+
+def test_run_forever_reloads_config_each_tick(tmp_path, monkeypatch):
+    """网页改了 config.json，下一轮 tick 就要用新的，不能等重启。"""
+    import nightshift.scheduler as sched
+    seen = []
+    monkeypatch.setattr(sched, "tick", lambda cfg, now: seen.append(cfg.get("marker")) or [])
+    monkeypatch.setattr(sched.time, "sleep", lambda s: store.atomic_write_json(store.home() / "config.json", {**CONFIG, "marker": "second"}))
+    store.atomic_write_json(store.home() / "config.json", {**CONFIG, "marker": "first"})
+    sched.run_forever({**CONFIG, "marker": "stale"}, max_ticks=2)
+    assert seen == ["first", "second"]
