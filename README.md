@@ -77,9 +77,55 @@ python3 -m nightshift capture <任务id> --lines 200
 
 每个任务自带一套 Claude Code hook 配置（随 `--settings` 传入，不碰任何项目的
 settings），七个事件都打到 `python3 -m nightshift.hook <任务id> <事件>`：
-它读 stdin 的 JSON，只更新该任务自己的 `status.json`（文件锁 + 原子写），
-stdout 永远沉默。`Stop` 事件带回 `background_tasks`，据此区分"在等背景任务"
-和"真干完了一轮"。
+它读 stdin 的 JSON，只更新该任务自己的 `status.json`（文件锁 + 原子写）。
+`Stop` 事件带回 `background_tasks`，据此区分"在等背景任务"和"真干完了一轮"。
+hook 的 stdout 平时沉默；唯一例外见下一节——`PostToolUse` 回注提醒时输出一个
+`hookSpecificOutput` JSON。
+
+## 上下文到线与换班
+
+一个任务可以跨多班（多个窗口）跑完，全程不用人在场。
+
+**到线提醒（回注）。** 每20次工具调用，hook 机器侧读一次 transcript 算上下文
+水位。到警戒线（`guards.context_warn_tokens`，没写就按
+`context_warn_ratio × 该模型 context_limit`，默认 0.8）时，hook 通过
+`PostToolUse` 的 `additionalContext` 往会话里注一句提醒（模型像看到系统提示
+一样看见它，不靠它自己自觉查）：
+
+> [nightshift] 上下文已 412k / 500k，到警戒线了。现在收尾：①把已完成/未完成/
+> 下一步写进 ~/.nightshift/tasks/<任务id>/handover-1.md，末行写 NEXT: continue
+> 或 NEXT: done；②未提交的改动 commit；③然后停下，不要再开新的活。调度器会
+> 按交接开下一班。
+
+文案可在 `config.context_warn_text`（或任务级 `guards.context_warn_text`）里改。
+额度到线（五小时或七日任一线碰到 `guards` 里的上限）时同样回注一段"请尽快
+收尾"的额度提醒；两种提醒同时命中就合成一段。每过 20 次工具调用仍在线上就
+再注一次，直到模型真的收尾。
+
+**交接文件怎么写。** 就是一个普通 markdown，路径在提醒里给全
+（`tasks/<任务id>/handover-<班次>.md`）。把"已完成 / 未完成 / 下一步"写清楚，
+最后一行必须是调度器认的指令：
+
+- `NEXT: continue` —— 活没干完，开下一班接着做；
+- `NEXT: done` —— 干完了，任务完结。
+
+**换班。** 模型收尾停下（Stop 且没有背景任务）后，调度器读到 idle 就看交接
+文件：`continue` → 走一遍完整预检（额度不够就推迟，绝不硬起）→ 开下一班窗口，
+提示词 = `chain_template` 渲染的"第 N 班 + 上一班交接"；`done` → 任务 finished。
+会话在写完交接后崩了/被关了（exited）也一样认交接。
+
+**没留交接怎么办（`chain.on_no_handover`）。** 这班收到过提醒却没写交接：
+
+- `continue`（默认）——照常续班，提示词换成兜底文案"上一班没留交接，先看
+  git log / git status / 项目里的验收单或 reports 目录判断进度"；
+- `stop` —— 标 `needs_attention`，开"需要人工"窗口停下等人。
+
+从没收到过提醒就 idle 的，视为正常干完 → `finished`。
+
+**几班上限（`chain.max_windows`）。** 默认 3。到上限还要求续班的，任务标
+`chain_exhausted` 并开"班次用尽"窗口。旧窗口一律保留不关，早上
+`Ctrl+B w` 挨个看；网页卡片上能看到换班链（"已续班 → <后继id>" /
+"上一班 <id>"）。
 
 ## 部署为 systemd 服务
 
