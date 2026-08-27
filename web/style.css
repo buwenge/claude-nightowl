@@ -338,3 +338,7 @@ fieldset.box summary { cursor: pointer; min-height: 44px; line-height: 44px; fon
 
 .bar-block { margin-bottom: 8px; }
 .bar-resets { font-size: 12px; color: var(--muted); margin-top: 3px; }
+
+.warmup-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line, #8884); }
+.warmup-row label.inline { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
+.warmup-row input[type="time"] { padding: 0 8px; }

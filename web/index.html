@@ -32,6 +32,13 @@
         </span>
       </div>
       <div id="quota-body"><p class="hint">加载中…</p></div>
+      <div class="warmup-row">
+        <label class="inline"><input type="checkbox" id="w-enabled"> 每天</label>
+        <input type="time" id="w-time" style="width:auto;min-height:40px">
+        <span class="hint">预热五小时窗口（发一句话给 haiku，让窗口从这一刻起算）</span>
+        <button type="button" id="btn-warmup-save" class="ghost">保存</button>
+      </div>
+      <p id="warmup-state" class="hint"></p>
     </div>
     <div id="task-list"><p class="hint">加载中…</p></div>
   </section>

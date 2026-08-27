@@ -18,7 +18,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import launcher, quota, store
+from . import launcher, quota, store, warmup
 
 __all__ = ["parse_iso", "to_iso", "tick", "run_forever"]
 
@@ -103,6 +103,14 @@ def tick(config: dict, now: datetime) -> list[str]:
     ]
     if active_ids:
         _maybe_refresh_quota(config, now, actions)
+    # 预热五小时窗口（config.warmup，网页可改）：到点发一句话给 haiku，一天一次
+    if warmup.due(config, now):
+        result = warmup.run_warmup(config, now)
+        actions.append(
+            "预热窗口：" + ("成功" if result.get("ok") else f"失败 {result.get('error', '')[:80]}")
+        )
+        # 预热后额度窗口已开始，顺手刷一次 quota.json 让页面立刻看到新刷新时间
+        _maybe_refresh_quota(config, now, actions, force=True)
     return actions
 
 
@@ -551,12 +559,12 @@ def _check_exited_chain(
 
 
 def _maybe_refresh_quota(
-    config: dict, now: datetime, actions: list[str]
+    config: dict, now: datetime, actions: list[str], force: bool = False
 ) -> None:
     sch = config.get("scheduler") or {}
     refresh_after = timedelta(minutes=sch.get("quota_refresh_minutes", 30))
     qpath = store.home() / "quota.json"
-    if qpath.is_file():
+    if qpath.is_file() and not force:
         try:
             with open(qpath, encoding="utf-8") as f:
                 data = json.load(f)

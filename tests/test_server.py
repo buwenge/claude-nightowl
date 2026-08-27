@@ -628,3 +628,13 @@ def test_quota_refresh_endpoint(authed, monkeypatch):
     monkeypatch.setattr(server_mod.quota, "fetch_usage", boom)
     status, _, body = authed.request("POST", "/api/quota/refresh")
     assert status == 502 and "额度查不到" in body["error"]
+
+
+def test_warmup_settings_roundtrip(authed):
+    status, _, body = authed.request("PUT", "/api/warmup", {"enabled": True, "time_local": "07:30"})
+    assert status == 200, body
+    assert json.load(open(store.home() / "config.json", encoding="utf-8"))["warmup"] == {"enabled": True, "time_local": "07:30"}
+    status, _, body = authed.request("GET", "/api/config")
+    assert body["warmup"]["time_local"] == "07:30"
+    status, _, body = authed.request("PUT", "/api/warmup", {"enabled": True, "time_local": "25:99"})
+    assert status == 400

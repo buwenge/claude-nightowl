@@ -25,7 +25,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import auth, launcher, quota, scheduler, store
+from . import auth, launcher, quota, scheduler, store, warmup
 
 __all__ = ["make_server", "serve_http"]
 
@@ -337,6 +337,8 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/templates":
             return self._api_templates()
+        if path == "/api/warmup":
+            return self._api_warmup()
         self._send_json(404, {"error": "没有这个路径"})
 
     def _route_delete(self) -> None:
@@ -411,6 +413,8 @@ class _Handler(BaseHTTPRequestHandler):
             "display_tz_offset_hours": cfg.get("display_tz_offset_hours"),
             # 可选：顶栏"回主站"链接 {"text": "...", "href": "..."}，没配就不显示
             "home_link": (cfg.get("http") or {}).get("home_link"),
+            "warmup": cfg.get("warmup") or {"enabled": False, "time_local": ""},
+            "warmup_state": warmup.read_state(),
         })
 
     _TEMPLATE_KEYS = ("prompt_template", "context_warn_text", "quota_pause_text", "quota_wrapup_text", "quota_other_model_text", "chain_template")
@@ -430,6 +434,21 @@ class _Handler(BaseHTTPRequestHandler):
         store.atomic_write_json(store.home() / "config.json", cfg)
         logger.info("模板已更新：%s", "、".join(updates))
         return self._send_json(200, {"ok": True})
+
+    def _api_warmup(self) -> None:
+        """预热设置：{enabled: bool, time_local: "HH:MM"}，写回 config.warmup。"""
+        data = self._read_json()
+        if data is None:
+            return
+        enabled = bool(data.get("enabled"))
+        hhmm = str(data.get("time_local") or "").strip()
+        if enabled and not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", hhmm):
+            return self._send_json(400, {"error": "时间要写成 HH:MM（本地时间）"})
+        cfg = store.load_config()
+        cfg["warmup"] = {**(cfg.get("warmup") or {}), "enabled": enabled, "time_local": hhmm}
+        store.atomic_write_json(store.home() / "config.json", cfg)
+        logger.info("预热设置已更新：enabled=%s time=%s", enabled, hhmm)
+        return self._send_json(200, {"ok": True, "warmup": cfg["warmup"]})
 
     def _api_preview(self) -> None:
         data = self._read_json()

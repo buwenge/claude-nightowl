@@ -133,6 +133,7 @@ function refreshQuota() {
   api("GET", "./api/quota").then(function (data) {
     renderQuota(data || {});
   }).catch(function () { /* banner 已提示 */ });
+  api("GET", "./api/config").then(function (cfg) { CFG = cfg; renderWarmup(cfg); }).catch(function () {});
 }
 
 // /usage 的 "Aug 27, 6:40pm (UTC)" → Date（按 UTC 解析；年份取当前年，明显过去就算下一年）
@@ -212,6 +213,27 @@ function renderQuota(data) {
     agoText = "查询时间 " + fmtLocal(data.fetched_at);
   }
   box.appendChild(el("p", { class: "quota-line", text: agoText }));
+}
+
+function renderWarmup(cfg) {
+  var w = cfg.warmup || {};
+  $("w-enabled").checked = !!w.enabled;
+  $("w-time").value = w.time_local || "";
+  var st = cfg.warmup_state || {};
+  var text = "";
+  if (st.last_run_at) {
+    text = "上次预热：" + fmtLocal(st.last_run_at) + (st.ok ? "（成功，" + (st.model || "") + " 回了「" + (st.reply || "") + "」）" : "（失败：" + (st.error || "") + "）");
+  } else if (w.enabled) {
+    text = "还没预热过，今天 " + (w.time_local || "") + " 到点自动发";
+  }
+  $("warmup-state").textContent = text;
+}
+
+function saveWarmup() {
+  api("PUT", "./api/warmup", { enabled: $("w-enabled").checked, time_local: $("w-time").value })
+    .then(function () { banner("预热设置已保存"); return api("GET", "./api/config"); })
+    .then(function (cfg) { CFG = cfg; renderWarmup(cfg); })
+    .catch(function () {});
 }
 
 function taskActions(item) {
@@ -562,6 +584,7 @@ function start() {
     });
   });
   $("btn-screen-close").addEventListener("click", closeScreen);
+  $("btn-warmup-save").addEventListener("click", saveWarmup);
   $("btn-refresh").addEventListener("click", function () {
     refreshTasks(); refreshQuota(); banner("已刷新");
   });
@@ -619,6 +642,7 @@ function start() {
       link.hidden = false;
     }
     populateNewForm();
+    renderWarmup(cfg);
     showView("tasks");
   }).catch(function () {
     // 401 已跳登录；其余情况仍试着渲染空界面
