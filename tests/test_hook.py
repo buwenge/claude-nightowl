@@ -679,3 +679,42 @@ def test_alarm_plan():
     assert text == "3 分钟（共 1 个）" and total == 3
     text, total = alarm_plan(None)
     assert "按最长等" in text and total == 300
+
+
+def test_other_model_weekly_line_only_notes(tmp_path):
+    """sonnet 任务：Fable 周线到了不叫停，只提示一次"别派 Fable 子 agent"。"""
+    cfg = dict(CONFIG)
+    cfg["models"] = {"claude-sonnet-5": {"context_limit": 500000, "usage_label": "Sonnet"},
+                     "claude-fable-5": {"context_limit": 500000, "usage_label": "Fable"}}
+    store.atomic_write_json(store.home() / "config.json", cfg)
+    task_id = make_task(model="claude-sonnet-5", guards={
+        "session_pct_max": 80, "weekly_pct_max": 95, "model_weekly_pct_max": 90,
+        "context_warn_tokens": 100000, "context_limit_tokens": 200000,
+    })
+    write_quota(session=10, week=20, per_model={"Fable": 92, "Sonnet": 30})
+    payload = make_transcript(tmp_path / "transcript.jsonl", 100)
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", payload)
+    proc = run_hook(task_id, "PostToolUse", payload)
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "Fable 的周额度只剩 8%" in ctx and "别再派 Fable" in ctx
+    assert "NEXT: done" not in ctx and "ScheduleWakeup" not in ctx
+    assert store.read_status(task_id)["other_model_warned"] == ["Fable"]
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", payload)
+    proc = run_hook(task_id, "PostToolUse", payload)  # 第 40 次：同一模型不再提示
+    assert proc.stdout == ""
+
+
+def test_own_model_line_uses_model_weekly_pct_max(tmp_path):
+    task_id = make_task(guards={
+        "session_pct_max": 80, "weekly_pct_max": 95, "model_weekly_pct_max": 85,
+        "context_warn_tokens": 100000, "context_limit_tokens": 200000,
+    })
+    write_quota(session=10, week=20, per_model={"Fable": 88})
+    payload = make_transcript(tmp_path / "transcript.jsonl", 100)
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", payload)
+    proc = run_hook(task_id, "PostToolUse", payload)
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "Fable 单独周线剩 12%（线 15%）" in ctx and "NEXT: done" in ctx

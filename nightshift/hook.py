@@ -29,6 +29,11 @@ QUOTA_PAUSE_TEXT = (
     "现在停止干活，不要再开新的工具调用：按家规定缓存闹钟——用 ScheduleWakeup 连续设 {alarm_plan}，"
     "每个闹钟醒来只输出一个“·”再设下一个，最后一个闹钟醒来后从刚才停下的地方继续。"
 )
+# 别的模型的周线到了：只提示别去用它，不叫停本会话
+QUOTA_OTHER_MODEL_TEXT = (
+    "[nightshift] 提示：{label} 的周额度只剩 {left}%（线 {line_left}%）。本会话的模型不受影响，"
+    "但接下来别再派 {label} 的子 agent、也别切到它。"
+)
 QUOTA_WRAPUP_TEXT = (
     "[nightshift] 周额度只剩 {week_left}%（线 {week_line_left}%）{model_note}，一时半会儿刷新不了。"
     "现在收尾：把已完成/未完成/下一步写进 {handover_path}，末行写 NEXT: done（本周不再续班，交接留给下次）；"
@@ -110,6 +115,28 @@ def _read_fresh_usage(config: dict) -> dict | None:
     return usage if isinstance(usage, dict) else None
 
 
+def _other_model_notes(task: dict, config: dict, status: dict) -> list[tuple[str, str]]:
+    """不是本任务模型的单模型周线到了 model_weekly_pct_max → 每个模型提示一次。"""
+    guards = task.get("guards") or {}
+    model_max = guards.get("model_weekly_pct_max", guards.get("weekly_pct_max"))
+    if model_max is None:
+        return []
+    usage = _read_fresh_usage(config)
+    if usage is None:
+        return []
+    own = (config.get("models") or {}).get(task.get("model", ""), {}).get("usage_label")
+    warned = set(status.get("other_model_warned") or [])
+    out = []
+    for label, pct in (usage.get("per_model") or {}).items():
+        if label == own or label in warned or not isinstance(pct, int) or pct < model_max:
+            continue
+        out.append((label, store.render(
+            config.get("quota_other_model_text") or QUOTA_OTHER_MODEL_TEXT,
+            label=label, left=100 - pct, line_left=100 - model_max,
+        )))
+    return out
+
+
 def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
     """额度判定，返回 (种类, 回注文案, 要写进 status 的字段)。
 
@@ -122,6 +149,7 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
     guards = task.get("guards") or {}
     session_max = guards.get("session_pct_max")
     weekly_max = guards.get("weekly_pct_max")
+    model_max = guards.get("model_weekly_pct_max", weekly_max)  # 单模型周线单独一个数，没配就跟全模型线
     if session_max is None or weekly_max is None:
         return None, "", {}
     usage = _read_fresh_usage(config)
@@ -130,16 +158,18 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
     session_pct = usage.get("session_pct")
     week_all_pct = usage.get("week_all_pct")
     label = (config.get("models") or {}).get(task.get("model", ""), {}).get("usage_label")
-    model_pct = (usage.get("per_model") or {}).get(label) if label else None
+    per_model = usage.get("per_model") or {}
+    model_pct = per_model.get(label) if label else None
 
     week_hit = isinstance(week_all_pct, int) and week_all_pct >= weekly_max
-    model_hit = isinstance(model_pct, int) and model_pct >= weekly_max
+    model_hit = isinstance(model_pct, int) and model_pct >= model_max
     if week_hit or model_hit:
-        model_note = f"，{label} 单独周线剩 {100 - model_pct}%" if model_hit else ""
+        model_note = f"，{label} 单独周线剩 {100 - model_pct}%（线 {100 - model_max}%）" if model_hit else ""
         text = store.render(
             config.get("quota_wrapup_text") or QUOTA_WRAPUP_TEXT,
             week_left=("?" if week_all_pct is None else 100 - week_all_pct),
             week_line_left=100 - weekly_max,
+            model_line_left=100 - model_max,
             model_note=model_note,
             handover_path=str(handover_path(task)),
         )
@@ -246,6 +276,14 @@ def _post_tool_use_refresh(task: dict, status: dict, payload: dict) -> str | Non
                         store.append_event(
                             task_id, f"回注上下文提醒 #{count}（{tokens}）"
                         )
+        # 别的模型周线到了：提示一次别去用它（sonnet 会话派 fable 子 agent 会撞限流）
+        for label, note in _other_model_notes(task, config, status):
+            inject.append(note)
+            warned = list(status.get("other_model_warned") or [])
+            warned.append(label)
+            extra["other_model_warned"] = warned
+            status["other_model_warned"] = warned
+            store.append_event(task_id, f"回注其他模型周线提示：{label}")
         kind, quota_text, quota_fields = _quota_check(task, config)
         if kind == "wrapup":
             inject.append(quota_text)

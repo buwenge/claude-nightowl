@@ -77,6 +77,10 @@
         <input type="number" id="f-weekleft" min="0" max="100" step="1">
         <p class="hint">七日全模型线或该模型单独周线任一到线，注入"收尾写交接"，本周不续班。起跑前预检也按这两条线放行/推迟。</p>
 
+        <label for="f-modelleft"><b>该模型单独周额度剩余低于多少 % 就收尾交接</b></label>
+        <input type="number" id="f-modelleft" min="0" max="100" step="1">
+        <p class="hint">比如 Fable 有自己的周线。别的模型的周线到了不叫停本会话，只提示一句"别再派它的子 agent"。</p>
+
         <label for="f-chainmax"><b>一晚最多几班</b></label>
         <input type="number" id="f-chainmax" min="1" max="20" step="1">
 
@@ -115,8 +119,12 @@
     <textarea id="t-quotapause" class="tall" rows="5"></textarea>
 
     <h2>周额度到线：收尾交接</h2>
-    <p class="hint">占位符：{week_left} 剩余% · {week_line_left} 线（剩余%）· {model_note} 单模型周线说明 · {handover_path}</p>
+    <p class="hint">占位符：{week_left} 剩余% · {week_line_left} 线（剩余%）· {model_line_left} 单模型线（剩余%）· {model_note} 单模型周线说明 · {handover_path}</p>
     <textarea id="t-quotawrap" class="tall" rows="5"></textarea>
+
+    <h2>别的模型周额度到线：只提示</h2>
+    <p class="hint">占位符：{label} 模型名 · {left} 剩余% · {line_left} 线（剩余%）。本会话不停，只叫它别派那个模型的子 agent。</p>
+    <textarea id="t-quotaother" class="tall" rows="4"></textarea>
 
     <h2>续班模板</h2>
     <p class="hint">占位符：{task} {shift} {handover} {title} {project_path} {context_limit}（系统自动填，改文案别删花括号）</p>

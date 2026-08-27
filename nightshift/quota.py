@@ -176,10 +176,11 @@ def check_guards(usage: dict, model: str, config: dict, guards: dict) -> tuple[b
     if week_all_pct is not None and week_all_pct > week_max:
         return False, f"七日额度 {week_all_pct}% 超线 {week_max}%"
     label = config.get("models", {}).get(model, {}).get("usage_label")
+    model_max = guards.get("model_weekly_pct_max", week_max)
     if label and label in usage.get("per_model", {}):
         pct = usage["per_model"][label]
-        if pct > week_max:
-            return False, f"模型 {label} 周额度 {pct}% 超线 {week_max}%"
+        if pct > model_max:
+            return False, f"模型 {label} 周额度 {pct}% 超线 {model_max}%"
     return True, ""
 
 

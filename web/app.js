@@ -436,6 +436,8 @@ function populateNewForm() {
   if (CFG.guards) {
     if (typeof CFG.guards.session_pct_max === "number") $("f-sessionleft").value = 100 - CFG.guards.session_pct_max;
     if (typeof CFG.guards.weekly_pct_max === "number") $("f-weekleft").value = 100 - CFG.guards.weekly_pct_max;
+    var mw = typeof CFG.guards.model_weekly_pct_max === "number" ? CFG.guards.model_weekly_pct_max : CFG.guards.weekly_pct_max;
+    if (typeof mw === "number") $("f-modelleft").value = 100 - mw;
   }
   if (CFG.chain) {
     if (typeof CFG.chain.max_windows === "number") $("f-chainmax").value = CFG.chain.max_windows;
@@ -474,6 +476,7 @@ function submitNewForm(ev) {
     guards.context_warn_text = $("f-warntext").value;
   if ($("f-sessionleft").value !== "") guards.session_pct_max = 100 - Number($("f-sessionleft").value);
   if ($("f-weekleft").value !== "") guards.weekly_pct_max = 100 - Number($("f-weekleft").value);
+  if ($("f-modelleft").value !== "") guards.model_weekly_pct_max = 100 - Number($("f-modelleft").value);
   var chain = {};
   if ($("f-chainmax").value !== "")
     chain.max_windows = Number($("f-chainmax").value);
@@ -500,6 +503,7 @@ function loadTemplatesView() {
     $("t-warntext").value = cfg.context_warn_text || "";
     $("t-quotapause").value = cfg.quota_pause_text || "";
     $("t-quotawrap").value = cfg.quota_wrapup_text || "";
+    $("t-quotaother").value = cfg.quota_other_model_text || "";
     $("t-chain").value = cfg.chain_template || "";
   }).catch(function () {});
 }
@@ -512,6 +516,7 @@ function saveTemplates() {
     context_warn_text: $("t-warntext").value,
     quota_pause_text: $("t-quotapause").value,
     quota_wrapup_text: $("t-quotawrap").value,
+    quota_other_model_text: $("t-quotaother").value,
     chain_template: $("t-chain").value
   }).then(function () {
     note.textContent = "已保存";
