@@ -26,6 +26,7 @@ __all__ = [
     "atomic_write_json",
     "atomic_write_text",
     "build_prompt",
+    "create_successor",
     "create_task",
     "ensure_dirs",
     "home",
@@ -193,6 +194,54 @@ def load_task(task_id: str) -> dict:
     """读 task.json。"""
     with open(task_dir(task_id) / "task.json", encoding="utf-8") as f:
         return json.load(f)
+
+
+# create_successor 里交接缺席时的兜底文案（与开工令一致）
+NO_HANDOVER_TEXT = (
+    "上一班没留交接。先看 git log / git status / 项目里的验收单或 reports "
+    "目录判断进度，再接着做。"
+)
+
+
+def create_successor(parent_task: dict, handover_text: str | None, config: dict) -> str:
+    """换班：按父任务造后继任务并落盘，返回后继任务 id。
+
+    - 复制 title/project/model/effort/task_text/guards/chain/retry_max；
+    - shift = 父 shift + 1，parent_id / root_id（根任务的 root_id 是它自己）；
+    - run_at = 现在（后继下一轮 tick 就能走预检）；
+    - prompt_final = render(config.chain_template, task=…, shift=…, handover=…)，
+      没交接就用 NO_HANDOVER_TEXT 兜底；
+    - 父任务状态改 chained 并记 successor_id（本班结束，后继进 scheduled）。
+    """
+    parent_id = parent_task["id"]
+    shift = int(parent_task.get("shift") or 1) + 1
+    handover = handover_text if handover_text else NO_HANDOVER_TEXT
+    task: dict = {
+        "title": parent_task["title"],
+        "project": parent_task["project"],
+        "model": parent_task["model"],
+        "effort": parent_task["effort"],
+        "run_at": utc_now_iso(),
+        "task_text": parent_task["task_text"],
+        "prompt_final": render(
+            config["chain_template"],
+            task=parent_task["task_text"],
+            shift=shift,
+            handover=handover,
+        ),
+        "shift": shift,
+        "parent_id": parent_id,
+        "root_id": parent_task.get("root_id") or parent_id,
+    }
+    if parent_task.get("retry_max") is not None:
+        task["retry_max"] = parent_task["retry_max"]
+    if parent_task.get("guards"):
+        task["guards"] = parent_task["guards"]
+    if parent_task.get("chain"):
+        task["chain"] = parent_task["chain"]
+    successor_id = create_task(task, config)
+    update_status(parent_id, state="chained", successor_id=successor_id)
+    return successor_id
 
 
 def read_status(task_id: str) -> dict:

@@ -12,9 +12,11 @@ from __future__ import annotations
 import json
 import logging
 import logging.handlers
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from . import launcher, quota, store
 
@@ -28,6 +30,9 @@ ACTIVE_STATES = ("launching", "working", "waiting_background")
 DEFAULT_KEEPALIVE_TEXT = (
     "来自nightshift：保活探针——背景任务还在跑吗？简短回一句即可。"
 )
+# 交接文件末行的换班指令（设计稿 §4.4）
+_RE_NEXT_CONTINUE = re.compile(r"^NEXT:\s*continue\s*$")
+_RE_NEXT_DONE = re.compile(r"^NEXT:\s*done\s*$")
 
 
 def parse_iso(s: str) -> datetime:
@@ -55,8 +60,9 @@ def tick(config: dict, now: datetime) -> list[str]:
     - launching：exit_code 铁证、宽限期与 PID 复用几条崩溃恢复在这里落；
     - working/waiting_background/idle：exit_code 兜底退场；窗口没了标 exited；
       非 auto 权限模式开窗提醒；waiting_background 静默超时戳保活（idle 永远
-      不戳，设计稿 §5.2）；
-    - 其余状态不动。
+      不戳，设计稿 §5.2）；idle 首次评估换班（设计稿 §4.4）；
+    - exited：也评估一次换班（只认交接文件）；
+    - 其余状态（chained/finished/…）不动。
     """
     if now.tzinfo is None:
         raise ValueError("now 必须是带时区的 aware datetime（UTC）")
@@ -84,7 +90,10 @@ def tick(config: dict, now: datetime) -> list[str]:
             actions.extend(_check_launching(task, status, config, now))
         elif state in ("working", "waiting_background", "idle"):
             actions.extend(_check_running(task, status, config, now))
-        # 其余状态（chained/exited/finished/…）不动
+        elif state == "exited":
+            # S3 换班：exited 也评估一次（写完交接后会话被关/崩了的情形）
+            actions.extend(_check_exited_chain(task, status, config, now))
+        # 其余状态（chained/finished/…）不动
 
     # 每轮末尾：有活跃任务且 quota.json 缺失/过期才刷 /usage（零开销原则）
     active_ids = [
@@ -359,6 +368,11 @@ def _check_running(
         )
         return [f"{task_id} 权限模式 {mode} 非 auto → 提醒窗口"]
 
+    # S3 换班：idle 收尾后按交接文件接下一班（每次评估先落 chain_checked
+    # 防重复；评估失败的代价是这班不再自动续，好过重复开出双份后继）
+    if status.get("state") == "idle" and not status.get("chain_checked"):
+        return _check_idle_chain(task, status, config, now)
+
     if status.get("state") != "waiting_background":
         return []  # idle 永远不戳（8/27 事故的反面，设计稿 §5.2）
 
@@ -385,6 +399,138 @@ def _check_running(
     )
     store.append_event(task_id, "保活戳：waiting_background 静默超时，已 send-keys 探针")
     return [f"{task_id} 保活戳"]
+
+
+# ---------- 换班：交接判定与后继任务（设计稿 §4.4） ----------
+
+
+def _handover_file(task: dict, status: dict) -> Path:
+    """交接文件路径：status 里 hook 记下的 handover_path 优先，
+    没有就按 task_dir/handover-<shift>.md 算。"""
+    recorded = status.get("handover_path")
+    if recorded:
+        return Path(recorded)
+    return store.task_dir(task["id"]) / f"handover-{int(task.get('shift') or 1)}.md"
+
+
+def _read_handover(path: Path) -> str | None:
+    """读整份交接（strip 后为空当没有）；文件不存在返回 None。"""
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8", errors="replace").strip() or None
+
+
+def _last_nonempty_line(text: str) -> str:
+    return [ln for ln in (ln.strip() for ln in text.splitlines()) if ln][-1]
+
+
+def _check_idle_chain(
+    task: dict, status: dict, config: dict, now: datetime
+) -> list[str]:
+    """idle 的换班评估（设计稿 §4.4 第 3 条）。
+
+    先落 chain_checked=True 防重复评估；再看交接文件：
+    - 有交接按末行 NEXT: continue/done 判（没写 NEXT 按 continue）；
+    - 没交接但这班被提醒过 → 按 chain.on_no_handover（continue/stop）；
+    - 没交接也从未被提醒 → 正常干完，finished。
+    """
+    store.update_status(task["id"], chain_checked=True)
+    path = _handover_file(task, status)
+    text = _read_handover(path)
+    if text is not None:
+        return _handover_verdict(task, text, config, now)
+
+    if status.get("context_warned_at"):  # 这班被提醒过却没留交接
+        policy = (task.get("chain") or {}).get("on_no_handover") or "continue"
+        if policy == "stop":
+            store.update_status(
+                task["id"], state="needs_attention", last_event_at=to_iso(now)
+            )
+            store.append_event(
+                task["id"],
+                "到线提醒过却没留交接，按 chain.on_no_handover=stop 停下等人",
+            )
+            launcher.open_notice_window(
+                task,
+                "(需要人工)",
+                [
+                    "到线提醒后没留交接，按设置停下等人",
+                    f"交接文件应在：{path}",
+                ],
+                config,
+            )
+            return [f"{task['id']} 提醒过没交接 → needs_attention"]
+        store.append_event(
+            task["id"],
+            "到线提醒过却没留交接，按 chain.on_no_handover=continue 续班（兜底文案）",
+        )
+        return _chain_continue(task, config, now, handover_text=None)
+
+    store.update_status(task["id"], state="finished", last_event_at=to_iso(now))
+    store.append_event(task["id"], "idle、没留交接、也没被提醒过 → finished（正常干完）")
+    return [f"{task['id']} 正常干完 → finished"]
+
+
+def _handover_verdict(
+    task: dict, text: str, config: dict, now: datetime
+) -> list[str]:
+    """有交接时的判定（idle 与 exited 共用）：末行 NEXT: done → finished；
+    NEXT: continue（或没写 NEXT，按 continue）→ 续班。"""
+    last = _last_nonempty_line(text)
+    if _RE_NEXT_DONE.match(last):
+        store.update_status(task["id"], state="finished", last_event_at=to_iso(now))
+        store.append_event(task["id"], "交接末行 NEXT: done → finished")
+        return [f"{task['id']} 交接 NEXT: done → finished"]
+    note = ""
+    if not _RE_NEXT_CONTINUE.match(last):
+        note = "（交接末行没写 NEXT，按 continue）"
+    return _chain_continue(task, config, now, handover_text=text, note=note)
+
+
+def _chain_continue(
+    task: dict, config: dict, now: datetime,
+    handover_text: str | None, note: str = "",
+) -> list[str]:
+    """续班：班次没到上限就造后继任务（父任务转 chained）；到上限标
+    chain_exhausted 并开提醒窗。后继下一 tick 走完整预检（额度不够就推迟）。"""
+    task_id = task["id"]
+    shift = int(task.get("shift") or 1)
+    chain = task.get("chain") or {}
+    max_windows = int(chain.get("max_windows") or 3)
+    if shift >= max_windows:
+        store.update_status(
+            task_id, state="chain_exhausted", last_event_at=to_iso(now)
+        )
+        store.append_event(
+            task_id, f"已连开 {shift} 班（上限 {max_windows}）→ chain_exhausted"
+        )
+        launcher.open_notice_window(
+            task,
+            "(班次用尽)",
+            [
+                f"已连开 {shift} 班（chain.max_windows={max_windows}），不再自动续班",
+                "任务可能没做完；要继续可调大上限后在网页重建任务",
+            ],
+            config,
+        )
+        return [f"{task_id} 第 {shift} 班结束：班次用尽"]
+    successor_id = store.create_successor(task, handover_text, config)
+    store.append_event(task_id, f"续班 → {successor_id}（第 {shift + 1} 班）{note}")
+    return [f"{task_id} 续班 → {successor_id}（第 {shift + 1} 班）{note}"]
+
+
+def _check_exited_chain(
+    task: dict, status: dict, config: dict, now: datetime
+) -> list[str]:
+    """exited 也评估一次换班（会话被关/崩了但交接已写完的情形）：
+    只认交接文件——有交接按 NEXT 判，没交接不动。"""
+    if status.get("chain_checked"):
+        return []
+    store.update_status(task["id"], chain_checked=True)
+    text = _read_handover(_handover_file(task, status))
+    if text is None:
+        return []
+    return _handover_verdict(task, text, config, now)
 
 
 # ---------- 额度刷新（零开销原则） ----------

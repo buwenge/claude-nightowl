@@ -38,6 +38,7 @@ CONFIG = {
     "efforts": ["low", "medium", "high", "xhigh", "max"],
     "guards": {"session_pct_max": 80, "weekly_pct_max": 95},
     "chain": {"max_windows": 3, "on_no_handover": "continue"},
+    "chain_template": "{task}\n\n这是第 {shift} 班。上一班交接如下：\n{handover}\n\n先核对交接里说的状态再动手。",
     "scheduler": {
         "interval_seconds": 30,
         "launch_grace_seconds": 180,
@@ -192,3 +193,66 @@ def test_serve_once_launches_then_idle_on_second_pass(trusted_env):
     assert trusted_env["fake_log"].read_text(
         encoding="utf-8"
     ).count("--session-id") == 1
+
+
+def test_chain_two_shifts_end_to_end(trusted_env):
+    """换班全链：第一班 exited → 写交接 NEXT: continue → 后继 scheduled →
+    后继被起 → 写 NEXT: done → 后继 finished。假 claude 一共被起两次。"""
+    config = store.load_config()
+    task_id = store.create_task(
+        {
+            "title": "换班夜班",
+            "project": "demo",
+            "model": "claude-fable-5",
+            "effort": "high",
+            "run_at": "2026-08-27T00:00:00Z",  # 过去：serve --once 立刻到点
+            "task_text": "正文",
+            "prompt_final": "只回复：好",
+        },
+        config,
+    )
+
+    # ① 第一班：起 → 跑完 → exited
+    serve_once()
+    parent_status, parent_seen = wait_for_state(task_id)
+    assert parent_status["state"] == "exited", f"没等到 exited：{parent_seen}"
+
+    # ② 测试自己当模型：往交接文件写 NEXT: continue
+    handover = store.task_dir(task_id) / "handover-1.md"
+    handover.write_text(
+        "第一班干完了登录页，还差支付页。\nNEXT: continue\n", encoding="utf-8"
+    )
+
+    # ③ 第二次 serve --once：父转 chained，后继进 scheduled（本 tick 不起跑）
+    out2 = serve_once()
+    parent_status = store.read_status(task_id)
+    assert parent_status["state"] == "chained"
+    successor_id = parent_status["successor_id"]
+    assert successor_id and successor_id in out2
+    assert store.read_status(successor_id)["state"] == "scheduled"
+    successor = store.load_task(successor_id)
+    assert successor["shift"] == 2
+    assert successor["parent_id"] == task_id
+    assert "还差支付页" in successor["prompt_final"]
+    assert "第 2 班" in successor["prompt_final"]
+    # 假 claude 还是只被起过一次（后继要等下一轮预检）
+    assert trusted_env["fake_log"].read_text(
+        encoding="utf-8"
+    ).count("--session-id") == 1
+
+    # ④ 第三次 serve --once：后继走完整预检后起跑 → exited
+    serve_once()
+    succ_status, succ_seen = wait_for_state(successor_id)
+    assert succ_status["state"] == "exited", f"后继没等到 exited：{succ_seen}"
+    assert trusted_env["fake_log"].read_text(
+        encoding="utf-8"
+    ).count("--session-id") == 2
+
+    # ⑤ 交接写 NEXT: done → 后继 finished；父任务停在 chained
+    (store.task_dir(successor_id) / "handover-2.md").write_text(
+        "支付页也干完了。\nNEXT: done\n", encoding="utf-8"
+    )
+    out4 = serve_once()
+    assert store.read_status(successor_id)["state"] == "finished"
+    assert "finished" in out4
+    assert store.read_status(task_id)["state"] == "chained"

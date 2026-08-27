@@ -222,6 +222,8 @@ function renderTasks(items) {
   items.sort(function (a, b) {
     var ga = groupOf(a.status.state), gb = groupOf(b.status.state);
     if (ga !== gb) return ga - gb;
+    // 终态组按 run_at 降序（最新在前）；其余组保持升序（早的先跑）
+    if (ga === 2) return a.task.run_at > b.task.run_at ? -1 : 1;
     return a.task.run_at < b.task.run_at ? -1 : 1;
   });
   var now = Date.now();
@@ -243,6 +245,16 @@ function taskCard(item, now) {
   card.appendChild(el("div", { class: "task-meta", text:
     "项目 " + task.project + " · 模型 " + task.model + " · 档位 " + task.effort +
     (task.shift > 1 ? " · 第 " + task.shift + " 班" : "") }));
+
+  // 换班链：父卡指出后继，子卡指回上一班
+  if (status.successor_id) {
+    card.appendChild(el("div", { class: "quota-line",
+      text: "已续班 → " + status.successor_id }));
+  }
+  if (task.parent_id) {
+    card.appendChild(el("div", { class: "quota-line",
+      text: "上一班 " + task.parent_id }));
+  }
 
   // 计划时间与倒计时 / 已跑时长
   var whenText;

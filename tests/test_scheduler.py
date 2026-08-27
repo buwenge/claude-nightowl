@@ -33,6 +33,7 @@ CONFIG = {
     "efforts": ["low", "medium", "high", "xhigh", "max"],
     "guards": {"session_pct_max": 80, "weekly_pct_max": 95},
     "chain": {"max_windows": 3, "on_no_handover": "continue"},
+    "chain_template": "{task}\n\n这是第 {shift} 班。上一班交接如下：\n{handover}\n\n先核对交接里说的状态再动手。",
     "scheduler": {
         "interval_seconds": 30,
         "launch_grace_seconds": 180,
@@ -383,9 +384,12 @@ def test_working_exit_code_marks_exited(monkeypatch):
     assert status["exit_reason"] == "claude_exit_7"
     assert any("claude_exit_7" in a for a in actions)
 
-    # idle 同样吃这条兜底；没有 exit_code 的任务不受影响
+    # idle 同样吃这条兜底；没有 exit_code 的任务不受影响。
+    # S3 起 idle 首次评估会走换班判定（无交接且从未提醒 → finished），
+    # 这里只验"兜底不碰 idle"，故先落 chain_checked=True 跳过换班评估
     other = make_task(title="正常 idle")
-    store.update_status(other, state="idle", window_id="@23", pane_pid=NO_PID)
+    store.update_status(other, state="idle", window_id="@23", pane_pid=NO_PID,
+                        chain_checked=True)
     scheduler.tick(CONFIG, NOW)
     assert store.read_status(other)["state"] == "idle"
 
@@ -478,8 +482,10 @@ def test_idle_never_poked(monkeypatch):
     fakes = Fakes(monkeypatch)
     tid = make_task(title="已收尾")
     stale = scheduler.to_iso(NOW - timedelta(minutes=51))
+    # S3 起 idle 首次评估会走换班判定；本条只验"idle 永远不戳保活"，
+    # 先落 chain_checked=True 跳过换班评估
     store.update_status(tid, state="idle", window_id="@7", pane_pid=NO_PID,
-                        last_event_at=stale)
+                        last_event_at=stale, chain_checked=True)
     scheduler.tick(CONFIG, NOW)
     assert fakes.send_keys_calls == []
     assert store.read_status(tid)["state"] == "idle"
@@ -493,6 +499,175 @@ def test_keepalive_disabled_not_poked(monkeypatch):
                         pane_pid=NO_PID, last_event_at=stale)
     scheduler.tick(CONFIG, NOW)
     assert fakes.send_keys_calls == []
+
+
+# ---------- S3② 换班：交接判定与后继任务 ----------
+
+
+def _go_idle(tid: str, **extra) -> None:
+    fields = {"state": "idle", "window_id": "@30", "pane_pid": NO_PID}
+    fields.update(extra)
+    store.update_status(tid, **fields)
+
+
+def _write_handover(tid: str, text: str, shift: int = 1) -> None:
+    (store.task_dir(tid) / f"handover-{shift}.md").write_text(
+        text + "\n", encoding="utf-8"
+    )
+
+
+def test_chain_continue_creates_successor(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    tid = make_task(retry_max=2)
+    _go_idle(tid)
+    _write_handover(tid, "登录页已完成。\n还差支付页。\nNEXT: continue")
+    actions = scheduler.tick(CONFIG, NOW)
+
+    parent_status = store.read_status(tid)
+    assert parent_status["state"] == "chained"
+    assert parent_status["chain_checked"] is True
+    successor_id = parent_status["successor_id"]
+    assert successor_id
+    assert any(successor_id in a for a in actions)
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert f"续班 → {successor_id}（第 2 班）" in events
+
+    successor = store.load_task(successor_id)
+    assert successor["shift"] == 2
+    assert successor["parent_id"] == tid
+    assert successor["root_id"] == tid
+    assert successor["retry_max"] == 2
+    assert store.read_status(successor_id)["state"] == "scheduled"
+    # 提示词 = 续班模板：交接正文 + 第 2 班
+    assert "还差支付页" in successor["prompt_final"]
+    assert "第 2 班" in successor["prompt_final"]
+    # 复制的字段
+    parent = store.load_task(tid)
+    for key in ("title", "project", "model", "effort", "task_text", "guards", "chain"):
+        assert successor[key] == parent[key]
+    # 父窗口不关（没人去杀它；这里至少保证调度器没开/关任何窗口）
+    assert fakes.failure_calls == []
+
+
+def test_chain_done_finishes(monkeypatch):
+    Fakes(monkeypatch)
+    tid = make_task()
+    _go_idle(tid)
+    _write_handover(tid, "全部完成，已提交。\nNEXT: done")
+    actions = scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "finished"
+    assert status.get("successor_id") is None
+    assert any("finished" in a for a in actions)
+    assert len(store.list_tasks()) == 1  # 没有后继
+
+
+def test_chain_handover_without_next_treated_as_continue(monkeypatch):
+    Fakes(monkeypatch)
+    tid = make_task()
+    _go_idle(tid)
+    _write_handover(tid, "做了一半，进度记在这里")
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "chained"
+    successor = store.load_task(status["successor_id"])
+    assert successor["shift"] == 2
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "交接末行没写 NEXT，按 continue" in events
+
+
+def test_chain_no_handover_warned_continue_uses_fallback_text(monkeypatch):
+    Fakes(monkeypatch)
+    tid = make_task()
+    _go_idle(tid, context_warned_at=scheduler.to_iso(NOW - timedelta(minutes=10)))
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "chained"
+    successor = store.load_task(status["successor_id"])
+    assert "上一班没留交接" in successor["prompt_final"]
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "on_no_handover=continue" in events
+
+
+def test_chain_no_handover_warned_stop_needs_attention(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    tid = make_task(chain={"on_no_handover": "stop"})
+    _go_idle(tid, context_warned_at=scheduler.to_iso(NOW - timedelta(minutes=10)))
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention"
+    assert status.get("successor_id") is None
+    assert len(fakes.notice_calls) == 1
+    noticed_id, suffix, lines = fakes.notice_calls[0]
+    assert noticed_id == tid and "(需要人工)" in suffix
+    assert any("没留交接" in ln for ln in lines)
+    assert any("handover-1.md" in ln for ln in lines)
+    assert len(store.list_tasks()) == 1
+
+
+def test_chain_no_handover_never_warned_finishes(monkeypatch):
+    Fakes(monkeypatch)
+    tid = make_task()
+    _go_idle(tid)
+    actions = scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "finished"
+    assert any("finished" in a for a in actions)
+    assert len(store.list_tasks()) == 1
+
+
+def test_chain_shift_at_max_windows_exhausted(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    tid = make_task(shift=3)  # chain.max_windows=3，这班就是最后一班
+    _go_idle(tid)
+    _write_handover(tid, "还没做完。\nNEXT: continue", shift=3)
+    actions = scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "chain_exhausted"
+    assert status.get("successor_id") is None
+    assert any("班次用尽" in a for a in actions)
+    assert len(fakes.notice_calls) == 1
+    assert "(班次用尽)" in fakes.notice_calls[0][1]
+
+
+def test_chain_evaluated_only_once(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    _go_idle(tid, context_warned_at=scheduler.to_iso(NOW - timedelta(minutes=10)))
+    scheduler.tick(CONFIG, NOW)
+    successor_id = store.read_status(tid)["successor_id"]
+    # 再 tick：父任务已 chained（不在巡检范围），不许重复评估、不许重复续班
+    actions = scheduler.tick(CONFIG, NOW)
+    assert actions == []
+    assert store.read_status(tid)["successor_id"] == successor_id
+    assert len(store.list_tasks()) == 2
+    assert fakes.notice_calls == []
+
+
+def test_chain_exited_with_handover_continues(monkeypatch):
+    Fakes(monkeypatch)
+    tid = make_task()
+    store.update_status(tid, state="exited", exit_reason="window_gone")
+    _write_handover(tid, "上下文写完交接时会话被关了。\nNEXT: continue")
+    actions = scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "chained"
+    successor_id = status["successor_id"]
+    assert successor_id
+    assert any(successor_id in a for a in actions)
+    assert store.read_status(successor_id)["state"] == "scheduled"
+
+
+def test_chain_exited_without_handover_untouched(monkeypatch):
+    Fakes(monkeypatch)
+    tid = make_task()
+    store.update_status(tid, state="exited", exit_reason="other")
+    actions = scheduler.tick(CONFIG, NOW)
+    assert actions == []
+    status = store.read_status(tid)
+    assert status["state"] == "exited"  # 没交接不动
+    assert status["chain_checked"] is True
+    assert len(store.list_tasks()) == 1
 
 
 # ---------- 额度刷新（零开销） ----------
