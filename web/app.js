@@ -215,10 +215,14 @@ function renderQuota(data) {
   box.appendChild(el("p", { class: "quota-line", text: agoText }));
 }
 
+var WARMUP_DIRTY = false;  // 用户动过预热控件、还没保存：轮询不许覆盖
+
 function renderWarmup(cfg) {
   var w = cfg.warmup || {};
-  $("w-enabled").checked = !!w.enabled;
-  $("w-time").value = w.time_local || "";
+  if (!WARMUP_DIRTY) {
+    $("w-enabled").checked = !!w.enabled;
+    $("w-time").value = w.time_local || "";
+  }
   var st = cfg.warmup_state || {};
   var text = "";
   if (st.last_run_at) {
@@ -231,7 +235,7 @@ function renderWarmup(cfg) {
 
 function saveWarmup() {
   api("PUT", "./api/warmup", { enabled: $("w-enabled").checked, time_local: $("w-time").value })
-    .then(function () { banner("预热设置已保存"); return api("GET", "./api/config"); })
+    .then(function () { WARMUP_DIRTY = false; banner("预热设置已保存"); return api("GET", "./api/config"); })
     .then(function (cfg) { CFG = cfg; renderWarmup(cfg); })
     .catch(function () {});
 }
@@ -585,6 +589,8 @@ function start() {
   });
   $("btn-screen-close").addEventListener("click", closeScreen);
   $("btn-warmup-save").addEventListener("click", saveWarmup);
+  $("w-enabled").addEventListener("change", function () { WARMUP_DIRTY = true; });
+  $("w-time").addEventListener("input", function () { WARMUP_DIRTY = true; });
   $("btn-refresh").addEventListener("click", function () {
     refreshTasks(); refreshQuota(); banner("已刷新");
   });
