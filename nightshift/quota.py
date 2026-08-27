@@ -86,8 +86,14 @@ def parse_usage(text: str) -> dict:
 def fetch_usage(config: dict, timeout: int = 120) -> dict:
     """跑一次无头 /usage 并解析。非零退出或超时抛 UsageUnavailable。
 
+    环境变量 NIGHTSHIFT_FAKE_USAGE_FILE：设了就读该文件当作 /usage 的输出，
+    完全不起子进程——serve --once 的集成测试用（monkeypatch 管不到子进程）。
     环境里要去掉 CLAUDECODE（在 Claude Code 会话里嵌套调用会报错）。
     """
+    fake_path = os.environ.get("NIGHTSHIFT_FAKE_USAGE_FILE")
+    if fake_path:
+        with open(fake_path, encoding="utf-8") as f:
+            return parse_usage(f.read())
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     cmd = [
         config["claude_bin"],

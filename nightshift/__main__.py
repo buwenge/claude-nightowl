@@ -1,6 +1,6 @@
 """命令行入口：`python3 -m nightshift <子命令>`。
 
-add / list / show / run-now / cancel / quota / capture，全部中文帮助。
+add / list / show / run-now / cancel / quota / capture / serve，全部中文帮助。
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import launcher, quota, store
+from . import launcher, quota, scheduler, store
 from .context import context_limit_for
 
 __all__ = ["main"]
@@ -176,6 +176,19 @@ def cmd_capture(args) -> int:
     return 0
 
 
+def cmd_serve(args) -> int:
+    """调度器服务：--once 跑一轮 tick 就退出（cron 与集成测试用），否则常驻。"""
+    config = store.load_config()
+    store.ensure_dirs()
+    if args.once:
+        actions = scheduler.tick(config, datetime.now(timezone.utc))
+        for line in actions:
+            print(line)
+        return 0
+    scheduler.run_forever(config)
+    return 0
+
+
 # ---------- 参数表 ----------
 
 
@@ -226,6 +239,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id", help="任务 id")
     p.add_argument("--lines", type=int, default=200, help="抓最近多少行（默认 200）")
     p.set_defaults(func=cmd_capture)
+
+    p = sub.add_parser("serve", help="起调度器（systemd 常驻跑；--once 只跑一轮就退出）")
+    p.add_argument("--once", action="store_true",
+                   help="只跑一轮 tick 就退出（cron 与集成测试用）")
+    p.set_defaults(func=cmd_serve)
 
     return parser
 

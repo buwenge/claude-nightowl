@@ -62,6 +62,8 @@ python3 -m nightshift capture <任务id> --lines 200
 ```
 ~/.nightshift/
 ├── config.json                     # 你的配置（从 config.example.json 复制改）
+├── quota.json                      # 最近一次 /usage 的解析结果（调度器写）
+├── scheduler.log                   # 调度器日志（2 MB × 3 轮转）
 └── tasks/<任务id>/
     ├── task.json                   # 任务定义（你写的）
     ├── status.json                 # 机器状态（hook 与调度器写）
@@ -77,3 +79,26 @@ settings），七个事件都打到 `python3 -m nightshift.hook <任务id> <事�
 它读 stdin 的 JSON，只更新该任务自己的 `status.json`（文件锁 + 原子写），
 stdout 永远沉默。`Stop` 事件带回 `background_tasks`，据此区分"在等背景任务"
 和"真干完了一轮"。
+
+## 部署为 systemd 服务
+
+调度器是常驻前台进程，用 systemd 托管：
+
+1. 复制单元模板，改掉两处占位路径：
+   ```bash
+   cp deploy/nightshift.service.example /etc/systemd/system/nightshift.service
+   ```
+   - `WorkingDirectory=/path/to/nightshift` → 本仓库的绝对路径；
+   - `Environment=NIGHTSHIFT_HOME=/root/.nightshift` → 你的数据目录
+     （默认就是 `~/.nightshift` 的绝对路径）。
+2. 启动并设开机自启：
+   ```bash
+   systemctl daemon-reload
+   systemctl enable --now nightshift
+   ```
+3. 看调度日志：`~/.nightshift/scheduler.log`（2 MB × 3 轮转，stderr 同步一份）。
+
+任务窗口是 tmux 的子进程而不是服务的子进程，所以 `systemctl restart nightshift`
+不影响正在跑的任务。
+
+不想常驻的话，`python3 -m nightshift serve --once` 跑一轮调度就退出，适合挂 cron。

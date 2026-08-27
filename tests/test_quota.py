@@ -159,3 +159,16 @@ def test_fetch_usage_creates_missing_home(tmp_path, monkeypatch):
     assert usage["session_pct"] == 13
     assert usage["per_model"] == {"Fable": 35}
     assert missing.exists()  # ensure_dirs 已把数据目录骨架建出来
+
+
+def test_fetch_usage_fake_file_switch(tmp_path, monkeypatch):
+    """NIGHTSHIFT_FAKE_USAGE_FILE：读该文件当 /usage 输出，完全不起子进程
+    （serve --once 的集成测试用，monkeypatch 管不到子进程）。"""
+    usage_file = tmp_path / "usage.txt"
+    usage_file.write_text(fixture_text(), encoding="utf-8")
+    monkeypatch.setenv("NIGHTSHIFT_FAKE_USAGE_FILE", str(usage_file))
+    # 可执行文件路径是故意给的不存在值：真起了子进程必然炸，测试就露馅
+    usage = fetch_usage(dict(CONFIG, claude_bin="/nonexistent/claude"))
+    assert usage["session_pct"] == 13
+    assert usage["week_all_pct"] == 19
+    assert usage["per_model"] == {"Fable": 35}

@@ -1,0 +1,22 @@
+# nightshift 调度器的 systemd 单元模板。
+# 用法：复制到 /etc/systemd/system/nightshift.service，改掉下面两处占位路径，
+# 然后 systemctl daemon-reload && systemctl enable --now nightshift。
+# 注意：不要开 PrivateTmp / ProtectHome——要碰 /tmp/tmux-<uid>/default 与 ~/.claude/projects。
+[Unit]
+Description=nightshift scheduler (runs scheduled Claude Code sessions in tmux)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/path/to/nightshift
+Environment=NIGHTSHIFT_HOME=/root/.nightshift
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 -m nightshift serve
+Restart=on-failure
+RestartSec=5
+MemoryMax=256M
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
