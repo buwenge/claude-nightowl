@@ -342,3 +342,8 @@ fieldset.box summary { cursor: pointer; min-height: 44px; line-height: 44px; fon
 .warmup-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line, #8884); }
 .warmup-row label.inline { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
 .warmup-row input[type="time"] { padding: 0 8px; }
+
+/* 换班链：一张卡里列各班 */
+.shifts { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 6px 0 2px; font-size: 13px; color: var(--muted); }
+.shift-item { display: inline-flex; align-items: center; gap: 4px; }
+.shift-item .chip { font-size: 12px; padding: 1px 8px; }

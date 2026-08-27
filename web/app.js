@@ -242,13 +242,14 @@ function saveWarmup() {
     .catch(function () {});
 }
 
-function taskActions(item) {
+function taskActions(item, chainIds) {
   var task = item.task, status = item.status;
   var state = status.state;
   var box = el("div", { class: "actions" });
   function add(text, cls, handler) {
     box.appendChild(el("button", { type: "button", class: cls, text: text, onclick: handler }));
   }
+  chainIds = chainIds || [task.id];
   if (RUNNOW_STATES.indexOf(state) >= 0) {
     add("现在就跑", "primary", function () {
       api("POST", "./api/tasks/" + task.id + "/run-now")
@@ -265,18 +266,33 @@ function taskActions(item) {
     });
   }
   if (TERMINAL_STATES.indexOf(state) >= 0) {
-    add("删除", "danger", function () {
-      if (!confirm("删除「" + task.title + "」？任务目录（含事件日志）会一并清掉。")) return;
+    var many = chainIds.length > 1;
+    add(many ? "删除（整条链 " + chainIds.length + " 班）" : "删除", "danger", function () {
+      if (!confirm("删除「" + task.title + "」" + (many ? "的全部 " + chainIds.length + " 班" : "") + "？任务目录（含事件日志）会一并清掉。")) return;
       if (!confirm("再确认一次：真的删除？")) return;
-      api("DELETE", "./api/tasks/" + task.id)
-        .then(function () { refreshTasks(); })
-        .catch(function () {});
+      // 逐个删，删完再刷；某一班不是终态会被服务器 409 挡住，其余照删
+      chainIds.reduce(function (p, id) {
+        return p.then(function () { return api("DELETE", "./api/tasks/" + id).catch(function () {}); });
+      }, Promise.resolve()).then(function () { refreshTasks(); });
     });
   }
   if (status.window_id && !status.session_ended_at) {  // 会话已关的窗口抓不到画面
     add("看屏幕", "", function () { openScreen(task.id, task.title); });
   }
   return box.childNodes.length ? box : null;
+}
+
+// 一个任务的几班（root_id 相同）合成一条链：卡片以最新一班为准，里面列各班状态
+function groupChains(items) {
+  var byRoot = {};
+  items.forEach(function (item) {
+    var root = item.task.root_id || item.task.id;
+    (byRoot[root] = byRoot[root] || []).push(item);
+  });
+  return Object.keys(byRoot).map(function (root) {
+    var shifts = byRoot[root].sort(function (a, b) { return (a.task.shift || 1) - (b.task.shift || 1); });
+    return { root: root, shifts: shifts, latest: shifts[shifts.length - 1], first: shifts[0] };
+  });
 }
 
 function renderTasks(items) {
@@ -286,20 +302,39 @@ function renderTasks(items) {
     list.appendChild(el("p", { class: "hint", text: "还没有任务。去「新建」页排一个夜班吧。" }));
     return;
   }
-  items.sort(function (a, b) {
-    var ga = groupOf(a.status.state), gb = groupOf(b.status.state);
+  var chains = groupChains(items);
+  chains.sort(function (a, b) {
+    var ga = groupOf(a.latest.status.state), gb = groupOf(b.latest.status.state);
     if (ga !== gb) return ga - gb;
     // 终态组按 run_at 降序（最新在前）；其余组保持升序（早的先跑）
-    if (ga === 2) return a.task.run_at > b.task.run_at ? -1 : 1;
-    return a.task.run_at < b.task.run_at ? -1 : 1;
+    if (ga === 2) return a.first.task.run_at > b.first.task.run_at ? -1 : 1;
+    return a.first.task.run_at < b.first.task.run_at ? -1 : 1;
   });
   var now = Date.now();
-  items.forEach(function (item) {
-    list.appendChild(taskCard(item, now));
+  chains.forEach(function (chain) {
+    list.appendChild(chainCard(chain, now));
   });
 }
 
-function taskCard(item, now) {
+function chainCard(chain, now) {
+  var ids = chain.shifts.map(function (it) { return it.task.id; });
+  var card = taskCard(chain.latest, now, ids);
+  if (chain.shifts.length > 1) {
+    var row = el("div", { class: "shifts" });
+    chain.shifts.forEach(function (it, i) {
+      var st = it.status.state || "-";
+      row.appendChild(el("span", { class: "shift-item" }, [
+        el("span", { text: "第 " + (it.task.shift || i + 1) + " 班 " }),
+        el("span", { class: "chip st-" + st, text: STATE_TEXT[st] || st })
+      ]));
+    });
+    // 插在标题行之后
+    card.insertBefore(row, card.children[1]);
+  }
+  return card;
+}
+
+function taskCard(item, now, chainIds) {
   var task = item.task, status = item.status;
   var state = status.state || "-";
   var card = el("article", { class: "card" + (task.id === HIGHLIGHT_ID ? " flash" : "") });
@@ -311,17 +346,7 @@ function taskCard(item, now) {
   ]));
   card.appendChild(el("div", { class: "task-meta", text:
     "项目 " + task.project + " · 模型 " + task.model + " · 档位 " + task.effort +
-    (task.shift > 1 ? " · 第 " + task.shift + " 班" : "") }));
-
-  // 换班链：父卡指出后继，子卡指回上一班
-  if (status.successor_id) {
-    card.appendChild(el("div", { class: "quota-line",
-      text: "已续班 → " + status.successor_id }));
-  }
-  if (task.parent_id) {
-    card.appendChild(el("div", { class: "quota-line",
-      text: "上一班 " + task.parent_id }));
-  }
+    (chainIds && chainIds.length > 1 ? " · 共 " + chainIds.length + " 班" : "") }));
 
   // 计划时间与倒计时 / 已跑时长
   var whenText;
@@ -382,7 +407,7 @@ function taskCard(item, now) {
     ]));
   }
 
-  var actions = taskActions(item);
+  var actions = taskActions(item, chainIds);
   if (actions) card.appendChild(actions);
   return card;
 }
