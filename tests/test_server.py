@@ -595,3 +595,11 @@ def test_config_exposes_optional_home_link(authed):
     status, _, body = authed.request("GET", "/api/config")
     assert status == 200
     assert body["home_link"] == {"text": "← 主站", "href": "/"}
+
+
+def test_delete_allows_chained(authed):
+    task_id = make_task(authed, "已续班的父任务")
+    store.update_status(task_id, state="chained", successor_id="20260101-000000-0000")
+    status, _, _ = authed.request("DELETE", f"/api/tasks/{task_id}")
+    assert status == 200
+    assert not store.task_dir(task_id).exists()

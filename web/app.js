@@ -89,7 +89,7 @@ function fmtDelta(ms) {
 
 var STATE_TEXT = {
   scheduled: "已排班", postponed: "已推迟", launching: "正在启动", working: "干活中",
-  waiting_background: "等背景任务", idle: "一轮干完", chained: "等续班",
+  waiting_background: "等背景任务", idle: "一轮干完", chained: "已续班",
   exited: "已退出", finished: "已完成", failed: "已失败",
   cancelled: "已取消", needs_attention: "需要人工", chain_exhausted: "班次用尽"
 };
@@ -98,11 +98,11 @@ var ACTIVE_STATES = ["launching", "working", "waiting_background", "idle"];
 var RUNNOW_STATES = ["scheduled", "postponed", "failed", "cancelled"];
 var CANCEL_STATES = ["scheduled", "postponed"];
 var TERMINAL_STATES = ["exited", "finished", "failed", "cancelled",
-  "chain_exhausted", "needs_attention"];
+  "chain_exhausted", "needs_attention", "chained"];
 
 function groupOf(state) {
   if (ACTIVE_STATES.indexOf(state) >= 0) return 0;
-  if (state === "scheduled" || state === "postponed" || state === "chained") return 1;
+  if (state === "scheduled" || state === "postponed") return 1;
   return 2;
 }
 
@@ -206,7 +206,7 @@ function taskActions(item) {
         .catch(function () {});
     });
   }
-  if (status.window_id) {
+  if (status.window_id && !status.session_ended_at) {  // 会话已关的窗口抓不到画面
     add("看屏幕", "", function () { openScreen(task.id, task.title); });
   }
   return box.childNodes.length ? box : null;

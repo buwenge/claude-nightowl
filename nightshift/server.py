@@ -64,6 +64,7 @@ _RUN_NOW_STATES = ("scheduled", "postponed", "failed", "cancelled")
 # 可删除的终态
 _TERMINAL_STATES = (
     "exited", "finished", "failed", "cancelled", "chain_exhausted", "needs_attention",
+    "chained",  # 本班已把活交给后继，自己就是结束了（8/28 工头发现删不掉）
 )
 
 
