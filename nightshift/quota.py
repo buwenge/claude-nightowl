@@ -10,13 +10,16 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
+from datetime import datetime, timedelta, timezone
 
 from .store import ensure_dirs, home
 
 __all__ = [
+    "resets_in_minutes",
     "UsageParseError",
     "UsageUnavailable",
     "check_guards",
@@ -128,6 +131,35 @@ def fetch_usage(config: dict, timeout: int = 120) -> dict:
     if proc.returncode != 0:
         raise UsageUnavailable(f"/usage 退出码 {proc.returncode}：{proc.stderr[-500:]}")
     return parse_usage(proc.stdout)
+
+
+_RE_RESETS_AT = re.compile(r"([A-Z][a-z]{2}) (\d{1,2}), (\d{1,2})(?::(\d{2}))?(am|pm)\s*\((UTC)\)")
+
+
+def resets_in_minutes(resets_text: str | None, now: datetime | None = None) -> int | None:
+    """把 /usage 的 `Aug 27, 6:40pm (UTC)` 换算成"距现在几分钟刷新"（向上取整，最小 0）。
+
+    认不出来（格式变了 / 不是 UTC）返回 None，调用方按未知处理。年份按当前年，
+    若算出来在一天前以上，视为跨年取下一年。
+    """
+    if not resets_text:
+        return None
+    m = _RE_RESETS_AT.search(resets_text)
+    if not m:
+        return None
+    now = now or datetime.now(timezone.utc)
+    mon, day, hour, minute, ampm = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4) or 0), m.group(5)
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+    try:
+        when = datetime.strptime(f"{now.year} {mon} {day} {hour}:{minute}", "%Y %b %d %H:%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    if when < now - timedelta(days=1):
+        when = when.replace(year=now.year + 1)
+    return max(0, math.ceil((when - now).total_seconds() / 60))
 
 
 def check_guards(usage: dict, model: str, config: dict, guards: dict) -> tuple[bool, str]:

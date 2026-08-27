@@ -15,19 +15,29 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import store
 from .context import context_limit_for, read_context_tokens
 
-__all__ = ["handle_event", "handover_path", "main", "warn_threshold"]
+__all__ = ["alarm_plan", "handle_event", "handover_path", "main", "warn_threshold"]
 
-# 额度到线的回注文案（占位符由 store.render 做字面替换）
-QUOTA_WARN_TEXT = (
-    "[nightshift] 账号额度：五小时 {session_pct}% / 七日 {week_all_pct}%"
-    "（线 {session_max}%/{weekly_max}%），已到线或将到线，请尽快收尾并写交接。"
+# 五小时额度到线：停下等刷新（缓存闹钟）；周额度到线：收尾交接。文案在 config 里可改。
+QUOTA_PAUSE_TEXT = (
+    "[nightshift] 五小时额度只剩 {session_left}%（线 {session_line_left}%），约 {resets_in} 分钟后刷新。"
+    "现在停止干活，不要再开新的工具调用：按家规定缓存闹钟——用 ScheduleWakeup 连续设 {alarm_plan}，"
+    "每个闹钟醒来只输出一个“·”再设下一个，最后一个闹钟醒来后从刚才停下的地方继续。"
 )
+QUOTA_WRAPUP_TEXT = (
+    "[nightshift] 周额度只剩 {week_left}%（线 {week_line_left}%）{model_note}，一时半会儿刷新不了。"
+    "现在收尾：把已完成/未完成/下一步写进 {handover_path}，末行写 NEXT: done（本周不再续班，交接留给下次）；"
+    "未提交的改动 commit；然后停下。"
+)
+# 闹钟规矩：50 分钟一个（缓存 TTL 约 1 小时），尾数补一个短的，再加几分钟缓冲
+ALARM_UNIT_MINUTES = 50
+ALARM_BUFFER_MINUTES = 3
+ALARM_FALLBACK_COUNT = 6  # 刷新时间没查到：按五小时最长等
 
 
 def _context_limit(task: dict, config: dict) -> int:
@@ -59,6 +69,22 @@ def handover_path(task: dict) -> Path:
     return store.task_dir(task["id"]) / f"handover-{shift}.md"
 
 
+def alarm_plan(resets_in: int | None) -> tuple[str, int]:
+    """把"几分钟后刷新"排成闹钟串，返回 (文案, 总分钟)。"""
+    if resets_in is None:
+        total = ALARM_UNIT_MINUTES * ALARM_FALLBACK_COUNT
+        return f"{ALARM_UNIT_MINUTES} 分钟 × {ALARM_FALLBACK_COUNT} 个（刷新时间没查到，按最长等）", total
+    total = resets_in + ALARM_BUFFER_MINUTES
+    full, rem = divmod(total, ALARM_UNIT_MINUTES)
+    parts = [f"{ALARM_UNIT_MINUTES} 分钟"] * full
+    if rem:
+        parts.append(f"{rem} 分钟")
+    if not parts:
+        parts = [f"{ALARM_BUFFER_MINUTES} 分钟"]
+        total = ALARM_BUFFER_MINUTES
+    return "、".join(parts) + f"（共 {len(parts)} 个）", total
+
+
 def _read_fresh_usage(config: dict) -> dict | None:
     """读 home()/quota.json（调度器在刷新），返回 usage dict。
 
@@ -84,40 +110,56 @@ def _read_fresh_usage(config: dict) -> dict | None:
     return usage if isinstance(usage, dict) else None
 
 
-def _quota_warning(task: dict, config: dict) -> str:
-    """额度到线判定：五小时 ≥ session_pct_max、七日全部 ≥ weekly_pct_max、
-    任务模型自己的单模型周线 ≥ weekly_pct_max，任一命中就回注一段文案。
-    不命中 / 没有新鲜额度返回空串。"""
+def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
+    """额度判定，返回 (种类, 回注文案, 要写进 status 的字段)。
+
+    种类：
+    - "wrapup"：七日全模型线或任务模型自己的周线到了 → 收尾交接（优先级高，刷新不了）；
+    - "pause"：五小时线到了 → 停下定缓存闹钟等刷新；
+    - None：都没到，或没有新鲜额度。
+    阈值取 task.guards.session_pct_max / weekly_pct_max（"已用"百分比）。
+    """
     guards = task.get("guards") or {}
     session_max = guards.get("session_pct_max")
     weekly_max = guards.get("weekly_pct_max")
     if session_max is None or weekly_max is None:
-        return ""
+        return None, "", {}
     usage = _read_fresh_usage(config)
     if usage is None:
-        return ""
+        return None, "", {}
     session_pct = usage.get("session_pct")
     week_all_pct = usage.get("week_all_pct")
-    hit = (
-        (isinstance(session_pct, int) and session_pct >= session_max)
-        or (isinstance(week_all_pct, int) and week_all_pct >= weekly_max)
-    )
-    if not hit:
-        label = (config.get("models") or {}).get(task.get("model", ""), {}).get(
-            "usage_label"
+    label = (config.get("models") or {}).get(task.get("model", ""), {}).get("usage_label")
+    model_pct = (usage.get("per_model") or {}).get(label) if label else None
+
+    week_hit = isinstance(week_all_pct, int) and week_all_pct >= weekly_max
+    model_hit = isinstance(model_pct, int) and model_pct >= weekly_max
+    if week_hit or model_hit:
+        model_note = f"，{label} 单独周线剩 {100 - model_pct}%" if model_hit else ""
+        text = store.render(
+            config.get("quota_wrapup_text") or QUOTA_WRAPUP_TEXT,
+            week_left=("?" if week_all_pct is None else 100 - week_all_pct),
+            week_line_left=100 - weekly_max,
+            model_note=model_note,
+            handover_path=str(handover_path(task)),
         )
-        pct = (usage.get("per_model") or {}).get(label)
-        if isinstance(pct, int) and pct >= weekly_max:
-            hit = True
-    if not hit:
-        return ""
-    return store.render(
-        config.get("quota_warn_text") or QUOTA_WARN_TEXT,  # 模板页可改，缺省用常量
-        session_pct="?" if session_pct is None else session_pct,
-        week_all_pct="?" if week_all_pct is None else week_all_pct,
-        session_max=session_max,
-        weekly_max=weekly_max,
-    )
+        return "wrapup", text, {}
+
+    if isinstance(session_pct, int) and session_pct >= session_max:
+        from .quota import resets_in_minutes
+
+        resets_in = resets_in_minutes(usage.get("session_resets"))
+        plan, total = alarm_plan(resets_in)
+        text = store.render(
+            config.get("quota_pause_text") or QUOTA_PAUSE_TEXT,
+            session_left=100 - session_pct,
+            session_line_left=100 - session_max,
+            resets_in=("未知" if resets_in is None else resets_in),
+            alarm_plan=plan,
+        )
+        paused_until = datetime.now(timezone.utc) + timedelta(minutes=total)
+        return "pause", text, {"quota_paused_until": paused_until.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    return None, "", {}
 
 
 def _refresh_context(task: dict, payload: dict, fields: dict) -> None:
@@ -204,13 +246,25 @@ def _post_tool_use_refresh(task: dict, status: dict, payload: dict) -> str | Non
                         store.append_event(
                             task_id, f"回注上下文提醒 #{count}（{tokens}）"
                         )
-        quota_text = _quota_warning(task, config)
-        if quota_text:
+        kind, quota_text, quota_fields = _quota_check(task, config)
+        if kind == "wrapup":
             inject.append(quota_text)
             count = int(status.get("quota_warn_count") or 0) + 1
+            # 周额度收尾等同"被提醒过要交接"，换班判定认 context_warned_at
+            extra["context_warned_at"] = status.get("context_warned_at") or now
             extra["quota_warned_at"] = status.get("quota_warned_at") or now
             extra["quota_warn_count"] = count
-            store.append_event(task_id, f"回注额度提醒 #{count}")
+            extra["handover_path"] = str(handover_path(task))
+            store.append_event(task_id, f"回注周额度收尾提醒 #{count}")
+        elif kind == "pause":
+            inject.append(quota_text)
+            count = int(status.get("quota_pause_count") or 0) + 1
+            extra["quota_pause_count"] = count
+            extra["quota_paused_at"] = now
+            extra.update(quota_fields)
+            store.append_event(
+                task_id, f"回注五小时额度暂停提醒 #{count}，预计 {quota_fields.get('quota_paused_until')} 后可继续"
+            )
     if extra:
         store.update_status(task_id, **extra)
     return "\n\n".join(inject) if inject else None
@@ -288,11 +342,14 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
         # Stop 不回注（stdout 语义不同），但同样刷新水位并把"是否过警戒线"
         # 落盘，供调度器换班判断（"这班收到过注入"用 context_warned_at 判）
         fields["over_warn_line"] = _over_warn_line(task, fields["context_tokens"])
-        fields["state"] = (
-            "waiting_background"
-            if any(t.get("status") == "running" for t in background_tasks)
-            else "idle"
-        )
+        crons = payload.get("session_crons") or []
+        fields["session_crons"] = crons
+        if any(t.get("status") == "running" for t in background_tasks):
+            fields["state"] = "waiting_background"
+        elif crons:
+            fields["state"] = "waiting_wakeup"  # 它自己定了闹钟（如额度暂停的缓存闹钟），不是干完了
+        else:
+            fields["state"] = "idle"
         store.update_status(task_id, **fields)
         store.append_event(task_id, f"hook Stop → {fields['state']}")
         return None

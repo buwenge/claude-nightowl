@@ -404,14 +404,15 @@ class _Handler(BaseHTTPRequestHandler):
             "chain": cfg.get("chain") or {},
             "prompt_template": cfg.get("prompt_template", ""),
             "context_warn_text": cfg.get("context_warn_text", ""),
-            "quota_warn_text": cfg.get("quota_warn_text", ""),
+            "quota_pause_text": cfg.get("quota_pause_text", ""),
+            "quota_wrapup_text": cfg.get("quota_wrapup_text", ""),
             "chain_template": cfg.get("chain_template", ""),
             "display_tz_offset_hours": cfg.get("display_tz_offset_hours"),
             # 可选：顶栏"回主站"链接 {"text": "...", "href": "..."}，没配就不显示
             "home_link": (cfg.get("http") or {}).get("home_link"),
         })
 
-    _TEMPLATE_KEYS = ("prompt_template", "context_warn_text", "quota_warn_text", "chain_template")
+    _TEMPLATE_KEYS = ("prompt_template", "context_warn_text", "quota_pause_text", "quota_wrapup_text", "chain_template")
 
     def _api_templates(self) -> None:
         data = self._read_json()

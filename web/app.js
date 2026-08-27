@@ -89,12 +89,12 @@ function fmtDelta(ms) {
 
 var STATE_TEXT = {
   scheduled: "已排班", postponed: "已推迟", launching: "正在启动", working: "干活中",
-  waiting_background: "等背景任务", idle: "一轮干完", chained: "已续班",
+  waiting_background: "等背景任务", waiting_wakeup: "等闹钟", idle: "一轮干完", chained: "已续班",
   exited: "已退出", finished: "已完成", failed: "已失败",
   cancelled: "已取消", needs_attention: "需要人工", chain_exhausted: "班次用尽"
 };
 
-var ACTIVE_STATES = ["launching", "working", "waiting_background", "idle"];
+var ACTIVE_STATES = ["launching", "working", "waiting_background", "waiting_wakeup", "idle"];
 var RUNNOW_STATES = ["scheduled", "postponed", "failed", "cancelled"];
 var CANCEL_STATES = ["scheduled", "postponed"];
 var TERMINAL_STATES = ["exited", "finished", "failed", "cancelled",
@@ -433,6 +433,10 @@ function populateNewForm() {
   });
   if ((CFG.efforts || []).indexOf("high") >= 0) effort.value = "high";
   $("f-warntext").value = CFG.context_warn_text || "";
+  if (CFG.guards) {
+    if (typeof CFG.guards.session_pct_max === "number") $("f-sessionleft").value = 100 - CFG.guards.session_pct_max;
+    if (typeof CFG.guards.weekly_pct_max === "number") $("f-weekleft").value = 100 - CFG.guards.weekly_pct_max;
+  }
   if (CFG.chain) {
     if (typeof CFG.chain.max_windows === "number") $("f-chainmax").value = CFG.chain.max_windows;
     $("f-nohandover").value = CFG.chain.on_no_handover || "continue";
@@ -468,6 +472,8 @@ function submitNewForm(ev) {
   if (warnTokens !== "") guards.context_warn_tokens = Number(warnTokens);
   if ($("f-warntext").value !== (CFG.context_warn_text || ""))
     guards.context_warn_text = $("f-warntext").value;
+  if ($("f-sessionleft").value !== "") guards.session_pct_max = 100 - Number($("f-sessionleft").value);
+  if ($("f-weekleft").value !== "") guards.weekly_pct_max = 100 - Number($("f-weekleft").value);
   var chain = {};
   if ($("f-chainmax").value !== "")
     chain.max_windows = Number($("f-chainmax").value);
@@ -492,7 +498,8 @@ function loadTemplatesView() {
     CFG = cfg;
     $("t-prompt").value = cfg.prompt_template || "";
     $("t-warntext").value = cfg.context_warn_text || "";
-    $("t-quotatext").value = cfg.quota_warn_text || "";
+    $("t-quotapause").value = cfg.quota_pause_text || "";
+    $("t-quotawrap").value = cfg.quota_wrapup_text || "";
     $("t-chain").value = cfg.chain_template || "";
   }).catch(function () {});
 }
@@ -503,7 +510,8 @@ function saveTemplates() {
   api("PUT", "./api/templates", {
     prompt_template: $("t-prompt").value,
     context_warn_text: $("t-warntext").value,
-    quota_warn_text: $("t-quotatext").value,
+    quota_pause_text: $("t-quotapause").value,
+    quota_wrapup_text: $("t-quotawrap").value,
     chain_template: $("t-chain").value
   }).then(function () {
     note.textContent = "已保存";

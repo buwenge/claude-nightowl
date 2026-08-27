@@ -69,6 +69,14 @@
         <label for="f-warntext"><b>到线时注入的话</b></label>
         <textarea id="f-warntext" rows="4"></textarea>
 
+        <label for="f-sessionleft"><b>五小时额度剩余低于多少 % 就暂停等刷新</b></label>
+        <input type="number" id="f-sessionleft" min="0" max="100" step="1">
+        <p class="hint">到线时注入"停下、定缓存闹钟等刷新"，刷新后自动继续。</p>
+
+        <label for="f-weekleft"><b>周额度剩余低于多少 % 就收尾交接</b></label>
+        <input type="number" id="f-weekleft" min="0" max="100" step="1">
+        <p class="hint">七日全模型线或该模型单独周线任一到线，注入"收尾写交接"，本周不续班。起跑前预检也按这两条线放行/推迟。</p>
+
         <label for="f-chainmax"><b>一晚最多几班</b></label>
         <input type="number" id="f-chainmax" min="1" max="20" step="1">
 
@@ -102,9 +110,13 @@
     <p class="hint">占位符：{ctx_k} {limit_k} {handover_path}</p>
     <textarea id="t-warntext" class="tall" rows="6"></textarea>
 
-    <h2>额度到线提醒</h2>
-    <p class="hint">占位符：{session_pct} {week_all_pct} {session_max} {weekly_max}（已用百分比与警戒线，系统自动填）</p>
-    <textarea id="t-quotatext" class="tall" rows="4"></textarea>
+    <h2>五小时额度到线：暂停等刷新</h2>
+    <p class="hint">占位符：{session_left} 剩余% · {session_line_left} 线（剩余%）· {resets_in} 几分钟后刷新 · {alarm_plan} 闹钟排法（系统自动填）</p>
+    <textarea id="t-quotapause" class="tall" rows="5"></textarea>
+
+    <h2>周额度到线：收尾交接</h2>
+    <p class="hint">占位符：{week_left} 剩余% · {week_line_left} 线（剩余%）· {model_note} 单模型周线说明 · {handover_path}</p>
+    <textarea id="t-quotawrap" class="tall" rows="5"></textarea>
 
     <h2>续班模板</h2>
     <p class="hint">占位符：{task} {shift} {handover} {title} {project_path} {context_limit}（系统自动填，改文案别删花括号）</p>

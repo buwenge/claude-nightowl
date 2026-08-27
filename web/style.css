@@ -182,7 +182,7 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
 .chip.st-scheduled { background: var(--chip-sched); }
 .chip.st-postponed { background: var(--warn); color: #201a00; }
 .chip.st-launching, .chip.st-working { background: var(--accent); }
-.chip.st-waiting_background { background: var(--purple); }
+.chip.st-waiting_background, .chip.st-waiting_wakeup { background: var(--purple); }
 .chip.st-idle { background: var(--ok); }
 .chip.st-exited, .chip.st-finished { background: var(--chip-done); }
 .chip.st-failed, .chip.st-needs_attention, .chip.st-chain_exhausted { background: var(--danger); }

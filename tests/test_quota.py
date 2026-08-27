@@ -172,3 +172,16 @@ def test_fetch_usage_fake_file_switch(tmp_path, monkeypatch):
     assert usage["session_pct"] == 13
     assert usage["week_all_pct"] == 19
     assert usage["per_model"] == {"Fable": 35}
+
+
+def test_resets_in_minutes():
+    from datetime import datetime, timezone
+    from nightshift.quota import resets_in_minutes
+    now = datetime(2026, 8, 27, 16, 50, tzinfo=timezone.utc)
+    assert resets_in_minutes("Aug 27, 6:40pm (UTC)", now) == 110
+    assert resets_in_minutes("Aug 27, 12pm (UTC)", now) == 0        # 已过，取 0
+    assert resets_in_minutes("Sep 2, 12am (UTC)", now) == (5 * 24 + 7) * 60 + 10
+    assert resets_in_minutes("垃圾", now) is None
+    assert resets_in_minutes(None, now) is None
+    # 跨年：一月的时间在八月看来是"一天前以上" → 算下一年
+    assert resets_in_minutes("Jan 1, 1am (UTC)", now) > 100 * 24 * 60

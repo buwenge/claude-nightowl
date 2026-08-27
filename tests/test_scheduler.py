@@ -721,3 +721,32 @@ def test_run_forever_swallows_tick_error(tmp_path, monkeypatch):
     scheduler.run_forever(CONFIG, max_ticks=1)  # 不许往外抛
     log = (store.home() / "scheduler.log").read_text(encoding="utf-8")
     assert "炸了" in log
+
+
+def test_waiting_wakeup_not_finished_nor_poked(monkeypatch):
+    """等闹钟：不收尾、不续班、不 send-keys；刷新时间没到的 idle 也不收尾。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t))
+    monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: None)
+    now = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+    tid = make_task()
+    store.update_status(tid, state="waiting_wakeup", window_id="@1", pane_pid=1,
+                        last_event_at="2026-08-27T09:00:00Z",
+                        quota_paused_until="2026-08-27T13:00:00Z")
+    sched.tick(CONFIG, now)
+    assert store.read_status(tid)["state"] == "waiting_wakeup" and sent == []
+    # 刷新时间没到、它却没定闹钟就停了（idle）→ 也不收尾
+    store.update_status(tid, state="idle")
+    sched.tick(CONFIG, now)
+    assert store.read_status(tid)["state"] == "idle" and sent == []
+    # 刷新时间到了还 idle → 敲一句继续，只敲一次
+    later = datetime(2026, 8, 27, 13, 5, tzinfo=timezone.utc)
+    sched.tick(CONFIG, later)
+    assert len(sent) == 1 and "额度应已刷新" in sent[0]
+    st = store.read_status(tid)
+    assert st["quota_resume_sent"] and st["quota_paused_until"] is None
+    sched.tick(CONFIG, later)
+    assert len(sent) == 1

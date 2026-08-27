@@ -25,7 +25,7 @@ __all__ = ["parse_iso", "to_iso", "tick", "run_forever"]
 # retry_max 的兜底值（task.json 里没写时按 3）
 DEFAULT_RETRY_MAX = 3
 # 视为"活跃"的状态：额度刷新看它们，同目录不并跑也拦它们
-ACTIVE_STATES = ("launching", "working", "waiting_background")
+ACTIVE_STATES = ("launching", "working", "waiting_background", "waiting_wakeup")
 # config.scheduler 缺 keepalive_text 时的兜底文案（与 config.example.json 一致）
 DEFAULT_KEEPALIVE_TEXT = (
     "来自nightshift：保活探针——背景任务还在跑吗？简短回一句即可。"
@@ -88,7 +88,7 @@ def tick(config: dict, now: datetime) -> list[str]:
                 actions.extend(_try_launch(task, status, config, now))
         elif state == "launching":
             actions.extend(_check_launching(task, status, config, now))
-        elif state in ("working", "waiting_background", "idle"):
+        elif state in ("working", "waiting_background", "waiting_wakeup", "idle"):
             actions.extend(_check_running(task, status, config, now))
         elif state == "exited":
             # S3 换班：exited 也评估一次（写完交接后会话被关/崩了的情形）
@@ -367,6 +367,20 @@ def _check_running(
             task_id, f"会话权限模式是 {mode} 不是 auto，已开提醒窗口（不改状态）"
         )
         return [f"{task_id} 权限模式 {mode} 非 auto → 提醒窗口"]
+
+    # 五小时额度暂停：它该在等缓存闹钟。没定闹钟就停了的（idle），刷新时间一到
+    # 敲一句让它继续；刷新时间没到之前 idle 也不算干完，不许收尾/续班
+    paused_until = status.get("quota_paused_until")
+    if paused_until and status.get("state") in ("idle", "waiting_wakeup"):
+        if now < parse_iso(paused_until):
+            return []
+        if status.get("state") == "idle" and not status.get("quota_resume_sent"):
+            launcher.send_keys(str(window_id), "来自nightshift：五小时额度应已刷新，请从刚才停下的地方继续。")
+            store.update_status(task_id, quota_resume_sent=True, quota_paused_until=None)
+            store.append_event(task_id, "额度刷新时间已到而它没定闹钟，已 send-keys 让它继续")
+            return [f"{task_id} 额度刷新，敲它继续"]
+        if status.get("state") == "waiting_wakeup":
+            return []  # 闹钟还没响完，等它自己醒
 
     # S3 换班：idle 收尾后按交接文件接下一班（每次评估先落 chain_checked
     # 防重复；评估失败的代价是这班不再自动续，好过重复开出双份后继）

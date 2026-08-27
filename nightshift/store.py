@@ -54,6 +54,7 @@ STATES = (
     "launching",
     "working",
     "waiting_background",
+    "waiting_wakeup",
     "idle",
     "chained",
     "exited",

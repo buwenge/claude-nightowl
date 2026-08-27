@@ -381,14 +381,14 @@ def test_post_tool_use_quota_warn(tmp_path):
     payload = make_transcript(tmp_path / "transcript.jsonl", 100)
     for _ in range(19):
         run_hook(task_id, "PostToolUse", payload)
-    proc = run_hook(task_id, "PostToolUse", payload)  # 第 20 次：只有额度一段
+    proc = run_hook(task_id, "PostToolUse", payload)  # 第 20 次：只有五小时暂停一段
     ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "五小时 85%" in ctx
-    assert "线 80%/95%" in ctx
+    assert "五小时额度只剩 15%" in ctx and "线 20%" in ctx
+    assert "ScheduleWakeup" in ctx and "50 分钟" in ctx
     assert "上下文已" not in ctx  # 上下文没到线，只有额度这一段
     status = store.read_status(task_id)
-    assert status["quota_warned_at"]
-    assert status["quota_warn_count"] == 1
+    assert status["quota_pause_count"] == 1
+    assert status["quota_paused_until"]
 
 
 def test_post_tool_use_stale_quota_ignored(tmp_path):
@@ -427,7 +427,7 @@ def test_post_tool_use_context_and_quota_one_json_two_paragraphs(tmp_path):
     assert len(lines) == 1  # 两种提醒也只打一个 JSON
     ctx = json.loads(lines[0])["hookSpecificOutput"]["additionalContext"]
     assert "上下文已 1k / 2k" in ctx
-    assert "五小时 85%" in ctx
+    assert "额度只剩" in ctx
     assert "\n\n" in ctx  # 两段用空行隔开
     status = store.read_status(task_id)
     assert status["context_warn_count"] == 1
@@ -626,7 +626,7 @@ def test_session_end_keeps_terminal_states(tmp_path):
 def test_quota_warn_text_from_config(tmp_path):
     """额度提醒文案走 config.quota_warn_text（模板页可改），不再是藏起来的常量。"""
     cfg = dict(CONFIG)
-    cfg["quota_warn_text"] = "自定义额度提醒：五小时用了{session_pct}，线{session_max}"
+    cfg["quota_pause_text"] = "自定义暂停：剩{session_left}，线{session_line_left}"
     store.atomic_write_json(store.home() / "config.json", cfg)
     task_id = make_task(guards={
         "session_pct_max": 80, "weekly_pct_max": 95,
@@ -638,4 +638,44 @@ def test_quota_warn_text_from_config(tmp_path):
         run_hook(task_id, "PostToolUse", payload)
     proc = run_hook(task_id, "PostToolUse", payload)
     ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert ctx == "自定义额度提醒：五小时用了85，线80"
+    assert ctx == "自定义暂停：剩15，线20"
+
+
+def test_weekly_quota_wrapup_beats_pause(tmp_path):
+    """周线到了 → 收尾交接（哪怕五小时也到了，收尾优先）；写 context_warned_at 供换班判定。"""
+    task_id = make_task(guards={
+        "session_pct_max": 80, "weekly_pct_max": 95,
+        "context_warn_tokens": 100000, "context_limit_tokens": 200000,
+    })
+    write_quota(session=90, week=97)
+    payload = make_transcript(tmp_path / "transcript.jsonl", 100)
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", payload)
+    proc = run_hook(task_id, "PostToolUse", payload)
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "周额度只剩 3%" in ctx and "NEXT: done" in ctx and "handover-1.md" in ctx
+    assert "ScheduleWakeup" not in ctx
+    status = store.read_status(task_id)
+    assert status["quota_warn_count"] == 1 and status["context_warned_at"]
+
+
+def test_stop_with_session_crons_is_waiting_wakeup():
+    task_id = make_task()
+    run_hook(task_id, "Stop", json.dumps({
+        "background_tasks": [],
+        "session_crons": [{"id": "x", "schedule": "50 20 * * *", "recurring": False, "prompt": "继续"}],
+        "last_assistant_message": "·",
+    }))
+    status = store.read_status(task_id)
+    assert status["state"] == "waiting_wakeup"
+    assert status["session_crons"][0]["id"] == "x"
+
+
+def test_alarm_plan():
+    from nightshift.hook import alarm_plan
+    text, total = alarm_plan(110)
+    assert text == "50 分钟、50 分钟、13 分钟（共 3 个）" and total == 113
+    text, total = alarm_plan(0)
+    assert text == "3 分钟（共 1 个）" and total == 3
+    text, total = alarm_plan(None)
+    assert "按最长等" in text and total == 300
