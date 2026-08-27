@@ -405,8 +405,9 @@ def make_task(authed, title="列表任务"):
 
 def test_run_now_on_scheduled_resets_state(authed):
     task_id = make_task(authed, "现在就跑")
-    store.update_status(task_id, state="scheduled", retries=2,
-                        retry_at="2026-08-27T10:00:00Z")
+    store.update_status(task_id, state="failed", retries=2,
+                        retry_at="2026-08-27T10:00:00Z",
+                        error="旧错误", postpone_reason="旧原因")
     status, _, body = authed.request("POST", f"/api/tasks/{task_id}/run-now")
     assert status == 200, body
     task = store.load_task(task_id)
@@ -417,6 +418,7 @@ def test_run_now_on_scheduled_resets_state(authed):
     assert status_data["retries"] == 0
     assert "retry_at" not in status_data
     assert "next_attempt_at" not in status_data
+    assert "error" not in status_data and "postpone_reason" not in status_data
 
 
 def test_run_now_rejects_idle(authed):

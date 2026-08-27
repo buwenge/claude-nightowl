@@ -493,6 +493,8 @@ class _Handler(BaseHTTPRequestHandler):
             status["last_event_at"] = store.utc_now_iso()
             status.pop("next_attempt_at", None)
             status.pop("retry_at", None)
+            status.pop("error", None)
+            status.pop("postpone_reason", None)
 
         store.modify_status(task_id, mut)
         store.append_event(task_id, "网页：现在就跑（run_at 改为当前，下一轮 tick 走完整预检）")

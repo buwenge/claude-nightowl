@@ -202,6 +202,8 @@ def launch(task_id: str, config: dict) -> dict:
         transcript_path=expected_transcript,
         window_id=None,
         pane_pid=None,
+        error=None,            # 上一次失败/推迟的原因到此作废，别在卡片上赖着（8/27 工头看见旧红字）
+        postpone_reason=None,
         last_event_at=store.utc_now_iso(),
     )
 

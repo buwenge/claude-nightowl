@@ -358,3 +358,21 @@ def test_notice_window_suffix_and_send_keys(tmp_path, monkeypatch):
     calls.clear()
     launcher.send_keys("@7", "保活探针")
     assert calls == [("send-keys", "-t", "@7", "保活探针", "Enter")]
+
+
+def test_launch_clears_stale_error(tmp_path, monkeypatch):
+    """重跑成功后旧的 error/postpone_reason 必须清掉——否则卡片一直显示上一次失败原因。"""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    claude_json = tmp_path / "claude.json"
+    claude_json.write_text(
+        json.dumps({"projects": {str(proj): {"hasTrustDialogAccepted": True}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NIGHTSHIFT_CLAUDE_JSON", str(claude_json))
+    task_id, config = make_task(str(proj))
+    store.update_status(task_id, state="failed", error="旧错误", postpone_reason="旧原因")
+    monkeypatch.setattr(launcher, "_tmux", lambda *a: subprocess.CompletedProcess(a, 0, "@1\n" if a[0] == "new-window" else "123\n", ""))
+    status = launcher.launch(task_id, config)
+    assert status["state"] == "launching"
+    assert status["error"] is None and status["postpone_reason"] is None
