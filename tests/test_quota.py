@@ -139,3 +139,23 @@ def test_fetch_usage_nonzero_exit(tmp_path):
     with pytest.raises(UsageUnavailable) as exc_info:
         fetch_usage(config)
     assert "坏了" in str(exc_info.value)
+
+
+def test_fetch_usage_creates_missing_home(tmp_path, monkeypatch):
+    """NIGHTSHIFT_HOME 指向不存在的目录：先建目录再跑子进程，照常解析（R3）。"""
+    missing = tmp_path / "not" / "created"
+    monkeypatch.setenv("NIGHTSHIFT_HOME", str(missing))
+    assert not missing.exists()
+
+    fake = tmp_path / "fake_probe.sh"
+    fake.write_text(
+        "#!/bin/bash\n"
+        f"cat '{FIXTURES / 'usage_output.txt'}'\n",
+        encoding="utf-8",
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+
+    usage = fetch_usage(dict(CONFIG, claude_bin=str(fake)))
+    assert usage["session_pct"] == 13
+    assert usage["per_model"] == {"Fable": 35}
+    assert missing.exists()  # ensure_dirs 已把数据目录骨架建出来

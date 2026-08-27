@@ -1,6 +1,7 @@
 """hook 接收端的测试：子进程喂夹具，逐步核对 status.json 的状态机。"""
 
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -221,6 +222,96 @@ def test_post_tool_use_refreshes_every_20(tmp_path):
     assert status["tool_calls"] == 20
     assert status["context_tokens"] == 500
     assert status["context_pct"] == 50
+
+
+# ---------- 并发 hook 进程（R2：计数不许丢）----------
+
+
+def _run_hook_proc(task_id: str, event: str, payload: str) -> None:
+    proc = run_hook(task_id, event, payload)
+    assert proc.returncode == 0
+    assert proc.stdout == ""
+
+
+def _spawn_and_join(procs) -> None:
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(60)
+    assert all(p.exitcode == 0 for p in procs)
+
+
+def test_concurrent_post_tool_use_counts():
+    """8 个 hook 进程同时打点，tool_calls 一次不丢。"""
+    task_id = make_task()
+    payload = '{"hook_event_name":"PostToolUse"}'
+    procs = [
+        multiprocessing.Process(
+            target=_run_hook_proc, args=(task_id, "PostToolUse", payload)
+        )
+        for _ in range(8)
+    ]
+    _spawn_and_join(procs)
+    assert store.read_status(task_id)["tool_calls"] == 8
+
+
+def test_concurrent_subagents_start_stop():
+    """4 起 4 停同时跑，最后 subagents_running 归零。"""
+    task_id = make_task()
+    procs = [
+        multiprocessing.Process(
+            target=_run_hook_proc,
+            args=(task_id, "SubagentStart", '{"hook_event_name":"SubagentStart"}'),
+        )
+        for _ in range(4)
+    ] + [
+        multiprocessing.Process(
+            target=_run_hook_proc,
+            args=(task_id, "SubagentStop", '{"hook_event_name":"SubagentStop"}'),
+        )
+        for _ in range(4)
+    ]
+    _spawn_and_join(procs)
+    assert store.read_status(task_id)["subagents_running"] == 0
+
+
+# ---------- config 缺失时的兜底（R4）----------
+
+
+def test_stop_without_config_still_updates(tmp_path):
+    """config.json 缺失算不出上限：Stop 照常落盘，context_pct 留空，events 留痕。"""
+    task_id = make_task()  # guards 里没有 context_limit_tokens → 会去读 config
+    (store.home() / "config.json").unlink()
+    assert not (store.home() / "config.json").exists()
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "usage": {
+                        "input_tokens": 150,
+                        "cache_read_input_tokens": 30,
+                        "cache_creation_input_tokens": 20,
+                    }
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    payload = json.loads(fixture("hook_stop_idle.json"))
+    payload["transcript_path"] = str(transcript)
+    proc = run_hook(task_id, "Stop", json.dumps(payload, ensure_ascii=False))
+    assert proc.returncode == 0 and proc.stdout == ""
+
+    status = store.read_status(task_id)
+    assert status["state"] == "idle"
+    assert status["context_tokens"] == 200  # transcript 照常统计
+    assert status["context_pct"] is None
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "算不出上限" in events
 
 
 def test_precompact_only_logs():

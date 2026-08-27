@@ -104,6 +104,10 @@ def test_write_task_files(tmp_path):
     assert f"NIGHTSHIFT_HOME='{store.home()}'" in run_sh
     assert f"PYTHONPATH='{REPO_ROOT}'" in run_sh
     assert "claude 已退出" in run_sh
+    # 提示词参数必须整体包在双引号里（防切词/展开）：含 "$(cat 且该行以 )" 收尾
+    cat_line = next(line for line in run_sh.splitlines() if "$(cat " in line)
+    assert '"$(cat ' in cat_line
+    assert cat_line.endswith(')"')
     mode = (d / "run.sh").stat().st_mode
     assert mode & 0o700 == 0o700  # 可执行
 
@@ -213,7 +217,11 @@ def wait_for_state(task_id: str, timeout: float = 15.0):
 
 
 def test_launch_full_cycle(tmux_session, trusted_env, tmp_path):
-    task_id, config = make_task(project_path=str(trusted_env["proj"]))
+    # 提示词含空格/换行/通配符/$变量/单引号：run.sh 里的双引号必须把它整个包住
+    prompt_final = "第一行 有空格\n第二行 *.py $HOME it's\n第三行"
+    task_id, config = make_task(
+        project_path=str(trusted_env["proj"]), prompt_final=prompt_final
+    )
     status = launcher.launch(task_id, config)
 
     assert re.fullmatch(r"@\d+", status["window_id"])
@@ -245,6 +253,22 @@ def test_launch_full_cycle(tmux_session, trusted_env, tmp_path):
     assert "--settings" in fake_log
     assert "--session-id" in fake_log
     assert status["session_id"] in fake_log
+
+    # 提示词参数核对：printf '%s\n' "$@" 会把参数里的换行原样打出来，
+    # 所以 --settings 之后要按"整段"读，不能按行数数。
+    idx = fake_log.index("\n--settings\n") + len("\n--settings\n")
+    settings_path, sep, rest = fake_log[idx:].partition("\n")
+    assert sep == "\n"
+    assert settings_path == str(store.task_dir(task_id) / "settings.json")
+    assert rest.endswith("\n")  # printf 给每个参数补的换行
+    prompt_arg = rest[:-1]  # 去掉 printf 补的换行，剩下的就是那个参数原文
+    # --settings 之后只有一个参数，且与 prompt.txt 去掉末尾换行后完全相等
+    # （命令替换本来就会剥掉末尾换行，两者天然一致）
+    prompt_txt = (store.task_dir(task_id) / "prompt.txt").read_text(encoding="utf-8")
+    if prompt_txt.endswith("\n"):
+        prompt_txt = prompt_txt[:-1]
+    assert prompt_arg == prompt_txt
+    assert prompt_arg == "第一行 有空格\n第二行 *.py $HOME it's\n第三行"
 
 
 def test_launch_untrusted_opens_failure_window(tmux_session, trusted_env, tmp_path):

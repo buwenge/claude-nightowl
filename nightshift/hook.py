@@ -20,7 +20,11 @@ __all__ = ["handle_event", "main"]
 
 
 def _refresh_context(task: dict, payload: dict, fields: dict) -> None:
-    """读 transcript 刷新 context_tokens / context_pct（读不到就置 None）。"""
+    """读 transcript 刷新 context_tokens / context_pct（读不到就置 None）。
+
+    算上限失败（config 缺/坏）只记 events.log，不拖垮整个事件：
+    context_tokens 照常写，context_pct 留空。
+    """
     transcript_path = payload.get("transcript_path")
     fields["context_tokens"] = None
     fields["context_pct"] = None
@@ -30,43 +34,55 @@ def _refresh_context(task: dict, payload: dict, fields: dict) -> None:
     fields["context_tokens"] = tokens
     if tokens is None:
         return
-    limit = (task.get("guards") or {}).get("context_limit_tokens")
-    if not limit:
-        from .store import load_config
+    try:
+        limit = (task.get("guards") or {}).get("context_limit_tokens")
+        if not limit:
+            from .store import load_config
 
-        limit = context_limit_for(task.get("model", ""), load_config())
+            limit = context_limit_for(task.get("model", ""), load_config())
+    except Exception as exc:  # config 缺失/损坏等，只留痕不炸
+        store.append_event(task["id"], f"算不出上限：{exc!r}")
+        return
     if limit:
         fields["context_pct"] = round(100 * tokens / limit)
 
 
 def handle_event(task_id: str, event: str, payload: dict) -> None:
-    """按事件类型更新 status.json / events.log。"""
+    """按事件类型更新 status.json / events.log。
+
+    turns / tool_calls / subagents_running 这类计数增量必须整个在
+    modify_status 的锁内读改写——两个 hook 进程并行时会互相吃掉增量。
+    """
     task = store.load_task(task_id)
-    status = store.read_status(task_id)
     now = store.utc_now_iso()
 
     if event == "UserPromptSubmit":
-        store.update_status(
-            task_id,
-            state="working",
-            turns=int(status.get("turns") or 0) + 1,
-            session_id=payload.get("session_id"),
-            transcript_path=payload.get("transcript_path"),
-            last_event_at=now,
-        )
+
+        def bump_turns(status: dict) -> None:
+            status["state"] = "working"
+            status["turns"] = int(status.get("turns") or 0) + 1
+            status["session_id"] = payload.get("session_id")
+            status["transcript_path"] = payload.get("transcript_path")
+            status["last_event_at"] = now
+
+        store.modify_status(task_id, bump_turns)
         store.append_event(task_id, "hook UserPromptSubmit → working")
 
     elif event in ("SubagentStart", "SubagentStop"):
         delta = 1 if event == "SubagentStart" else -1
-        current = int(status.get("subagents_running") or 0)
-        fields: dict = {
-            "subagents_running": max(0, current + delta),
-            "last_event_at": now,
-        }
-        if payload.get("agent_type"):
-            fields["agent_type"] = payload["agent_type"]
-        store.update_status(task_id, **fields)
-        store.append_event(task_id, f"hook {event} subagents={fields['subagents_running']}")
+
+        def bump_subagents(status: dict) -> None:
+            status["subagents_running"] = max(
+                0, int(status.get("subagents_running") or 0) + delta
+            )
+            status["last_event_at"] = now
+            if payload.get("agent_type"):
+                status["agent_type"] = payload["agent_type"]
+
+        status = store.modify_status(task_id, bump_subagents)
+        store.append_event(
+            task_id, f"hook {event} subagents={status['subagents_running']}"
+        )
 
     elif event == "Stop":
         background_tasks = payload.get("background_tasks") or []
@@ -85,13 +101,24 @@ def handle_event(task_id: str, event: str, payload: dict) -> None:
         store.append_event(task_id, f"hook Stop → {fields['state']}")
 
     elif event == "PostToolUse":
-        calls = int(status.get("tool_calls") or 0) + 1
-        fields = {"tool_calls": calls, "last_event_at": now}
-        if calls % 20 == 0:  # 每 20 次工具调用刷新一次上下文水位（回注是 S3 的事）
+        refresh = False
+
+        def bump_tool_calls(status: dict) -> None:
+            nonlocal refresh
+            calls = int(status.get("tool_calls") or 0) + 1
+            status["tool_calls"] = calls
+            status["last_event_at"] = now
+            if calls % 20 == 0:  # 每 20 次工具调用刷新一次上下文水位（回注是 S3 的事）
+                refresh = True
+
+        status = store.modify_status(task_id, bump_tool_calls)
+        if refresh:  # 锁内算出的新值；上下文字段不是计数，锁外合并即可
+            fields: dict = {}
             _refresh_context(task, payload, fields)
-        store.update_status(task_id, **fields)
-        if calls % 20 == 0:
-            store.append_event(task_id, f"hook PostToolUse #{calls} 刷新上下文")
+            store.update_status(task_id, **fields)
+            store.append_event(
+                task_id, f"hook PostToolUse #{status['tool_calls']} 刷新上下文"
+            )
 
     elif event == "PreCompact":
         store.append_event(task_id, "hook PreCompact（有人开了 compact？）")

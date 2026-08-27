@@ -108,7 +108,9 @@ def run_sh_text(task: dict, config: dict, session_id: str) -> str:
             f"--name {_sq(config['window_prefix'] + task['title'])}",
             f"--session-id {_sq(session_id)}",
             f"--settings {_sq(d / 'settings.json')}",
-            f"$(cat {_sq(d / 'prompt.txt')})",
+            # 提示词必须整体包在双引号里：裸 $(cat …) 会被 shell 按空白切词、
+            # 展开 $ 与通配符，多行任务内容会打散成一堆参数。
+            f"\"$(cat {_sq(d / 'prompt.txt')})\"",
         ]),
         "code=$?",
         'echo "[nightshift] claude 已退出（退出码 $code）。窗口保留，按回车关闭。"',

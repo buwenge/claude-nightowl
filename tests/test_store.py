@@ -131,6 +131,36 @@ def test_concurrent_update_status_from_two_processes():
     assert all("\t" in line for line in lines)
 
 
+def _bump_n(status: dict) -> None:
+    """mutator：原地 +1（返回值被 modify_status 忽略）。"""
+    status["n"] = status.get("n", 0) + 1
+
+
+def _modify_worker(task_id: str, count: int) -> None:
+    for _ in range(count):
+        store.modify_status(task_id, _bump_n)
+
+
+def test_modify_status_counts_no_loss():
+    """两个子进程各 200 次锁内 +1，一条不丢（R2）。"""
+    tid = store.create_task(make_task(), CONFIG)
+    procs = [
+        multiprocessing.Process(target=_modify_worker, args=(tid, 200))
+        for _ in range(2)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(120)
+    assert all(p.exitcode == 0 for p in procs)
+    assert store.read_status(tid)["n"] == 400
+
+    # 直接调一次：mutator 原地改、盖 updated_at、返回新 status
+    out = store.modify_status(tid, _bump_n)
+    assert out["n"] == 401
+    assert "updated_at" in out
+
+
 def test_config_example_json_valid():
     example = Path(__file__).resolve().parent.parent / "config.example.json"
     config = json.loads(example.read_text(encoding="utf-8"))

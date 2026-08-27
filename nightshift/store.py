@@ -2,8 +2,10 @@
 
 约定：
 - 所有写盘一律"同目录临时文件 + os.replace"原子替换；
-- status.json 的读-改-写只允许走 update_status()，靠 tasks/<id>/.lock 上的
-  fcntl.flock 串行化（hook 进程与调度器会并发写同一份状态）。
+- status.json 的读-改-写只允许走 modify_status()（update_status 是它的
+  字段合并特例），靠 tasks/<id>/.lock 上的 fcntl.flock 串行化（hook 进程
+  与调度器会并发写同一份状态）。计数器一类的"读旧值算新值"必须整个在
+  锁内完成，锁外先 read 再 update 会丢增量。
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ __all__ = [
     "list_tasks",
     "load_config",
     "load_task",
+    "modify_status",
     "new_task_id",
     "read_status",
     "render",
@@ -204,20 +207,30 @@ def list_tasks() -> list[dict]:
     return out
 
 
-def update_status(task_id: str, **fields) -> dict:
-    """status.json 的唯一写入口：.lock 文件锁内读-改-写，自动盖 updated_at。"""
+def modify_status(task_id: str, mutator) -> dict:
+    """status.json 锁内读-改-写：读旧值 → mutator 原地改（返回值忽略）→
+    盖 updated_at → 原子写 → 返回新 status。
+
+    计数器增量（turns / tool_calls / subagents_running）必须整个走这里；
+    锁外先 read_status 再 update_status 会被并发的 hook 进程吃掉增量。
+    """
     d = task_dir(task_id)
     d.mkdir(parents=True, exist_ok=True)
     with open(d / ".lock", "a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             status = read_status(task_id)
-            status.update(fields)
+            mutator(status)
             status["updated_at"] = utc_now_iso()
             atomic_write_json(d / "status.json", status)
             return status
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def update_status(task_id: str, **fields) -> dict:
+    """status.json 的字段合并入口：锁内合并字段，自动盖 updated_at。"""
+    return modify_status(task_id, lambda status: status.update(fields))
 
 
 def append_event(task_id: str, text: str) -> None:

@@ -14,7 +14,7 @@ import os
 import re
 import subprocess
 
-from .store import home
+from .store import ensure_dirs, home
 
 __all__ = [
     "UsageParseError",
@@ -98,6 +98,9 @@ def fetch_usage(config: dict, timeout: int = 120) -> dict:
         "--tools",
         "",
     ]
+    # cwd=home()；目录还不存在时 subprocess 抛的 FileNotFoundError 带的是
+    # cwd 路径，会被误报成"找不到 claude"——先把数据目录骨架建出来。
+    ensure_dirs()
     try:
         proc = subprocess.run(
             cmd,
@@ -113,6 +116,8 @@ def fetch_usage(config: dict, timeout: int = 120) -> dict:
             tail = tail.decode("utf-8", "replace")
         raise UsageUnavailable(f"/usage 超时（{timeout}s）{(tail or '')[-500:]}") from exc
     except FileNotFoundError as exc:
+        if exc.filename != cmd[0]:
+            raise  # 不是可执行文件不在（比如 cwd 建不出来），原样上抛
         raise UsageUnavailable(f"找不到 claude 可执行文件：{cmd[0]}") from exc
     if proc.returncode != 0:
         raise UsageUnavailable(f"/usage 退出码 {proc.returncode}：{proc.stderr[-500:]}")
