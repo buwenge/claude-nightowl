@@ -10,7 +10,7 @@
   },
   "models": {
     "claude-fable-5": {
-      "context_limit": 500000,
+      "context_limit": 1000000,
       "usage_label": "Fable"
     },
     "claude-fable-5[1m]": {
