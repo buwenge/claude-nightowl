@@ -326,3 +326,7 @@ fieldset.box summary { cursor: pointer; min-height: 44px; line-height: 44px; fon
 
 /* 顶栏可选的"回主站"链接（config.http.home_link） */
 .home-link { text-decoration: none; display: inline-flex; align-items: center; min-height: 44px; padding: 0 10px; margin-right: 6px; color: var(--muted); font-size: 15px; }
+
+/* 页脚的退出登录：小字、不抢眼（8/28 工头把顶栏"退出"当成了返回） */
+.foot { text-align: center; margin: 40px 0 24px; }
+.link-btn { background: none; border: none; color: var(--muted); font-size: 13px; text-decoration: underline; min-height: 44px; padding: 0 12px; }

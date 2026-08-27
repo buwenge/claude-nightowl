@@ -502,6 +502,7 @@ function start() {
   $("tab-new").addEventListener("click", function () { showView("new"); });
   $("tab-tpl").addEventListener("click", function () { showView("tpl"); });
   $("btn-logout").addEventListener("click", function () {
+    if (!confirm("退出登录？之后打开夜班页要重新输口令。想回小予首页请用左上角的链接。")) return;
     api("POST", "./api/logout").catch(function () {}).then(function () {
       location.href = "./login.html";
     });
