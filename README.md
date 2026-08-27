@@ -4,6 +4,15 @@
 你早上 ssh 进来 `Ctrl+B w` 选窗口就能接着聊；跑的时候靠 Claude Code 自己的
 hook 回报状态，靠机器读 transcript 算上下文水位——不猜、不接管会话。
 
+## 适用范围
+
+- 能跑：Linux / macOS / Windows 的 WSL——有 `tmux`、Python 3.12 和**终端版** Claude Code 的地方。
+- 不能跑：Windows 原生（没 tmux、没 fcntl）、Claude Code 桌面 app / IDE 插件 / 网页版（调度器起的是 CLI 会话，attach 不到那些）。
+- 隐含前提：机器整夜不睡（VPS 天然满足；笔记本得关掉睡眠）。
+- 目标项目目录要先手动用 `claude` 开过一次、点过"信任此文件夹"；`--permission-mode auto` 对某些模型（如 Haiku 4.5）会被 CC 静默回落成 manual，真跑请用 Sonnet / Opus / Fable 这类支持 auto 的模型（回落了调度器会开"(注意)"窗口提醒）。
+
+> **安全提示**：网页登录口令 = 一把能让 `--permission-mode auto` 的 Claude 以运行用户（通常是 root）身份在你的项目里干活的钥匙，强度等同于一个 shell。放公网务必走 nginx + HTTPS，口令认真设，有条件再套一层 Cloudflare Access 之类的第二因子。
+
 ## 依赖
 
 - Python 3.12（只用标准库，不装任何第三方包，没有 venv）
@@ -98,9 +107,24 @@ hook 的 stdout 平时沉默；唯一例外见下一节——`PostToolUse` 回�
 > 按交接开下一班。
 
 文案可在 `config.context_warn_text`（或任务级 `guards.context_warn_text`）里改。
-额度到线（五小时或七日任一线碰到 `guards` 里的上限）时同样回注一段"请尽快
-收尾"的额度提醒；两种提醒同时命中就合成一段。每过 20 次工具调用仍在线上就
-再注一次，直到模型真的收尾。
+每过 20 次工具调用仍在线上就再注一次，直到模型真的收尾。
+
+**额度守卫（同一时机回注，三条线各管各的）。** 调度器有任务在跑时每
+`scheduler.quota_refresh_minutes`（默认 10）分钟跑一次 `claude -p "/usage"` 写
+`quota.json`；hook 每 20 次工具调用读一次，按任务的 `guards` 判：
+
+| 线 | 键（"已用"百分比上限） | 到线怎么办 |
+|---|---|---|
+| 五小时 | `session_pct_max`（默认 80，即剩 20%） | **停下等刷新**：注入"用 ScheduleWakeup 连续设 50 分钟、50 分钟、13 分钟闹钟，最后一个醒来再继续"（分钟数按 `/usage` 给的刷新时间算）。模型定了闹钟停下后，Stop 回报里 `session_crons` 非空，任务记为"等闹钟"，不收尾不续班；若它没定闹钟就停了，刷新时间一到调度器往窗口敲一句"额度应已刷新，请继续"。 |
+| 七日（全部模型） | `weekly_pct_max`（默认 95） | **收尾交接**，末行 `NEXT: done`（本周续不了班）。 |
+| 该模型单独周线 | `model_weekly_pct_max`（默认同上） | 同上；`/usage` 里像 `Current week (Fable)` 这种单模型行按 `models.<模型>.usage_label` 对上。 |
+
+别的模型的单独周线到了不叫停本会话，只注一句"别再派 X 的子 agent、别切到它"
+（每个模型提醒一次）——防止 Sonnet 会话派 Fable 子 agent 审核时撞限流。
+起跑前预检同样只看本任务模型的三条线，不过线就推迟。五段文案
+（`prompt_template` / `context_warn_text` / `quota_pause_text` /
+`quota_wrapup_text` / `quota_other_model_text` / `chain_template`）都在网页"模板"页可改，
+占位符由系统自动填。
 
 **交接文件怎么写。** 就是一个普通 markdown，路径在提醒里给全
 （`tasks/<任务id>/handover-<班次>.md`）。把"已完成 / 未完成 / 下一步"写清楚，
@@ -164,6 +188,15 @@ hook 的 stdout 平时沉默；唯一例外见下一节——`PostToolUse` 回�
   覆盖后旧的登录会话全部失效。
 - **登录会话**：cookie（`ns_auth`）签发后一年有效，HttpOnly / SameSite=Lax /
   （https 下）Secure；登录接口还有进程内失败限速（同来源 15 分钟错 5 次即锁）。
+- **任务页**：额度卡显示三条线的**剩余**百分比、各自的刷新时间（转成浏览器本地时区）
+  与倒计时；"刷新"重拉列表与缓存，"重新查额度"现查一次 `/usage`（约 10 秒）。
+  卡片按活跃 / 排班中 / 已结束分组，终态（含"已续班"的父任务）可删；会话还开着的
+  有"看屏幕"（只读快照，每 5 秒刷新）。
+- **新建页**：开跑时间必填、没有默认值（浏览器本地时间，提交时转 UTC）；折叠区
+  "上下文与换班"里可按任务改警戒线、三条额度线、几班上限、没交接时续班还是停下；
+  最下方是会原样发给会话的最终提示词，随内容自动刷新，手改后不再覆盖。
+- **回主站链接**：`config.http.home_link = {"text": "← 主站", "href": "/"}` 时顶栏左上显示，
+  方便从别的站点跳过来的场景；不配就没有。退出登录在页脚小字里（点了要重输口令）。
 - **放公网**：前面必须挡一层 nginx 反代，location 片段见
   `deploy/nginx-location.example.conf`（含登录路径限速；其中登录限速的 zone
   要在 nginx 的 `http {}` 层定义）。nginx 会剥掉 `/nightshift` 前缀，
