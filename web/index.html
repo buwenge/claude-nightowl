@@ -24,7 +24,13 @@
   <!-- ============ 任务页 ============ -->
   <section id="view-tasks">
     <div class="card" id="quota-box">
-      <h2 style="margin-top:0">额度</h2>
+      <div class="quota-head">
+        <h2 style="margin:0">额度（剩余）</h2>
+        <span class="quota-btns">
+          <button type="button" id="btn-refresh" class="ghost">刷新</button>
+          <button type="button" id="btn-requery" class="ghost">重新查额度</button>
+        </span>
+      </div>
       <div id="quota-body"><p class="hint">加载中…</p></div>
     </div>
     <div id="task-list"><p class="hint">加载中…</p></div>

@@ -25,7 +25,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import auth, launcher, scheduler, store
+from . import auth, launcher, quota, scheduler, store
 
 __all__ = ["make_server", "serve_http"]
 
@@ -319,6 +319,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._api_preview()
         if path == "/api/tasks":
             return self._api_create_task()
+        if path == "/api/quota/refresh":
+            return self._api_quota_refresh()
         match = _RE_TASK_ACTION.match(path)
         if match:
             task_id, action = match.group(1), match.group(2)
@@ -560,6 +562,21 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(404, {"error": "这个任务还没有开过窗口"})
         text = launcher.capture_pane(str(window_id), lines=lines)
         return self._send_json(200, {"text": text})
+
+    def _api_quota_refresh(self) -> None:
+        """用户手动现查一次 /usage（约 10 秒、一次 haiku 无头调用），写 quota.json 后原样返回。"""
+        cfg = store.load_config()
+        try:
+            usage = quota.fetch_usage(cfg)
+        except (quota.UsageUnavailable, quota.UsageParseError) as exc:
+            logger.warning("手动查额度失败：%s", exc)
+            return self._send_json(502, {"error": f"额度查不到：{str(exc)[:200]}"})
+        store.atomic_write_json(
+            store.home() / "quota.json",
+            {"usage": usage, "fetched_at": store.utc_now_iso()},
+        )
+        logger.info("网页手动刷新额度")
+        return self._api_quota()
 
     def _api_quota(self) -> None:
         path = store.home() / "quota.json"

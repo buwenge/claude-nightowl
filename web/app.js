@@ -135,6 +135,20 @@ function refreshQuota() {
   }).catch(function () { /* banner 已提示 */ });
 }
 
+// 额度条一律显示"剩余"：传进来的是已用百分比，这里换算；颜色按剩余多少（少于 20% 红）
+function remainRow(label, usedPct) {
+  var left = Math.min(100, Math.max(0, 100 - usedPct));
+  var cls = left > 40 ? "" : (left > 20 ? "mid" : "high");
+  var fill = el("i", { class: cls, style: "width:" + left + "%" });
+  return el("div", null, [
+    el("div", { class: "bar-label" }, [
+      el("span", { text: label }),
+      el("span", { text: "剩 " + left + "%" })
+    ]),
+    el("div", { class: "bar" }, [fill])
+  ]);
+}
+
 function barRow(label, pct) {
   var cls = pct < 60 ? "" : (pct < 80 ? "mid" : "high");
   var fill = el("i", { class: cls, style: "width:" + Math.min(100, Math.max(0, pct)) + "%" });
@@ -159,11 +173,11 @@ function renderQuota(data) {
     return;
   }
   var usage = data.usage;
-  if (typeof usage.session_pct === "number") box.appendChild(barRow("五小时", usage.session_pct));
-  if (typeof usage.week_all_pct === "number") box.appendChild(barRow("七日（全部模型）", usage.week_all_pct));
+  if (typeof usage.session_pct === "number") box.appendChild(remainRow("五小时", usage.session_pct));
+  if (typeof usage.week_all_pct === "number") box.appendChild(remainRow("七日（全部模型）", usage.week_all_pct));
   var per = usage.per_model || {};
   Object.keys(per).forEach(function (name) {
-    box.appendChild(barRow("七日（" + name + "）", per[name]));
+    box.appendChild(remainRow("七日（" + name + "）", per[name]));
   });
   var agoText = "";
   if (typeof data.age_seconds === "number") {
@@ -286,10 +300,10 @@ function taskCard(item, now) {
   if (status.quota_at_launch) {
     var q = status.quota_at_launch;
     var parts = [];
-    if (typeof q.session_pct === "number") parts.push("五小时 " + q.session_pct + "%");
-    if (typeof q.week_all_pct === "number") parts.push("七日 " + q.week_all_pct + "%");
+    if (typeof q.session_pct === "number") parts.push("五小时剩 " + (100 - q.session_pct) + "%");
+    if (typeof q.week_all_pct === "number") parts.push("七日剩 " + (100 - q.week_all_pct) + "%");
     Object.keys(q.per_model || {}).forEach(function (name) {
-      parts.push(name + " " + q.per_model[name] + "%");
+      parts.push(name + " 剩 " + (100 - q.per_model[name]) + "%");
     });
     if (parts.length) {
       card.appendChild(el("div", { class: "quota-line",
@@ -508,6 +522,25 @@ function start() {
     });
   });
   $("btn-screen-close").addEventListener("click", closeScreen);
+  $("btn-refresh").addEventListener("click", function () {
+    refreshTasks(); refreshQuota(); banner("已刷新");
+  });
+  $("btn-requery").addEventListener("click", function () {
+    var btn = $("btn-requery");
+    btn.disabled = true; btn.textContent = "查询中…（约 10 秒）";
+    api("POST", "./api/quota/refresh").then(function (data) {
+      renderQuota(data || {}); banner("额度已重新查询");
+    }).catch(function () {}).then(function () {
+      btn.disabled = false; btn.textContent = "重新查额度";
+    });
+  });
+  // 手机切回来（WebView 的 visibilitychange 不一定可靠）也拉一次
+  window.addEventListener("focus", function () {
+    if (currentView === "tasks") { refreshTasks(); refreshQuota(); }
+  });
+  window.addEventListener("pageshow", function () {
+    if (currentView === "tasks") { refreshTasks(); refreshQuota(); }
+  });
 
   $("new-form").addEventListener("submit", submitNewForm);
   $("f-title").addEventListener("input", schedulePreview);

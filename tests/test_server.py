@@ -611,3 +611,20 @@ def test_static_no_store_and_versioned_assets(authed):
     assert headers.get("Cache-Control") == "no-store"
     text = body if isinstance(body, str) else str(body)
     assert "./app.js?v=" in text and "./style.css?v=" in text
+
+
+def test_quota_refresh_endpoint(authed, monkeypatch):
+    from nightshift import quota as quota_mod
+    from nightshift import server as server_mod
+    fake = {"session_pct": 12, "week_all_pct": 34, "per_model": {"Fable": 56}, "raw": ""}
+    monkeypatch.setattr(server_mod.quota, "fetch_usage", lambda cfg: fake)
+    status, _, body = authed.request("POST", "/api/quota/refresh")
+    assert status == 200, body
+    assert body["usage"]["session_pct"] == 12 and body["age_seconds"] is not None
+    assert (store.home() / "quota.json").is_file()
+
+    def boom(cfg):
+        raise quota_mod.UsageUnavailable("x")
+    monkeypatch.setattr(server_mod.quota, "fetch_usage", boom)
+    status, _, body = authed.request("POST", "/api/quota/refresh")
+    assert status == 502 and "额度查不到" in body["error"]

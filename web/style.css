@@ -330,3 +330,8 @@ fieldset.box summary { cursor: pointer; min-height: 44px; line-height: 44px; fon
 /* 页脚的退出登录：小字、不抢眼（8/28 工头把顶栏"退出"当成了返回） */
 .foot { text-align: center; margin: 40px 0 24px; }
 .link-btn { background: none; border: none; color: var(--muted); font-size: 13px; text-decoration: underline; min-height: 44px; padding: 0 12px; }
+
+/* 额度卡头部：标题 + 两个按钮 */
+.quota-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.quota-btns { display: flex; gap: 6px; }
+.quota-btns button { min-height: 40px; padding: 0 12px; font-size: 14px; }
