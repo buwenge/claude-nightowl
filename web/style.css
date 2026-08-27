@@ -347,3 +347,8 @@ fieldset.box summary { cursor: pointer; min-height: 44px; line-height: 44px; fon
 .shifts { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 6px 0 2px; font-size: 13px; color: var(--muted); }
 .shift-item { display: inline-flex; align-items: center; gap: 4px; }
 .shift-item .chip { font-size: 12px; padding: 1px 8px; }
+
+.warmup-times { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.warmup-times .row { display: flex; align-items: center; gap: 8px; }
+.warmup-times input[type="time"] { width: auto; min-height: 40px; padding: 0 8px; }
+.warmup-times .x { min-height: 40px; min-width: 40px; }

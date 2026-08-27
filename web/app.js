@@ -217,13 +217,37 @@ function renderQuota(data) {
   box.appendChild(el("p", { class: "quota-line", text: agoText }));
 }
 
-var WARMUP_DIRTY = false;  // 用户动过预热控件、还没保存：轮询不许覆盖
+var WARMUP_DIRTY = false;  // 用户动过预热控件、还没保存成功：轮询不许覆盖
+
+function warmupTimesFromDom() {
+  var out = [];
+  Array.prototype.forEach.call(document.querySelectorAll("#w-times input[type=time]"), function (inp) {
+    if (inp.value) out.push(inp.value);
+  });
+  return out;
+}
+
+function addWarmupRow(value) {
+  var inp = el("input", { type: "time", value: value || "" });
+  inp.addEventListener("change", function () { WARMUP_DIRTY = true; saveWarmup(); });
+  var row = el("div", { class: "row" }, [
+    inp,
+    el("button", { type: "button", class: "ghost x", text: "×", onclick: function () {
+      row.remove(); WARMUP_DIRTY = true; saveWarmup();
+    } })
+  ]);
+  $("w-times").appendChild(row);
+  return inp;
+}
 
 function renderWarmup(cfg) {
   var w = cfg.warmup || {};
   if (!WARMUP_DIRTY) {
     $("w-enabled").checked = !!w.enabled;
-    $("w-time").value = (w.times && w.times.length) ? w.times.join(" ") : (w.time_local || "");
+    var box = $("w-times");
+    box.textContent = "";
+    var times = (w.times && w.times.length) ? w.times : (w.time_local ? [w.time_local] : []);
+    times.forEach(function (t) { addWarmupRow(t); });
   }
   var st = cfg.warmup_state || {};
   var text = "";
@@ -236,9 +260,9 @@ function renderWarmup(cfg) {
 }
 
 function saveWarmup() {
-  var enabled = $("w-enabled").checked, time = $("w-time").value.trim();
-  if (enabled && !time) { banner("先填时刻，如 06:00 18:00"); return; }
-  api("PUT", "./api/warmup", { enabled: enabled, times: time })
+  var enabled = $("w-enabled").checked, times = warmupTimesFromDom();
+  if (enabled && !times.length) { banner("先选至少一个时刻"); return; }
+  api("PUT", "./api/warmup", { enabled: enabled, times: times })
     .then(function () { WARMUP_DIRTY = false; banner("预热设置已保存"); return api("GET", "./api/config"); })
     .then(function (cfg) { CFG = cfg; renderWarmup(cfg); })
     .catch(function () {});
@@ -617,11 +641,12 @@ function start() {
     });
   });
   $("btn-screen-close").addEventListener("click", closeScreen);
-  $("btn-warmup-save").addEventListener("click", saveWarmup);
-  // 一改就存：勾选/时间变化立刻 PUT，不给轮询插队的机会（8/28 工头勾了两次都被抹掉）
+  // 一改就存：勾选/时刻变化立刻 PUT，不给轮询插队的机会
   $("w-enabled").addEventListener("change", function () { WARMUP_DIRTY = true; saveWarmup(); });
-  $("w-time").addEventListener("input", function () { WARMUP_DIRTY = true; });
-  $("w-time").addEventListener("change", function () { WARMUP_DIRTY = true; saveWarmup(); });
+  $("btn-warmup-add").addEventListener("click", function () {
+    WARMUP_DIRTY = true;  // 新行还没选时间，别让轮询把空行冲掉
+    addWarmupRow("").focus();
+  });
   $("btn-refresh").addEventListener("click", function () {
     refreshTasks(); refreshQuota(); banner("已刷新");
   });
