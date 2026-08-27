@@ -104,13 +104,21 @@ def load_config() -> dict:
         return json.load(f)
 
 
-def atomic_write_text(path: str | os.PathLike, text: str) -> None:
-    """同目录写临时文件再 os.replace，保证读方要么看到旧整份要么看到新整份。"""
+def atomic_write_text(path: str | os.PathLike, text: str, mode: int | None = None) -> None:
+    """同目录写临时文件再 os.replace，保证读方要么看到旧整份要么看到新整份。
+
+    给了 mode（如 0o600）就用 os.open(tmp, O_WRONLY|O_CREAT|O_EXCL, mode) 建
+    临时文件，落盘即收紧权限，不留"先按 umask 落地再 chmod"的旁观窗口。
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        if mode is not None:
+            f = os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), "w", encoding="utf-8")
+        else:
+            f = open(tmp, "w", encoding="utf-8")
+        with f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
@@ -120,9 +128,11 @@ def atomic_write_text(path: str | os.PathLike, text: str) -> None:
             tmp.unlink()
 
 
-def atomic_write_json(path: str | os.PathLike, obj) -> None:
-    """原子写 JSON 文件（UTF-8、缩进两格）。"""
-    atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
+def atomic_write_json(path: str | os.PathLike, obj, mode: int | None = None) -> None:
+    """原子写 JSON 文件（UTF-8、缩进两格）。mode 语义同 atomic_write_text。"""
+    atomic_write_text(
+        path, json.dumps(obj, ensure_ascii=False, indent=2) + "\n", mode=mode
+    )
 
 
 def new_task_id() -> str:

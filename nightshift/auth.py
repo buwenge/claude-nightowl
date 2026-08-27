@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
 import secrets
 import threading
 import time
@@ -85,9 +84,8 @@ def reset_password(password: str) -> None:
         "token_secret": secrets.token_bytes(32).hex(),
         "created_at": store.utc_now_iso(),
     }
-    store.atomic_write_json(_cred_path(), creds)
-    # atomic_write_json 走默认 umask，落地后立刻收紧到 0600
-    os.chmod(_cred_path(), 0o600)
+    # mode=0o600：临时文件就按 0600 建，落盘即收紧，不留旁观窗口
+    store.atomic_write_json(_cred_path(), creds, mode=0o600)
 
 
 def set_password(password: str) -> None:

@@ -204,3 +204,22 @@ def test_config_example_json_valid():
         "chain_template",
     ):
         assert key in config, f"config.example.json 缺键：{key}"
+
+
+# ---------- 原子写 mode（S3①：凭据类文件落盘即收紧）----------
+
+
+def test_atomic_write_text_mode_0600(tmp_path):
+    target = tmp_path / "secret.txt"
+    store.atomic_write_text(target, "机密内容", mode=0o600)
+    assert target.read_text(encoding="utf-8") == "机密内容"
+    assert target.stat().st_mode & 0o777 == 0o600
+    # 临时文件不留残尸
+    assert list(tmp_path.glob(".*tmp.*")) == []
+
+
+def test_atomic_write_json_mode_0600(tmp_path):
+    target = tmp_path / "secret.json"
+    store.atomic_write_json(target, {"a": 1}, mode=0o600)
+    assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1}
+    assert target.stat().st_mode & 0o777 == 0o600
