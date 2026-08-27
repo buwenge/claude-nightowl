@@ -223,3 +223,18 @@ def test_atomic_write_json_mode_0600(tmp_path):
     store.atomic_write_json(target, {"a": 1}, mode=0o600)
     assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1}
     assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_create_successor_renders_all_placeholders(tmp_path, monkeypatch):
+    monkeypatch.setenv("NIGHTSHIFT_HOME", str(tmp_path))
+    config = json.load(open(Path(__file__).resolve().parent.parent / "config.example.json", encoding="utf-8"))
+    config["projects"] = {"demo": "/home/user/projects/demo"}
+    parent_id = store.create_task({
+        "title": "标题X", "project": "demo", "model": "claude-fable-5", "effort": "high",
+        "run_at": "2026-08-27T18:00:00Z", "task_text": "正文Y", "prompt_final": "p",
+    }, config)
+    succ = store.create_successor(store.load_task(parent_id), "交接Z\nNEXT: continue", config)
+    prompt = store.load_task(succ)["prompt_final"]
+    for piece in ("标题X", "正文Y", "交接Z", "第 2 班", "/home/user/projects/demo", "500000"):
+        assert piece in prompt, piece
+    assert "{" not in prompt.replace("{}", "")

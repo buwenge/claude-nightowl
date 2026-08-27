@@ -223,11 +223,15 @@ def create_successor(parent_task: dict, handover_text: str | None, config: dict)
         "effort": parent_task["effort"],
         "run_at": utc_now_iso(),
         "task_text": parent_task["task_text"],
+        # 续班模板可用的占位符 = 首班模板那四个 + shift/handover，别让第 2 班少掉开场叮嘱
         "prompt_final": render(
             config["chain_template"],
             task=parent_task["task_text"],
             shift=shift,
             handover=handover,
+            title=parent_task["title"],
+            project_path=config["projects"][parent_task["project"]],
+            context_limit=context_limit_for(parent_task["model"], config),
         ),
         "shift": shift,
         "parent_id": parent_id,
