@@ -32,7 +32,7 @@ cp config.example.json ~/.nightshift/config.json
 |---|---|
 | `tmux_session` | 任务窗口开在哪个 tmux 会话里（你登录自动进的那个会话名） |
 | `projects` | 项目名 → 目录绝对路径；表单/命令行只能从这里选 |
-| `models` | 各模型的上下文上限 `context_limit`、账号额度里的单模型周线标签 `usage_label` |
+| `models` | 各模型的上下文上限 `context_limit`（Claude 5 全系 1,000,000，Haiku 4.5 200,000；官方接口不给这个数，只能查表）、账号额度里的单模型周线标签 `usage_label` |
 | `efforts` / `guards` / `chain` | 思考档位、额度与上下文警戒线、换班策略 |
 | `prompt_template` 等三个模板 | 提示词模板、到线提醒文案、续班文案 |
 

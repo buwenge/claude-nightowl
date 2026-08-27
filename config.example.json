@@ -13,23 +13,19 @@
       "context_limit": 1000000,
       "usage_label": "Fable"
     },
-    "claude-fable-5[1m]": {
-      "context_limit": 1000000,
-      "usage_label": "Fable"
-    },
     "claude-opus-5": {
-      "context_limit": 500000,
+      "context_limit": 1000000,
       "usage_label": "Opus"
     },
     "claude-sonnet-5": {
-      "context_limit": 500000,
+      "context_limit": 1000000,
       "usage_label": "Sonnet"
     },
     "claude-haiku-4-5-20251001": {
       "context_limit": 200000
     }
   },
-  "default_context_limit": 200000,
+  "default_context_limit": 1000000,
   "efforts": [
     "low",
     "medium",
