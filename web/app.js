@@ -135,18 +135,42 @@ function refreshQuota() {
   }).catch(function () { /* banner 已提示 */ });
 }
 
+// /usage 的 "Aug 27, 6:40pm (UTC)" → Date（按 UTC 解析；年份取当前年，明显过去就算下一年）
+var MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+function parseResets(text) {
+  if (!text) return null;
+  var m = /([A-Z][a-z]{2}) (\d{1,2}), (\d{1,2})(?::(\d{2}))?(am|pm)\s*\(UTC\)/.exec(text);
+  if (!m || !(m[1] in MONTHS)) return null;
+  var hour = Number(m[3]) % 12 + (m[5] === "pm" ? 12 : 0);
+  var now = new Date();
+  var d = new Date(Date.UTC(now.getUTCFullYear(), MONTHS[m[1]], Number(m[2]), hour, Number(m[4] || 0)));
+  if (d.getTime() < now.getTime() - 86400000) d = new Date(Date.UTC(now.getUTCFullYear() + 1, MONTHS[m[1]], Number(m[2]), hour, Number(m[4] || 0)));
+  return d;
+}
+
+function resetsLine(text) {
+  var d = parseResets(text);
+  if (!d) return text ? "刷新：" + text : "";
+  var left = d.getTime() - Date.now();
+  var local = d.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  return "刷新：" + local + "（" + (left > 0 ? "还有 " + fmtDelta(left) : "已到，下次查询会更新") + "）";
+}
+
 // 额度条一律显示"剩余"：传进来的是已用百分比，这里换算；颜色按剩余多少（少于 20% 红）
-function remainRow(label, usedPct) {
+function remainRow(label, usedPct, resetsText) {
   var left = Math.min(100, Math.max(0, 100 - usedPct));
   var cls = left > 40 ? "" : (left > 20 ? "mid" : "high");
   var fill = el("i", { class: cls, style: "width:" + left + "%" });
-  return el("div", null, [
+  var kids = [
     el("div", { class: "bar-label" }, [
       el("span", { text: label }),
       el("span", { text: "剩 " + left + "%" })
     ]),
     el("div", { class: "bar" }, [fill])
-  ]);
+  ];
+  var line = resetsLine(resetsText);
+  if (line) kids.push(el("div", { class: "bar-resets", text: line }));
+  return el("div", { class: "bar-block" }, kids);
 }
 
 function barRow(label, pct) {
@@ -173,11 +197,12 @@ function renderQuota(data) {
     return;
   }
   var usage = data.usage;
-  if (typeof usage.session_pct === "number") box.appendChild(remainRow("五小时", usage.session_pct));
-  if (typeof usage.week_all_pct === "number") box.appendChild(remainRow("七日（全部模型）", usage.week_all_pct));
+  if (typeof usage.session_pct === "number") box.appendChild(remainRow("五小时", usage.session_pct, usage.session_resets));
+  if (typeof usage.week_all_pct === "number") box.appendChild(remainRow("七日（全部模型）", usage.week_all_pct, usage.week_all_resets));
   var per = usage.per_model || {};
+  var perResets = usage.per_model_resets || {};
   Object.keys(per).forEach(function (name) {
-    box.appendChild(remainRow("七日（" + name + "）", per[name]));
+    box.appendChild(remainRow("七日（" + name + "）", per[name], perResets[name]));
   });
   var agoText = "";
   if (typeof data.age_seconds === "number") {
