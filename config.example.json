@@ -1,0 +1,23 @@
+{
+  "tmux_session": "claude",
+  "window_prefix": "ns:",
+  "claude_bin": "claude",
+  "probe_model": "claude-haiku-4-5-20251001",
+  "display_tz_offset_hours": 8,
+  "memory_max_bytes": 2147483648,
+  "projects": { "demo": "/home/user/projects/demo" },
+  "models": {
+    "claude-fable-5":      { "context_limit": 500000,  "usage_label": "Fable" },
+    "claude-fable-5[1m]":  { "context_limit": 1000000, "usage_label": "Fable" },
+    "claude-opus-5":       { "context_limit": 500000,  "usage_label": "Opus" },
+    "claude-sonnet-5":     { "context_limit": 500000,  "usage_label": "Sonnet" },
+    "claude-haiku-4-5-20251001": { "context_limit": 200000 }
+  },
+  "default_context_limit": 200000,
+  "efforts": ["low", "medium", "high", "xhigh", "max"],
+  "guards": { "session_pct_max": 80, "weekly_pct_max": 95, "context_warn_ratio": 0.8, "keepalive": true },
+  "chain": { "max_windows": 3, "on_no_handover": "continue" },
+  "prompt_template": "你在无人值守的定时会话里工作，项目目录 {project_path}。任务：{title}\n\n{task}\n\n没有人在场：遇到问题按合理判断继续，不要停下来等确认。长于 20 分钟的外部命令请用后台方式跑。本会话上下文上限约 {context_limit} tokens，快到线时调度器会提醒你收尾。",
+  "context_warn_text": "[nightshift] 上下文已 {ctx_k}k / {limit_k}k，到警戒线了。现在收尾：①把已完成/未完成/下一步写进 {handover_path}，末行写 NEXT: continue 或 NEXT: done；②未提交的改动 commit；③然后停下，不要再开新的活。调度器会按交接开下一班。",
+  "chain_template": "{task}\n\n这是第 {shift} 班。上一班交接如下：\n{handover}\n\n先核对交接里说的状态再动手。"
+}
