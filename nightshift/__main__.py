@@ -1,18 +1,20 @@
 """命令行入口：`python3 -m nightshift <子命令>`。
 
-add / list / show / run-now / cancel / quota / capture / serve，全部中文帮助。
+add / list / show / run-now / cancel / quota / capture / serve / passwd，全部中文帮助。
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import sys
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import launcher, quota, scheduler, store
+from . import auth, launcher, quota, scheduler, server, store
 
 __all__ = ["main"]
 
@@ -172,7 +174,9 @@ def cmd_capture(args) -> int:
 
 
 def cmd_serve(args) -> int:
-    """调度器服务：--once 跑一轮 tick 就退出（cron 与集成测试用），否则常驻。"""
+    """调度器服务：默认同时起 HTTP（线程）+ 调度循环（主线程）；
+    --no-http 只跑调度；--once 跑一轮 tick 就退出（cron 与集成测试用）。
+    """
     config = store.load_config()
     store.ensure_dirs()
     if args.once:
@@ -180,7 +184,33 @@ def cmd_serve(args) -> int:
         for line in actions:
             print(line)
         return 0
+    if not args.no_http:
+        # HTTP 放线程里，调度循环占主线程；daemon 线程随进程退出
+        scheduler._setup_logging()
+        http_thread = threading.Thread(
+            target=server.serve_http, args=(config,), daemon=True, name="nightshift-http"
+        )
+        http_thread.start()
     scheduler.run_forever(config)
+    return 0
+
+
+def cmd_passwd(args) -> int:
+    """交互式设置/覆盖登录口令（覆盖后旧的登录 cookie 全部失效）。"""
+    store.ensure_dirs()
+    if auth.is_set_up():
+        print("已设过口令，继续将覆盖它（旧登录会话会全部失效）。")
+    pw1 = getpass.getpass("设置新口令（至少 8 个字符）：")
+    pw2 = getpass.getpass("再输一遍：")
+    if pw1 != pw2:
+        print("两次输入不一致，没有改动。", file=sys.stderr)
+        return 1
+    try:
+        auth.reset_password(pw1)
+    except ValueError as exc:
+        print(f"口令没写：{exc}", file=sys.stderr)
+        return 1
+    print(f"口令已写入 {store.home() / 'auth.json'}（0600）。")
     return 0
 
 
@@ -235,10 +265,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lines", type=int, default=200, help="抓最近多少行（默认 200）")
     p.set_defaults(func=cmd_capture)
 
-    p = sub.add_parser("serve", help="起调度器（systemd 常驻跑；--once 只跑一轮就退出）")
+    p = sub.add_parser("serve", help="起调度器（默认带网页；--once 只跑一轮就退出）")
     p.add_argument("--once", action="store_true",
-                   help="只跑一轮 tick 就退出（cron 与集成测试用）")
+                   help="只跑一轮 tick 就退出（cron 与集成测试用），不起 HTTP")
+    p.add_argument("--no-http", action="store_true",
+                   help="不起网页服务，只跑调度循环")
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("passwd", help="设置/覆盖网页登录口令（覆盖后旧登录全部失效）")
+    p.set_defaults(func=cmd_passwd)
 
     return parser
 

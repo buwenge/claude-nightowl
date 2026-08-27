@@ -6,15 +6,21 @@
 """
 
 import json
+import os
+import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
 from http import cookies as http_cookies
+from pathlib import Path
 
 import pytest
 
 from nightshift import __main__ as cli
 from nightshift import auth, launcher, server, store
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 CONFIG = {
     "tmux_session": "ns-selftest",
@@ -563,3 +569,18 @@ def test_unknown_path_is_404_json(authed):
     status, headers, body = authed.request("GET", "/api/nothing")
     assert status == 404
     assert "error" in body
+
+
+# ---------- serve 冒烟：--once / --no-http 不受 HTTP 影响 ----------
+
+
+def test_serve_once_smoke_still_one_tick(ns_home):
+    """子进程 `serve --once`（含 --no-http 组合）只跑一轮 tick，不起网页。"""
+    env = {**os.environ, "NIGHTSHIFT_HOME": str(ns_home)}
+    for extra in (["--once"], ["--no-http", "--once"]):
+        proc = subprocess.run(
+            [sys.executable, "-m", "nightshift", "serve", *extra],
+            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == ""  # 空数据目录一轮 tick 无动作

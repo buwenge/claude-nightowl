@@ -62,6 +62,7 @@ python3 -m nightshift capture <任务id> --lines 200
 ```
 ~/.nightshift/
 ├── config.json                     # 你的配置（从 config.example.json 复制改）
+├── auth.json                       # 网页登录口令的散列与签名密钥（0600）
 ├── quota.json                      # 最近一次 /usage 的解析结果（调度器写）
 ├── scheduler.log                   # 调度器日志（2 MB × 3 轮转）
 └── tasks/<任务id>/
@@ -101,4 +102,23 @@ stdout 永远沉默。`Stop` 事件带回 `background_tasks`，据此区分"在�
 任务窗口是 tmux 的子进程而不是服务的子进程，所以 `systemctl restart nightshift`
 不影响正在跑的任务。
 
-不想常驻的话，`python3 -m nightshift serve --once` 跑一轮调度就退出，适合挂 cron。
+不想常驻的话，`python3 -m nightshift serve --once` 跑一轮调度就退出，适合挂 cron
+（不起网页）；只想跑调度不要网页，用 `python3 -m nightshift serve --no-http`。
+
+## 网页
+
+`serve` 默认在 `127.0.0.1:8190`（端口、监听地址、URL 前缀都在 `config.json` 的
+`http` 段里改）同时跑调度循环和网页：任务列表 / 新建任务 / 模板编辑 / 屏幕快照，
+手机上也能用。
+
+- **首次打开**：还没设过口令时会自动跳到设置页，设一次口令（至少 8 个字符）。
+  口令只能设这一次，散列连同签名密钥存 `~/.nightshift/auth.json`（0600），
+  不进 `config.json`。
+- **改口令**：在服务器上跑 `python3 -m nightshift passwd`，输入两遍即可覆盖；
+  覆盖后旧的登录会话全部失效。
+- **登录会话**：cookie（`ns_auth`）签发后一年有效，HttpOnly / SameSite=Lax /
+  （https 下）Secure；登录接口还有进程内失败限速（同来源 15 分钟错 5 次即锁）。
+- **放公网**：前面必须挡一层 nginx 反代，location 片段见
+  `deploy/nginx-location.example.conf`（含登录路径限速；其中登录限速的 zone
+  要在 nginx 的 `http {}` 层定义）。nginx 会剥掉 `/nightshift` 前缀，
+  网页里的资源引用全是相对路径，直接照抄片段即可。
