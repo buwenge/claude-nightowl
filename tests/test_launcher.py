@@ -90,8 +90,11 @@ def test_hook_settings_seven_events():
 def test_write_task_files(tmp_path):
     task_id, config = make_task(project_path="/home/user/projects/demo")
     task = store.load_task(task_id)
-    launcher.write_task_files(task, config, "01234567-89ab-cdef-0123-456789abcdef")
     d = store.task_dir(task_id)
+    # R1：上一轮窗口留下的旧 exit_code 必须先删，免得误判新窗口
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "exit_code").write_text("3\n", encoding="utf-8")
+    launcher.write_task_files(task, config, "01234567-89ab-cdef-0123-456789abcdef")
 
     run_sh = (d / "run.sh").read_text(encoding="utf-8")
     assert "--model 'claude-fable-5'" in run_sh
@@ -104,6 +107,10 @@ def test_write_task_files(tmp_path):
     assert f"NIGHTSHIFT_HOME='{store.home()}'" in run_sh
     assert f"PYTHONPATH='{REPO_ROOT}'" in run_sh
     assert "claude 已退出" in run_sh
+    # R1：claude 退出码落盘，调度器靠它识破 read 留窗的假活
+    assert not (d / "exit_code").exists()  # 旧的先删了
+    assert 'echo "$code" > ' in run_sh
+    assert f"'{d / 'exit_code'}'" in run_sh
     # 提示词参数必须整体包在双引号里（防切词/展开）：含 "$(cat 且该行以 )" 收尾
     cat_line = next(line for line in run_sh.splitlines() if "$(cat " in line)
     assert '"$(cat ' in cat_line

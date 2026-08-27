@@ -63,6 +63,10 @@ def handle_event(task_id: str, event: str, payload: dict) -> None:
             status["turns"] = int(status.get("turns") or 0) + 1
             status["session_id"] = payload.get("session_id")
             status["transcript_path"] = payload.get("transcript_path")
+            # 实测 --permission-mode auto 会被 CC 对某些模型静默回落成 default，
+            # 回报里带着实际生效的模式，调度器靠它开提醒窗（R2）；没有就不覆盖旧值
+            if payload.get("permission_mode"):
+                status["permission_mode"] = payload["permission_mode"]
             status["last_event_at"] = now
 
         store.modify_status(task_id, bump_turns)
@@ -70,11 +74,31 @@ def handle_event(task_id: str, event: str, payload: dict) -> None:
 
     elif event in ("SubagentStart", "SubagentStop"):
         delta = 1 if event == "SubagentStart" else -1
+        agent_id = payload.get("agent_id")
 
         def bump_subagents(status: dict) -> None:
-            status["subagents_running"] = max(
-                0, int(status.get("subagents_running") or 0) + delta
-            )
+            if agent_id:
+                # 按 agent_id 记集合：并发 Start/Stop 乱序也不再丢计数。
+                # Stop 先到（agent 还没记上）时落一枚墓碑，把迟到的 Start 拦下，
+                # 否则"无论顺序最后归零"根本保证不了——这正是原计数抖动的根。
+                active = list(status.get("subagents") or [])
+                retired = list(status.get("subagents_retired") or [])
+                if delta == 1:
+                    if agent_id not in retired and agent_id not in active:
+                        active.append(agent_id)
+                else:
+                    if agent_id in active:
+                        active.remove(agent_id)
+                    if agent_id not in retired:
+                        retired.append(agent_id)
+                status["subagents"] = active
+                status["subagents_retired"] = retired
+                status["subagents_running"] = len(active)
+            else:
+                # 没有 agent_id 的回报退回原来的计数逻辑
+                status["subagents_running"] = max(
+                    0, int(status.get("subagents_running") or 0) + delta
+                )
             status["last_event_at"] = now
             if payload.get("agent_type"):
                 status["agent_type"] = payload["agent_type"]

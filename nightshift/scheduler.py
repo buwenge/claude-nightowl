@@ -50,11 +50,12 @@ def tick(config: dict, now: datetime) -> list[str]:
     """跑一遍所有任务，返回本轮做过的动作描述（给日志与测试用）。
 
     按 status.state 分支（设计稿 §3 状态机）：
-    - scheduled：到点 → 预检起跑；
+    - scheduled：到点（max(run_at, retry_at)）→ 预检起跑；
     - postponed：next_attempt_at 到点 → 同上；
-    - launching：宽限期与 PID 复用两条崩溃恢复在这里落；
-    - working/waiting_background/idle：窗口没了标 exited；waiting_background
-      静默超时戳保活（idle 永远不戳，设计稿 §5.2）；
+    - launching：exit_code 铁证、宽限期与 PID 复用几条崩溃恢复在这里落；
+    - working/waiting_background/idle：exit_code 兜底退场；窗口没了标 exited；
+      非 auto 权限模式开窗提醒；waiting_background 静默超时戳保活（idle 永远
+      不戳，设计稿 §5.2）；
     - 其余状态不动。
     """
     if now.tzinfo is None:
@@ -67,7 +68,13 @@ def tick(config: dict, now: datetime) -> list[str]:
         task, status = item["task"], item["status"]
         state = status.get("state")
         if state == "scheduled":
-            if parse_iso(task["run_at"]) <= now:
+            # R4：到点锚用 max(run_at, retry_at)——有 retry_at（启动重试时刻）
+            # 就用它，task.json 的 run_at 一个字不改
+            retry_at = status.get("retry_at")
+            due = parse_iso(task["run_at"])
+            if retry_at:
+                due = max(due, parse_iso(retry_at))
+            if due <= now:
                 actions.extend(_try_launch(task, status, config, now))
         elif state == "postponed":
             next_at = status.get("next_attempt_at")
@@ -140,7 +147,11 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
             "fetched_at": to_iso(now),
         },
     )
-    launcher.launch(task_id, config)
+    # R5：launch 在 tmux 失败/未信任时会把 state 写成 failed 并返回该 status，
+    # 不能闭着眼报"已启动"
+    launched = launcher.launch(task_id, config)
+    if launched.get("state") == "failed":
+        return [f"{task_id} 启动失败：{launched.get('error')}"]
     return [f"{task_id} 已启动"]
 
 
@@ -204,6 +215,17 @@ def _fail_now(task: dict, config: dict, now: datetime, error: str) -> list[str]:
 # ---------- 崩溃恢复：launching（设计稿 §3） ----------
 
 
+def _read_exit_code(task_id: str) -> int | None:
+    """读 run.sh 在 claude 退出后写下的 exit_code；没有/认不出 → None。"""
+    path = store.task_dir(task_id) / "exit_code"
+    if not path.is_file():
+        return None
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        return None
+
+
 def _check_launching(
     task: dict, status: dict, config: dict, now: datetime
 ) -> list[str]:
@@ -211,22 +233,27 @@ def _check_launching(
     sch = config.get("scheduler") or {}
     grace = timedelta(seconds=sch.get("launch_grace_seconds", 180))
 
+    # R1：run.sh 在 claude 退出后会写 exit_code，而 pane 靠 read 留窗——
+    # "窗口在 + pane 在"是假活。文件存在就是死透的铁证，宽限期内也照样重试。
+    exit_code = _read_exit_code(task_id)
     launched_at = status.get("launched_at")
-    if not launched_at or now - parse_iso(launched_at) < grace:
-        return []  # 宽限期内不做恢复判断
-    if int(status.get("turns") or 0) > 0:
-        return []  # 其实有 hook 来过，不按崩溃处理
+    in_grace = not launched_at or now - parse_iso(launched_at) < grace
+    if exit_code is None:
+        if in_grace:
+            return []  # 宽限期内不做恢复判断
+        if int(status.get("turns") or 0) > 0:
+            return []  # 其实有 hook 来过，不按崩溃处理
 
-    window_id = status.get("window_id")
-    pane_pid = status.get("pane_pid")
-    # PID 复用兜底：窗口在 + pane 进程在，才算"claude 还在起"
-    if (
-        window_id
-        and launcher.window_alive(str(window_id), config)
-        and pane_pid
-        and launcher.pid_alive(int(pane_pid))
-    ):
-        return []
+        window_id = status.get("window_id")
+        pane_pid = status.get("pane_pid")
+        # PID 复用兜底：窗口在 + pane 进程在，才算"claude 还在起"
+        if (
+            window_id
+            and launcher.window_alive(str(window_id), config)
+            and pane_pid
+            and launcher.pid_alive(int(pane_pid))
+        ):
+            return []
 
     retries = int(status.get("retries") or 0) + 1
     retry_max = int(task.get("retry_max") or DEFAULT_RETRY_MAX)
@@ -236,16 +263,30 @@ def _check_launching(
             f"启动重试超限：重试 {retries} 次仍没等到首个 hook 且窗口不在"
             f"（retry_max={retry_max}）",
         )
-    # 回到 scheduled，run_at 推到现在，下一 tick 重起
-    task["run_at"] = to_iso(now)
-    store.atomic_write_json(store.task_dir(task_id) / "task.json", task)
+    # 回到 scheduled，下一 tick 重起。R4：run_at 一个字不改（_postpone 的
+    # 6 小时上限锚在原始 run_at 上），重试时刻记进 status.retry_at
     store.update_status(
-        task_id, state="scheduled", retries=retries, last_event_at=to_iso(now)
-    )
-    store.append_event(
         task_id,
-        f"启动重试 {retries}/{retry_max}：宽限期过后没有首个 hook，回到 scheduled",
+        state="scheduled",
+        retries=retries,
+        retry_at=to_iso(now),
+        last_event_at=to_iso(now),
     )
+    if exit_code is None:
+        store.append_event(
+            task_id,
+            f"启动重试 {retries}/{retry_max}：宽限期过后没有首个 hook，回到 scheduled",
+        )
+    else:
+        # 留证：exit_code 改名 exit_code.<retries>，不碍下一次启动
+        (store.task_dir(task_id) / "exit_code").rename(
+            store.task_dir(task_id) / f"exit_code.{retries}"
+        )
+        store.append_event(
+            task_id,
+            f"启动重试 {retries}/{retry_max}：claude 起来就退了"
+            f"（exit_code={exit_code}），回到 scheduled",
+        )
     return [f"{task_id} 启动重试 {retries}/{retry_max}"]
 
 
@@ -256,6 +297,28 @@ def _check_running(
     task: dict, status: dict, config: dict, now: datetime
 ) -> list[str]:
     task_id = task["id"]
+
+    # R1 兜底：run.sh 写了 exit_code 就是 claude 死透（SessionEnd hook 超时/
+    # 被杀没来的情形）；窗口还在也只是 read 留窗的假象。SessionEnd 正常时
+    # 它会先把 state 写成 exited，轮不到这条。
+    exit_code = _read_exit_code(task_id)
+    if exit_code is not None:
+        store.update_status(
+            task_id,
+            state="exited",
+            exit_reason=f"claude_exit_{exit_code}",
+            last_event_at=to_iso(now),
+        )
+        store.append_event(
+            task_id,
+            f"run.sh 报 claude 已退出（exit_code={exit_code}）且没等到"
+            f" SessionEnd → exited(claude_exit_{exit_code})",
+        )
+        return [
+            f"{task_id} claude 退出（exit_code={exit_code}）"
+            f"→ exited(claude_exit_{exit_code})"
+        ]
+
     window_id = status.get("window_id")
     pane_pid = status.get("pane_pid")
     alive = (
@@ -272,6 +335,29 @@ def _check_running(
         )
         store.append_event(task_id, "窗口不在了且没等到 SessionEnd → exited(window_gone)")
         return [f"{task_id} 窗口消失 → exited(window_gone)"]
+
+    # R2：auto 被 CC 静默回落（如 haiku 只吃 default），无人值守会整晚卡在
+    # 权限问答。开窗提醒一次就够——不改 state、不杀窗口，人来处理。
+    mode = status.get("permission_mode")
+    if (
+        mode
+        and mode not in ("auto", "bypassPermissions")
+        and not status.get("mode_warned")
+    ):
+        launcher.open_notice_window(
+            task,
+            "(注意)",
+            [
+                f"会话没进 auto 模式（当前：{mode}），无人值守会卡在权限问答",
+                "多半是该模型不支持 auto；换 sonnet/opus/fable 之类的模型重建任务",
+            ],
+            config,
+        )
+        store.update_status(task_id, mode_warned=True)
+        store.append_event(
+            task_id, f"会话权限模式是 {mode} 不是 auto，已开提醒窗口（不改状态）"
+        )
+        return [f"{task_id} 权限模式 {mode} 非 auto → 提醒窗口"]
 
     if status.get("state") != "waiting_background":
         return []  # idle 永远不戳（8/27 事故的反面，设计稿 §5.2）

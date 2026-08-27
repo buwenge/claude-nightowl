@@ -97,19 +97,25 @@ def test_event_sequence_state_machine():
     assert status["turns"] == 1
     assert status["session_id"] == up["session_id"]
     assert status["transcript_path"] == up["transcript_path"]
+    # R2：夹具里 permission_mode=default（auto 被回落的实锤形状），要照实进 status
+    assert status["permission_mode"] == "default"
+    assert status["permission_mode"] == up["permission_mode"]
     assert "last_event_at" in status
 
-    # ② SubagentStart → subagents_running=1
+    # ② SubagentStart → subagents_running=1（R3：按 agent_id 记集合）
     proc = run_hook(task_id, "SubagentStart", subagent_start)
     assert proc.returncode == 0 and proc.stdout == ""
     status = store.read_status(task_id)
     assert status["subagents_running"] == 1
     assert status["agent_type"] == "general-purpose"
+    assert status["subagents"] == [json.loads(subagent_start)["agent_id"]]
 
     # ③ SubagentStop → 减回 0，不低于 0
     proc = run_hook(task_id, "SubagentStop", subagent_stop)
     assert proc.returncode == 0 and proc.stdout == ""
-    assert store.read_status(task_id)["subagents_running"] == 0
+    status = store.read_status(task_id)
+    assert status["subagents_running"] == 0
+    assert status["subagents"] == []
 
     # ④ Stop 且 background_tasks 有 running → waiting_background
     stop_payload = json.loads(stop_running)
@@ -256,23 +262,45 @@ def test_concurrent_post_tool_use_counts():
 
 
 def test_concurrent_subagents_start_stop():
-    """4 起 4 停同时跑，最后 subagents_running 归零。"""
+    """R3：8 个进程用 4 个不同 agent_id 各 Start/Stop 一次，无论进程以什么
+    顺序跑完，最后 subagents 归空、subagents_running 归零（按 id 记集合后
+    不再有旧计数器"最后一笔是 Start"的抖动）。"""
     task_id = make_task()
+    agent_ids = [f"a374269b6bde46c2{i}" for i in range(4)]
     procs = [
         multiprocessing.Process(
             target=_run_hook_proc,
-            args=(task_id, "SubagentStart", '{"hook_event_name":"SubagentStart"}'),
+            args=(
+                task_id,
+                event,
+                json.dumps({"hook_event_name": event, "agent_id": agent_id}),
+            ),
         )
-        for _ in range(4)
-    ] + [
-        multiprocessing.Process(
-            target=_run_hook_proc,
-            args=(task_id, "SubagentStop", '{"hook_event_name":"SubagentStop"}'),
-        )
-        for _ in range(4)
+        for agent_id in agent_ids
+        for event in ("SubagentStart", "SubagentStop")
     ]
     _spawn_and_join(procs)
-    assert store.read_status(task_id)["subagents_running"] == 0
+    status = store.read_status(task_id)
+    assert status["subagents"] == []
+    assert status["subagents_running"] == 0
+
+
+def test_subagent_stop_before_start_stays_zero():
+    """R3 乱序兜底：同一 agent_id 的 Stop 先于 Start 串行到达（hook 进程
+    被调度延迟的实况），最后也必须归零——迟到的 Start 不许把 agent 复活。"""
+    task_id = make_task()
+    stop = json.dumps({"hook_event_name": "SubagentStop", "agent_id": "a374269b6bde46c22"})
+    start = json.dumps({"hook_event_name": "SubagentStart", "agent_id": "a374269b6bde46c22"})
+
+    _run_hook_proc(task_id, "SubagentStop", stop)  # 先到：agent 还没记上，不许出错也不许欠账
+    status = store.read_status(task_id)
+    assert status["subagents_running"] == 0
+    assert status["subagents"] == []
+
+    _run_hook_proc(task_id, "SubagentStart", start)  # 后到：这枚 Start 必须被墓碑拦下
+    status = store.read_status(task_id)
+    assert status["subagents"] == []
+    assert status["subagents_running"] == 0
 
 
 # ---------- config 缺失时的兜底（R4）----------

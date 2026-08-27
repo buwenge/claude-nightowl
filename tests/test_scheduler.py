@@ -262,6 +262,19 @@ def test_untrusted_project_fails_without_postpone(monkeypatch):
     assert fakes.fetch_calls == []
 
 
+def test_launch_failure_reported_from_launch_return(monkeypatch):
+    """R5：launch() 返回 state=failed（tmux 失败路径）时，动作描述必须是
+    "启动失败"，不能谎报"已启动"。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    monkeypatch.setattr(
+        launcher, "launch",
+        lambda task_id, config: {"state": "failed", "error": "x"},
+    )
+    actions = scheduler.tick(CONFIG, NOW)
+    assert any("启动失败" in a and "x" in a for a in actions)
+
+
 # ---------- 崩溃恢复：launching ----------
 
 
@@ -277,14 +290,16 @@ def test_launching_retry_then_failed(monkeypatch):
     assert status["state"] == "launching"
     assert not status.get("retries")
 
-    # 过了宽限期、窗口没了 → retries=1，回到 scheduled，run_at 推到现在
+    # 过了宽限期、窗口没了 → retries=1，回到 scheduled；run_at 不许被改写，
+    # 重试时刻记进 status.retry_at（R4）
     cur = t0 + timedelta(seconds=200)
     for retries in (1, 2, 3):
         scheduler.tick(CONFIG, cur)
         status = store.read_status(tid)
         assert status["state"] == "scheduled"
         assert status["retries"] == retries
-        assert store.load_task(tid)["run_at"] == scheduler.to_iso(cur)
+        assert status["retry_at"] == scheduler.to_iso(cur)
+        assert store.load_task(tid)["run_at"] == scheduler.to_iso(t0)
         # 下一 tick 到点重起（假 launch 盖新的 launched_at）→ 又变 launching
         fakes.now = cur
         scheduler.tick(CONFIG, cur)
@@ -317,6 +332,64 @@ def test_launching_alive_window_or_turned_untouched(monkeypatch):
     assert not status.get("retries")
 
 
+def test_launching_exit_code_retries_even_within_grace(monkeypatch):
+    """R1 真雷：claude 起来就崩，run.sh 写下 exit_code 而 pane 靠 read 留窗；
+    宽限期内/窗口还在都必须立刻重试，不许永远卡在 launching。"""
+    fakes = Fakes(monkeypatch)  # 窗口在、pid 在（read 留窗的假象）
+    tid = make_task()
+    t0 = NOW
+    store.update_status(tid, state="launching", launched_at=scheduler.to_iso(t0),
+                        window_id="@21", pane_pid=NO_PID, turns=0)
+    (store.task_dir(tid) / "exit_code").write_text("1\n", encoding="utf-8")
+
+    # 宽限期内 + 窗口都在：exit_code 是死透的铁证 → 立即重试
+    cur = t0 + timedelta(seconds=10)
+    scheduler.tick(CONFIG, cur)
+    status = store.read_status(tid)
+    assert status["state"] == "scheduled"
+    assert status["retries"] == 1
+    assert status["retry_at"] == scheduler.to_iso(cur)
+    # R4：task.json 的 run_at 一个字不改
+    assert store.load_task(tid)["run_at"] == scheduler.to_iso(t0)
+    # 留证：exit_code 改名 exit_code.<retries>
+    d = store.task_dir(tid)
+    assert not (d / "exit_code").exists()
+    assert (d / "exit_code.1").read_text(encoding="utf-8").strip() == "1"
+    # 事件带退出码
+    events = (d / "events.log").read_text(encoding="utf-8")
+    assert "exit_code=1" in events
+
+    # 下一 tick 到点（retry_at）重起 → 又变 launching
+    fakes.now = cur
+    scheduler.tick(CONFIG, cur)
+    assert fakes.launch_calls == [tid]
+    assert store.read_status(tid)["state"] == "launching"
+    # 重启只清 exit_code 本尊，留证文件还在
+    assert (store.task_dir(tid) / "exit_code.1").read_text(
+        encoding="utf-8"
+    ).strip() == "1"
+
+
+def test_working_exit_code_marks_exited(monkeypatch):
+    """R1 兜底：SessionEnd hook 没来时，working/idle + exit_code → 退场，
+    exit_reason 带退出码；窗口/pid 都在（read 留窗）也拦不住这条。"""
+    fakes = Fakes(monkeypatch)  # 窗口在、pid 在
+    tid = make_task()
+    store.update_status(tid, state="working", window_id="@22", pane_pid=NO_PID)
+    (store.task_dir(tid) / "exit_code").write_text("7\n", encoding="utf-8")
+    actions = scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "exited"
+    assert status["exit_reason"] == "claude_exit_7"
+    assert any("claude_exit_7" in a for a in actions)
+
+    # idle 同样吃这条兜底；没有 exit_code 的任务不受影响
+    other = make_task(title="正常 idle")
+    store.update_status(other, state="idle", window_id="@23", pane_pid=NO_PID)
+    scheduler.tick(CONFIG, NOW)
+    assert store.read_status(other)["state"] == "idle"
+
+
 # ---------- 运行期巡检：窗口消失 / 保活戳 ----------
 
 
@@ -333,6 +406,45 @@ def test_working_window_gone_exits_and_alive_untouched(monkeypatch):
     assert status["state"] == "exited"
     assert status["exit_reason"] == "window_gone"
     assert any("window_gone" in a for a in actions)
+
+
+def test_non_auto_permission_mode_warns_once(monkeypatch):
+    """R2：会话权限模式被回落成 default（如 haiku 不吃 auto）→ 开一次提醒窗，
+    mode_warned 落盘；不改 state、不杀窗口；auto/bypassPermissions 不提醒。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    store.update_status(
+        tid, state="working", window_id="@11", pane_pid=NO_PID,
+        permission_mode="default",
+    )
+    scheduler.tick(CONFIG, NOW)
+    assert len(fakes.notice_calls) == 1
+    noticed_id, suffix, lines = fakes.notice_calls[0]
+    assert noticed_id == tid and "(注意)" in suffix
+    assert any("default" in line and "auto" in line for line in lines)
+    status = store.read_status(tid)
+    assert status["mode_warned"] is True
+    assert status["state"] == "working"  # 不改 state
+
+    # 再 tick 不再叫（mode_warned 已落盘）
+    scheduler.tick(CONFIG, NOW)
+    assert len(fakes.notice_calls) == 1
+
+    # 对照：auto 模式不提醒
+    auto_task = make_task(title="auto 的")
+    store.update_status(
+        auto_task, state="working", window_id="@12", pane_pid=NO_PID,
+        permission_mode="auto",
+    )
+    scheduler.tick(CONFIG, NOW)
+    assert len(fakes.notice_calls) == 1
+    # bypassPermissions 同样放过
+    store.update_status(
+        auto_task, state="working", permission_mode="bypassPermissions",
+        window_id="@12",
+    )
+    scheduler.tick(CONFIG, NOW)
+    assert len(fakes.notice_calls) == 1
 
 
 def test_keepalive_pokes_waiting_background_once(monkeypatch):

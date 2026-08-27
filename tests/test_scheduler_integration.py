@@ -167,6 +167,15 @@ def test_serve_once_launches_then_idle_on_second_pass(trusted_env):
     assert "quota_at_launch" in status  # 预检顺手记了额度
     assert status["quota_at_launch"]["session_pct"] == 13
 
+    # R1：run.sh 在 claude 退出后写下 exit_code（SessionEnd 正常时轮不到
+    # 调度器兜底，但文件必须在）；它比 SessionEnd hook 晚一拍，轮询等它出现
+    exit_file = store.task_dir(task_id) / "exit_code"
+    deadline = time.time() + 10
+    while time.time() < deadline and not exit_file.is_file():
+        time.sleep(0.1)
+    assert exit_file.is_file(), "claude 退出后 run.sh 没写下 exit_code"
+    assert exit_file.read_text(encoding="utf-8").strip() == "0"
+
     # 假 claude 只被起过一次
     fake_log = trusted_env["fake_log"].read_text(encoding="utf-8")
     assert fake_log.count("--session-id") == 1

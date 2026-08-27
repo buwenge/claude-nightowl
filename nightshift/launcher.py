@@ -115,6 +115,8 @@ def run_sh_text(task: dict, config: dict, session_id: str) -> str:
             f"\"$(cat {_sq(d / 'prompt.txt')})\"",
         ]),
         "code=$?",
+        # claude 死透的铁证：调度器靠它识破"read 留窗"的假活（宽限期内也能重试）
+        f'echo "$code" > {_sq(d / "exit_code")}',
         'echo "[nightshift] claude 已退出（退出码 $code）。窗口保留，按回车关闭。"',
         "read",
     ]
@@ -125,6 +127,8 @@ def write_task_files(task: dict, config: dict, session_id: str) -> None:
     """写 prompt.txt / settings.json / run.sh（0o700）。"""
     d = store.task_dir(task["id"])
     d.mkdir(parents=True, exist_ok=True)
+    # 上一轮窗口留下的 exit_code 先删：那是旧 claude 的死讯，不能拿来误判新窗口
+    (d / "exit_code").unlink(missing_ok=True)
     store.atomic_write_json(d / "settings.json", hook_settings(task["id"]))
     store.atomic_write_text(d / "prompt.txt", task["prompt_final"])
     run_sh = d / "run.sh"
