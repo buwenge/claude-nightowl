@@ -159,9 +159,11 @@ function resetsLine(text) {
 
 // 额度条一律显示"剩余"：传进来的是已用百分比，这里换算；颜色按剩余多少（少于 20% 红）
 function remainRow(label, usedPct, resetsText) {
-  var left = Math.min(100, Math.max(0, 100 - usedPct));
-  var cls = left > 40 ? "" : (left > 20 ? "mid" : "high");
-  var fill = el("i", { class: cls, style: "width:" + left + "%" });
+  // 条按"已用"增长（跟 Claude 自己的 /usage 一致），文字标"剩多少"；用超 80% 变红
+  var used = Math.min(100, Math.max(0, usedPct));
+  var left = 100 - used;
+  var cls = used < 60 ? "" : (used < 80 ? "mid" : "high");
+  var fill = el("i", { class: cls, style: "width:" + used + "%" });
   var kids = [
     el("div", { class: "bar-label" }, [
       el("span", { text: label }),
