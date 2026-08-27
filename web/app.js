@@ -4,6 +4,7 @@
 "use strict";
 
 var CSRF = { "X-Requested-With": "nightshift" };
+var UI_OPEN = {};          // 用户展开过的东西（最后一句/最近事件），列表重画时保持
 var CFG = null;            // /api/config 的内容
 var PROMPT_EDITED = false; // 用户手改过最终提示词
 var WARN_EDITED = false;   // 用户手改过警戒线 tokens
@@ -417,8 +418,11 @@ function taskCard(item, now, chainIds) {
 
   if (status.last_message) {
     var msg = el("div", {
-      class: "lastmsg clamp", text: status.last_message,
-      onclick: function () { msg.classList.toggle("clamp"); }
+      class: "lastmsg" + (UI_OPEN["msg:" + task.id] ? "" : " clamp"), text: status.last_message,
+      onclick: function () {
+        msg.classList.toggle("clamp");
+        UI_OPEN["msg:" + task.id] = !msg.classList.contains("clamp");  // 5 秒重画时保持展开
+      }
     });
     card.appendChild(msg);
   }
@@ -427,10 +431,13 @@ function taskCard(item, now, chainIds) {
 
   if (item.events_tail && item.events_tail.length) {
     var pre = el("pre", { text: item.events_tail.join("\n") });
-    card.appendChild(el("details", { class: "events" }, [
+    var det = el("details", { class: "events" }, [
       el("summary", { text: "最近事件（" + item.events_tail.length + " 条）" }),
       pre
-    ]));
+    ]);
+    if (UI_OPEN["ev:" + task.id]) det.open = true;
+    det.addEventListener("toggle", function () { UI_OPEN["ev:" + task.id] = det.open; });
+    card.appendChild(det);
   }
 
   var actions = taskActions(item, chainIds);
