@@ -79,6 +79,18 @@ def _tail_lines(path: Path, count: int) -> list[str]:
         return []
 
 
+def _version_assets(html: bytes) -> bytes:
+    """把 html 里的 ./app.js、./style.css 引用改成 ./app.js?v=<mtime>，缓存穿透。"""
+    text = html.decode("utf-8", errors="replace")
+    for name in ("app.js", "style.css"):
+        try:
+            stamp = int((WEB_DIR / name).stat().st_mtime)
+        except OSError:
+            continue
+        text = text.replace(f'"./{name}"', f'"./{name}?v={stamp}"')
+    return text.encode("utf-8")
+
+
 class _Handler(BaseHTTPRequestHandler):
     """所有路由都在这一个类里；config/limiter 由 make_server 注入子类。"""
 
@@ -150,10 +162,15 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             self._send_json(404, {"error": "文件不存在"})
             return
+        if path.suffix == ".html":
+            # 资源引用带上版本号（文件 mtime），让 CDN/浏览器缓存的旧 js/css 立刻失效
+            data = _version_assets(data)
         self.send_response(200)
         self.send_header("Content-Type", _CONTENT_TYPES.get(path.suffix, "application/octet-stream"))
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-cache")
+        # no-store：Cloudflare 之类的 CDN 会把 no-cache 改写成"浏览器缓存 4 小时"
+        # （8/28 真机踩到），no-store 它不碰，浏览器也不留副本
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
         self._sent = True

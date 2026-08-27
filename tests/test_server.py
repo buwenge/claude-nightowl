@@ -534,7 +534,7 @@ def test_static_files_and_traversal(ns_home, tmp_path, monkeypatch):
             status, headers, raw = client.request("GET", f"/{name}")
             assert status == 200, name
             assert headers["Content-Type"].startswith(ctype)
-            assert headers["Cache-Control"] == "no-cache"
+            assert headers["Cache-Control"] == "no-store"
             assert raw
         # 白名单外与路径穿越一律 404
         for path in ("/nope.js", "/etc/passwd", "/../etc/passwd",
@@ -603,3 +603,11 @@ def test_delete_allows_chained(authed):
     status, _, _ = authed.request("DELETE", f"/api/tasks/{task_id}")
     assert status == 200
     assert not store.task_dir(task_id).exists()
+
+
+def test_static_no_store_and_versioned_assets(authed):
+    status, headers, body = authed.request("GET", "/index.html")
+    assert status == 200
+    assert headers.get("Cache-Control") == "no-store"
+    text = body if isinstance(body, str) else str(body)
+    assert "./app.js?v=" in text and "./style.css?v=" in text
