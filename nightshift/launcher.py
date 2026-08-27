@@ -19,7 +19,9 @@ __all__ = [
     "is_trusted",
     "launch",
     "open_failure_window",
+    "open_notice_window",
     "pid_alive",
+    "send_keys",
     "window_alive",
     "write_task_files",
 ]
@@ -240,39 +242,56 @@ def launch(task_id: str, config: dict) -> dict:
     return status
 
 
-def open_failure_window(task: dict, reason: str, config: dict) -> None:
-    """开一个红字窗口写清失败原因；tmux 本身不可用就只记 events.log。"""
+def open_notice_window(
+    task: dict, suffix: str, lines: list[str], config: dict
+) -> None:
+    """开一个通知窗口写清事情（失败/推迟共用）；tmux 不可用就只记 events.log。
+
+    suffix 是窗口名后缀（如 "(失败)" / "(推迟)"），lines 是正文行（已含标签）。
+    """
     task_id = task["id"]
     title = task.get("title") or task_id
     d = store.task_dir(task_id)
     d.mkdir(parents=True, exist_ok=True)
-    script = d / "failure.sh"
-    lines = [
+    script = d / "notice.sh"
+    out = [
         "#!/bin/bash",
-        "# nightshift 失败窗口",
-        f"echo {_sq(f'[nightshift] 任务 {task_id}（{title}）失败')}",
+        "# nightshift 通知窗口（失败/推迟共用）",
+        f"echo {_sq(f'[nightshift] 任务 {task_id}（{title}）{suffix}')}",
         "echo -n '[nightshift] 时间：'; date '+%Y-%m-%d %H:%M:%S %Z'",
-        f"echo {_sq('[nightshift] 原因：' + reason)}",
+    ]
+    out += [f"echo {_sq(line)}" for line in lines]
+    out += [
         "echo",
         "echo '[nightshift] 按回车关闭。'",
         "read",
     ]
-    store.atomic_write_text(script, "\n".join(lines) + "\n")
+    store.atomic_write_text(script, "\n".join(out) + "\n")
     os.chmod(script, 0o700)
 
     session = config["tmux_session"]
     proc = ensure_tmux_session(session)
     if proc.returncode != 0:
-        store.append_event(task_id, f"失败窗口开不了（会话起不来）：{proc.stderr.strip()}")
+        store.append_event(task_id, f"通知窗口开不了（会话起不来）：{proc.stderr.strip()}")
         return
     proc = _tmux(
         "new-window", "-d", "-t", f"{session}:",
-        "-n", f"{config['window_prefix']}{title}(失败)", str(script),
+        "-n", f"{config['window_prefix']}{title}{suffix}", str(script),
     )
     if proc.returncode != 0:
-        store.append_event(task_id, f"失败窗口开不了：{proc.stderr.strip()}")
+        store.append_event(task_id, f"通知窗口开不了：{proc.stderr.strip()}")
     else:
-        store.append_event(task_id, "已开失败窗口")
+        store.append_event(task_id, f"已开通知窗口（{suffix}）")
+
+
+def open_failure_window(task: dict, reason: str, config: dict) -> None:
+    """开一个红字窗口写清失败原因；tmux 本身不可用就只记 events.log。"""
+    open_notice_window(task, "(失败)", [f"原因：{reason}"], config)
+
+
+def send_keys(window_id: str, text: str) -> subprocess.CompletedProcess:
+    """往窗口的 pane 敲一段文本加回车（保活戳用）。"""
+    return _tmux("send-keys", "-t", str(window_id), text, "Enter")
 
 
 def window_alive(window_id: str, config: dict) -> bool:

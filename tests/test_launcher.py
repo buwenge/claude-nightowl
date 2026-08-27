@@ -320,3 +320,34 @@ def test_tmux_targets_use_session_colon(tmp_path, monkeypatch):
     launcher.window_alive("@1", config)
     targets = [a[a.index("-t") + 1] for a in calls if a[0] in ("new-window", "list-windows")]
     assert len(targets) == 3 and all(x == "claude:" for x in targets), targets
+
+
+def test_notice_window_suffix_and_send_keys(tmp_path, monkeypatch):
+    """通用通知窗口：窗口名带 suffix、正文逐行落脚本；send-keys 带 Enter。"""
+    task_id, config = make_task()
+    calls = []
+
+    def fake_tmux(*args):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "@2\n", "")
+
+    monkeypatch.setattr(launcher, "_tmux", fake_tmux)
+    launcher.open_notice_window(
+        store.load_task(task_id), "(推迟)",
+        ["原因：额度 90% 超线 80%", "下次尝试：08-27 19:00"], config,
+    )
+    new_window = next(a for a in calls if a[0] == "new-window")
+    assert "(推迟)" in new_window[new_window.index("-n") + 1]
+    script = store.task_dir(task_id) / "notice.sh"
+    text = script.read_text(encoding="utf-8")
+    assert "原因：额度 90% 超线 80%" in text
+    assert "下次尝试：08-27 19:00" in text
+    # 失败窗口是通知窗口的特例：名字仍是 (失败)
+    calls.clear()
+    launcher.open_failure_window(store.load_task(task_id), "炸了", config)
+    new_window = next(a for a in calls if a[0] == "new-window")
+    assert "(失败)" in new_window[new_window.index("-n") + 1]
+
+    calls.clear()
+    launcher.send_keys("@7", "保活探针")
+    assert calls == [("send-keys", "-t", "@7", "保活探针", "Enter")]

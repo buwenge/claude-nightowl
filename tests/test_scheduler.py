@@ -1,0 +1,436 @@
+"""scheduler 的测试：tick 全分支、崩溃恢复、保活戳、推迟/失败窗口、run_forever 兜底。
+
+launcher / quota 全部 monkeypatch 成可控假函数；时间用固定的 aware datetime 注入。
+"""
+
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from nightshift import launcher, quota, scheduler, store
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+NOW = datetime(2026, 8, 27, 18, 0, 0, tzinfo=timezone.utc)
+NO_PID = 2**24  # 必然不存在的 pid（同 test_launcher 的用法）
+
+CONFIG = {
+    "tmux_session": "claude",
+    "window_prefix": "ns:",
+    "claude_bin": "claude",
+    "probe_model": "claude-haiku-4-5-20251001",
+    "display_tz_offset_hours": 8,
+    "memory_max_bytes": 2147483648,
+    "projects": {
+        "demo": "/home/user/projects/demo",
+        "other": "/home/user/projects/other",
+    },
+    "models": {
+        "claude-fable-5": {"context_limit": 500000, "usage_label": "Fable"},
+    },
+    "default_context_limit": 200000,
+    "efforts": ["low", "medium", "high", "xhigh", "max"],
+    "guards": {"session_pct_max": 80, "weekly_pct_max": 95},
+    "chain": {"max_windows": 3, "on_no_handover": "continue"},
+    "scheduler": {
+        "interval_seconds": 30,
+        "launch_grace_seconds": 180,
+        "postpone_minutes": 30,
+        "max_postpone_hours": 6,
+        "quota_refresh_minutes": 30,
+        "keepalive_idle_minutes": 50,
+        "keepalive_text": "保活探针——还在跑吗？",
+    },
+}
+
+
+@pytest.fixture(autouse=True)
+def ns_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("NIGHTSHIFT_HOME", str(tmp_path))
+    store.atomic_write_json(tmp_path / "config.json", CONFIG)
+    return tmp_path
+
+
+def make_task(**over):
+    task = {
+        "title": "夜间重构",
+        "project": "demo",
+        "model": "claude-fable-5",
+        "effort": "high",
+        "run_at": scheduler.to_iso(NOW),
+        "task_text": "正文",
+        "prompt_final": "提示词",
+    }
+    task.update(over)
+    return store.create_task(task, CONFIG)
+
+
+def usage_fixture() -> dict:
+    text = (FIXTURES / "usage_output.txt").read_text(encoding="utf-8")
+    return quota.parse_usage(text)
+
+
+class Fakes:
+    """把 launcher / quota 的对外接口全部换成记录调用的假函数。"""
+
+    def __init__(self, monkeypatch, *, trusted=True, window_alive=True,
+                 pid_alive=True):
+        self.trusted = trusted
+        self.window_alive = window_alive
+        self.pid_alive = pid_alive
+        self.usage = usage_fixture()
+        self.usage_exc: Exception | None = None
+        self.now = NOW  # 假 launch 写 launched_at 用的时间
+        self.launch_calls: list[str] = []
+        self.notice_calls: list[tuple] = []
+        self.failure_calls: list[tuple] = []
+        self.send_keys_calls: list[tuple] = []
+        self.fetch_calls: list[int] = []
+
+        monkeypatch.setattr(launcher, "is_trusted", lambda path: self.trusted)
+        monkeypatch.setattr(launcher, "launch", self._launch)
+        monkeypatch.setattr(
+            launcher, "window_alive", lambda wid, config: self.window_alive
+        )
+        monkeypatch.setattr(launcher, "pid_alive", lambda pid: self.pid_alive)
+        monkeypatch.setattr(launcher, "send_keys", self._send_keys)
+        monkeypatch.setattr(launcher, "open_notice_window", self._notice)
+        monkeypatch.setattr(launcher, "open_failure_window", self._failure)
+        monkeypatch.setattr(quota, "fetch_usage", self._fetch)
+
+    def _launch(self, task_id, config):
+        self.launch_calls.append(task_id)
+        store.update_status(
+            task_id,
+            state="launching",
+            launched_at=scheduler.to_iso(self.now),
+            window_id="@9",
+            pane_pid=NO_PID,
+        )
+        return store.read_status(task_id)
+
+    def _notice(self, task, suffix, lines, config):
+        self.notice_calls.append((task["id"], suffix, list(lines)))
+
+    def _failure(self, task, reason, config):
+        self.failure_calls.append((task["id"], reason))
+
+    def _send_keys(self, window_id, text):
+        self.send_keys_calls.append((window_id, text))
+
+    def _fetch(self, config, timeout=120):
+        self.fetch_calls.append(1)
+        if self.usage_exc is not None:
+            raise self.usage_exc
+        return dict(self.usage)
+
+
+# ---------- 时间小函数 ----------
+
+
+def test_parse_iso_and_to_iso_roundtrip():
+    dt = datetime(2026, 8, 27, 18, 0, 5, tzinfo=timezone.utc)
+    assert scheduler.to_iso(dt) == "2026-08-27T18:00:05Z"
+    assert scheduler.parse_iso("2026-08-27T18:00:05Z") == dt
+    # 与 store.utc_now_iso 同格式来回转
+    assert scheduler.to_iso(scheduler.parse_iso(store.utc_now_iso())).endswith("Z")
+    # 裸时间按 UTC
+    assert scheduler.parse_iso("2026-08-27T18:00:05").tzinfo is not None
+
+
+# ---------- scheduled / postponed 到点起跑 ----------
+
+
+def test_due_scheduled_launches_and_future_does_not(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    tid = make_task()  # run_at == NOW
+    fakes.now = NOW
+    actions = scheduler.tick(CONFIG, NOW)
+    assert fakes.launch_calls == [tid]
+    assert any(tid in a for a in actions)
+
+    # 没到点的不叫；到过点的那个已转 launching（宽限期内）也不重起
+    make_task(title="未来任务", run_at=scheduler.to_iso(NOW + timedelta(minutes=5)))
+    fakes.launch_calls.clear()
+    actions = scheduler.tick(CONFIG, NOW)
+    assert fakes.launch_calls == []
+    assert actions == []
+
+
+def test_postponed_due_relaunches(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    store.update_status(
+        tid, state="postponed",
+        next_attempt_at=scheduler.to_iso(NOW - timedelta(minutes=1)),
+    )
+    fakes.now = NOW
+    scheduler.tick(CONFIG, NOW)
+    assert fakes.launch_calls == [tid]
+
+
+# ---------- 推迟与失败窗口 ----------
+
+
+def test_quota_over_postpones_with_one_notice_window(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    fakes.usage["session_pct"] = 85  # 超五小时线
+    tid = make_task()
+    scheduler.tick(CONFIG, NOW)
+
+    status = store.read_status(tid)
+    assert status["state"] == "postponed"
+    assert status["next_attempt_at"] == scheduler.to_iso(NOW + timedelta(minutes=30))
+    assert status["postponed_count"] == 1
+    assert "85%" in status["postpone_reason"]
+    assert fakes.launch_calls == []
+    # 第一次推迟：开一个窗口，suffix 含"推迟"
+    assert len(fakes.notice_calls) == 1
+    assert fakes.notice_calls[0][0] == tid and "推迟" in fakes.notice_calls[0][1]
+    lines = fakes.notice_calls[0][2]
+    assert any("下次尝试" in line for line in lines)
+    assert any("最多推到" in line for line in lines)
+
+    # 再过 30 分钟仍超线 → 第二次推迟，不再开窗口
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=30))
+    status = store.read_status(tid)
+    assert status["state"] == "postponed"
+    assert status["postponed_count"] == 2
+    assert len(fakes.notice_calls) == 1
+
+
+def test_usage_unavailable_postpones_fail_closed(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    fakes.usage_exc = quota.UsageUnavailable("/usage 超时（120s）")
+    tid = make_task()
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "postponed"
+    assert "fail-closed" in status["postpone_reason"]
+    assert fakes.launch_calls == []
+
+
+def test_postpone_past_deadline_fails_with_window(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    fakes.usage["session_pct"] = 85
+    tid = make_task(run_at=scheduler.to_iso(NOW - timedelta(hours=6, minutes=1)))
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "failed"
+    assert "推迟超过 6 小时仍不满足" in status["error"]
+    assert "85%" in status["error"]
+    assert len(fakes.failure_calls) == 1
+    assert fakes.notice_calls == []
+
+
+# ---------- 同目录不并跑 / 目录信任 ----------
+
+
+def test_same_project_busy_postpones_without_window(monkeypatch):
+    fakes = Fakes(monkeypatch)  # 窗口在、pid 在
+    busy = make_task(title="在跑的")
+    store.update_status(busy, state="working", window_id="@1", pane_pid=NO_PID)
+    same_dir = make_task(title="同目录的")
+    other_dir = make_task(title="别的目录", project="other")
+
+    fakes.now = NOW
+    scheduler.tick(CONFIG, NOW)
+
+    status = store.read_status(same_dir)
+    assert status["state"] == "postponed"
+    assert "还在跑" in status["postpone_reason"]
+    assert status["postponed_count"] == 1
+    assert fakes.notice_calls == []  # 同目录推迟不开窗口
+    # 另一个目录不受影响，照常起跑
+    assert sorted(fakes.launch_calls) == [other_dir]
+    assert store.read_status(other_dir)["state"] == "launching"
+    assert store.read_status(busy)["state"] == "working"
+
+
+def test_untrusted_project_fails_without_postpone(monkeypatch):
+    fakes = Fakes(monkeypatch, trusted=False)
+    tid = make_task()
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "failed"
+    assert "未信任" in status["error"]
+    assert status.get("postpone_reason") is None
+    assert len(fakes.failure_calls) == 1
+    assert fakes.launch_calls == []
+    # 信任检查在额度之前：根本不该去查 /usage
+    assert fakes.fetch_calls == []
+
+
+# ---------- 崩溃恢复：launching ----------
+
+
+def test_launching_retry_then_failed(monkeypatch):
+    fakes = Fakes(monkeypatch, window_alive=False)  # 窗口没了
+    tid = make_task()
+    t0 = NOW
+    store.update_status(tid, state="launching", launched_at=scheduler.to_iso(t0),
+                        turns=0)
+    # 宽限期内不动
+    scheduler.tick(CONFIG, t0 + timedelta(seconds=60))
+    status = store.read_status(tid)
+    assert status["state"] == "launching"
+    assert not status.get("retries")
+
+    # 过了宽限期、窗口没了 → retries=1，回到 scheduled，run_at 推到现在
+    cur = t0 + timedelta(seconds=200)
+    for retries in (1, 2, 3):
+        scheduler.tick(CONFIG, cur)
+        status = store.read_status(tid)
+        assert status["state"] == "scheduled"
+        assert status["retries"] == retries
+        assert store.load_task(tid)["run_at"] == scheduler.to_iso(cur)
+        # 下一 tick 到点重起（假 launch 盖新的 launched_at）→ 又变 launching
+        fakes.now = cur
+        scheduler.tick(CONFIG, cur)
+        assert store.read_status(tid)["state"] == "launching"
+        cur = cur + timedelta(seconds=200)
+    # 第 4 次 → 超限判失败 + 失败窗口
+    scheduler.tick(CONFIG, cur)
+    status = store.read_status(tid)
+    assert status["state"] == "failed"
+    assert "启动重试超限" in status["error"]
+    assert len(fakes.failure_calls) == 1
+
+
+def test_launching_alive_window_or_turned_untouched(monkeypatch):
+    fakes = Fakes(monkeypatch)  # 窗口在、pid 在
+    tid = make_task(title="还在起")
+    stale = scheduler.to_iso(NOW - timedelta(seconds=999))
+    store.update_status(tid, state="launching", launched_at=stale, turns=0,
+                        window_id="@5", pane_pid=NO_PID)
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "launching"
+    assert not status.get("retries")
+
+    # turns>0（hook 其实来过）也不按崩溃处理
+    store.update_status(tid, window_id=None, turns=1)
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "launching"
+    assert not status.get("retries")
+
+
+# ---------- 运行期巡检：窗口消失 / 保活戳 ----------
+
+
+def test_working_window_gone_exits_and_alive_untouched(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    tid = make_task(title="巡检对象")
+    store.update_status(tid, state="working", window_id="@3", pane_pid=NO_PID)
+    scheduler.tick(CONFIG, NOW)
+    assert store.read_status(tid)["state"] == "working"  # 窗口在、pid 在 → 不动
+
+    fakes.window_alive = False
+    actions = scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "exited"
+    assert status["exit_reason"] == "window_gone"
+    assert any("window_gone" in a for a in actions)
+
+
+def test_keepalive_pokes_waiting_background_once(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    tid = make_task(title="等背景")
+    stale = scheduler.to_iso(NOW - timedelta(minutes=51))
+    store.update_status(tid, state="waiting_background", window_id="@4",
+                        pane_pid=NO_PID, last_event_at=stale)
+    scheduler.tick(CONFIG, NOW)
+    assert len(fakes.send_keys_calls) == 1
+    window_id, text = fakes.send_keys_calls[0]
+    assert window_id == "@4" and "保活" in text
+    status = store.read_status(tid)
+    assert status["last_keepalive_at"] == scheduler.to_iso(NOW)
+    assert status["keepalive_count"] == 1
+
+    # 紧接着再 tick 一次（now+1min）不再叫
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=1))
+    assert len(fakes.send_keys_calls) == 1
+
+    # 49 分钟不够久也不叫（边界对照：now+1min 时才静默 49 分钟）
+    other = make_task(title="还太早")
+    fresh = scheduler.to_iso(NOW - timedelta(minutes=48))
+    store.update_status(other, state="waiting_background", window_id="@6",
+                        pane_pid=NO_PID, last_event_at=fresh)
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=1))
+    assert len(fakes.send_keys_calls) == 1
+
+
+def test_idle_never_poked(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    tid = make_task(title="已收尾")
+    stale = scheduler.to_iso(NOW - timedelta(minutes=51))
+    store.update_status(tid, state="idle", window_id="@7", pane_pid=NO_PID,
+                        last_event_at=stale)
+    scheduler.tick(CONFIG, NOW)
+    assert fakes.send_keys_calls == []
+    assert store.read_status(tid)["state"] == "idle"
+
+
+def test_keepalive_disabled_not_poked(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    tid = make_task(title="不许戳", guards={"keepalive": False})
+    stale = scheduler.to_iso(NOW - timedelta(minutes=51))
+    store.update_status(tid, state="waiting_background", window_id="@8",
+                        pane_pid=NO_PID, last_event_at=stale)
+    scheduler.tick(CONFIG, NOW)
+    assert fakes.send_keys_calls == []
+
+
+# ---------- 额度刷新（零开销） ----------
+
+
+def test_quota_refreshed_only_when_active_and_stale(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    tid = make_task(title="刷新对象", run_at=scheduler.to_iso(NOW + timedelta(hours=1)))
+    # 没活跃任务：quota.json 不存在也不刷
+    scheduler.tick(CONFIG, NOW)
+    assert fakes.fetch_calls == []
+    assert not (store.home() / "quota.json").exists()
+
+    # 有活跃任务 → 刷，写盘 fetched_at == now
+    store.update_status(tid, state="working", window_id="@6", pane_pid=NO_PID)
+    scheduler.tick(CONFIG, NOW)
+    assert len(fakes.fetch_calls) == 1
+    data = json.loads((store.home() / "quota.json").read_text(encoding="utf-8"))
+    assert data["fetched_at"] == scheduler.to_iso(NOW)
+    assert data["usage"]["session_pct"] == 13
+
+    # 刚刷过（5 分钟 < 30 分钟）→ 不刷
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=5))
+    assert len(fakes.fetch_calls) == 1
+
+    # 过期（31 分钟 ≥ 30 分钟）→ 再刷
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=31))
+    assert len(fakes.fetch_calls) == 2
+
+
+def test_quota_refresh_error_written_to_file(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    fakes.usage_exc = quota.UsageUnavailable("坏了")
+    tid = make_task(title="刷新失败", run_at=scheduler.to_iso(NOW + timedelta(hours=1)))
+    store.update_status(tid, state="working", window_id="@6", pane_pid=NO_PID)
+    scheduler.tick(CONFIG, NOW)
+    data = json.loads((store.home() / "quota.json").read_text(encoding="utf-8"))
+    assert "error" in data and "坏了" in data["error"]
+    assert data["fetched_at"] == scheduler.to_iso(NOW)
+
+
+# ---------- run_forever：单轮异常吞掉并记日志 ----------
+
+
+def test_run_forever_swallows_tick_error(tmp_path, monkeypatch):
+    def boom(config, now=None):
+        raise RuntimeError("炸了")
+
+    monkeypatch.setattr(scheduler, "tick", boom)
+    monkeypatch.setattr(scheduler.time, "sleep", lambda seconds: None)
+    scheduler.run_forever(CONFIG, max_ticks=1)  # 不许往外抛
+    log = (store.home() / "scheduler.log").read_text(encoding="utf-8")
+    assert "炸了" in log
