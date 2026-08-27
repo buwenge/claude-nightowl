@@ -291,3 +291,32 @@ def test_launch_untrusted_opens_failure_window(tmux_session, trusted_env, tmp_pa
     )
     assert proc.returncode == 0
     assert any("(失败)" in name for name in proc.stdout.splitlines())
+
+
+
+def test_tmux_targets_use_session_colon(tmp_path, monkeypatch):
+    """-t 目标必须是 "会话名:"——不带冒号时 tmux 会先按窗口名解析，
+    会话里恰好有个同名窗口就会撞 index（8/27 真机踩到：用户当前窗口就叫 claude）。"""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    claude_json = tmp_path / "claude.json"
+    claude_json.write_text(
+        json.dumps({"projects": {str(proj): {"hasTrustDialogAccepted": True}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NIGHTSHIFT_CLAUDE_JSON", str(claude_json))
+    task_id, config = make_task(str(proj))
+    config["tmux_session"] = "claude"
+    calls = []
+
+    def fake_tmux(*args):
+        calls.append(args)
+        out = "@1\n" if args[0] == "new-window" else "123\n"
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    monkeypatch.setattr(launcher, "_tmux", fake_tmux)
+    launcher.launch(task_id, config)
+    launcher.open_failure_window(store.load_task(task_id), "测试", config)
+    launcher.window_alive("@1", config)
+    targets = [a[a.index("-t") + 1] for a in calls if a[0] in ("new-window", "list-windows")]
+    assert len(targets) == 3 and all(x == "claude:" for x in targets), targets

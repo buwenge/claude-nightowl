@@ -208,8 +208,10 @@ def launch(task_id: str, config: dict) -> dict:
     # ⑥ 开窗口拿 window_id
     run_sh = str(store.task_dir(task_id) / "run.sh")
     window_name = f"{config['window_prefix']}{task['title']}"
+    # -t 必须写成 "会话名:"（带冒号）：不带冒号时 tmux 会先按窗口名解析，
+    # 会话里恰好有个同名窗口就会落到那个 index 上报 "index N in use"（8/27 真机踩到）。
     proc = _tmux(
-        "new-window", "-d", "-P", "-F", "#{window_id}", "-t", session,
+        "new-window", "-d", "-P", "-F", "#{window_id}", "-t", f"{session}:",
         "-n", window_name, run_sh,
     )
     if proc.returncode != 0:
@@ -264,7 +266,7 @@ def open_failure_window(task: dict, reason: str, config: dict) -> None:
         store.append_event(task_id, f"失败窗口开不了（会话起不来）：{proc.stderr.strip()}")
         return
     proc = _tmux(
-        "new-window", "-d", "-t", session,
+        "new-window", "-d", "-t", f"{session}:",
         "-n", f"{config['window_prefix']}{title}(失败)", str(script),
     )
     if proc.returncode != 0:
@@ -275,7 +277,7 @@ def open_failure_window(task: dict, reason: str, config: dict) -> None:
 
 def window_alive(window_id: str, config: dict) -> bool:
     """window_id 是否还在 tmux 会话的窗口列表里。"""
-    proc = _tmux("list-windows", "-t", config["tmux_session"], "-F", "#{window_id}")
+    proc = _tmux("list-windows", "-t", f"{config['tmux_session']}:", "-F", "#{window_id}")
     if proc.returncode != 0:
         return False
     return window_id in proc.stdout.splitlines()
