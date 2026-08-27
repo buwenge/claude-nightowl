@@ -102,12 +102,16 @@
     <p class="hint">占位符：{ctx_k} {limit_k} {handover_path}</p>
     <textarea id="t-warntext" class="tall" rows="6"></textarea>
 
+    <h2>额度到线提醒</h2>
+    <p class="hint">占位符：{session_pct} {week_all_pct} {session_max} {weekly_max}（已用百分比与警戒线，系统自动填）</p>
+    <textarea id="t-quotatext" class="tall" rows="4"></textarea>
+
     <h2>续班模板</h2>
     <p class="hint">占位符：{task} {shift} {handover} {title} {project_path} {context_limit}（系统自动填，改文案别删花括号）</p>
     <textarea id="t-chain" class="tall" rows="6"></textarea>
 
     <p id="tpl-note" class="ok-note"></p>
-    <button type="button" id="btn-save-tpl" class="primary" style="width:100%">保存三个模板</button>
+    <button type="button" id="btn-save-tpl" class="primary" style="width:100%">保存模板</button>
   </section>
   <p class="foot"><button type="button" id="btn-logout" class="link-btn">退出登录（之后要重输口令）</button></p>
 </div>

@@ -621,3 +621,21 @@ def test_session_end_keeps_terminal_states(tmp_path):
     store.update_status(task_id, state="idle")
     run_hook(task_id, "SessionEnd", '{"reason": "other"}')
     assert store.read_status(task_id)["state"] == "exited"
+
+
+def test_quota_warn_text_from_config(tmp_path):
+    """额度提醒文案走 config.quota_warn_text（模板页可改），不再是藏起来的常量。"""
+    cfg = dict(CONFIG)
+    cfg["quota_warn_text"] = "自定义额度提醒：五小时用了{session_pct}，线{session_max}"
+    store.atomic_write_json(store.home() / "config.json", cfg)
+    task_id = make_task(guards={
+        "session_pct_max": 80, "weekly_pct_max": 95,
+        "context_warn_tokens": 100000, "context_limit_tokens": 200000,
+    })
+    write_quota(session=85, week=10)
+    payload = make_transcript(tmp_path / "transcript.jsonl", 100)
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", payload)
+    proc = run_hook(task_id, "PostToolUse", payload)
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert ctx == "自定义额度提醒：五小时用了85，线80"

@@ -112,7 +112,7 @@ def _quota_warning(task: dict, config: dict) -> str:
     if not hit:
         return ""
     return store.render(
-        QUOTA_WARN_TEXT,
+        config.get("quota_warn_text") or QUOTA_WARN_TEXT,  # 模板页可改，缺省用常量
         session_pct="?" if session_pct is None else session_pct,
         week_all_pct="?" if week_all_pct is None else week_all_pct,
         session_max=session_max,

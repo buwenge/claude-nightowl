@@ -492,6 +492,7 @@ function loadTemplatesView() {
     CFG = cfg;
     $("t-prompt").value = cfg.prompt_template || "";
     $("t-warntext").value = cfg.context_warn_text || "";
+    $("t-quotatext").value = cfg.quota_warn_text || "";
     $("t-chain").value = cfg.chain_template || "";
   }).catch(function () {});
 }
@@ -502,6 +503,7 @@ function saveTemplates() {
   api("PUT", "./api/templates", {
     prompt_template: $("t-prompt").value,
     context_warn_text: $("t-warntext").value,
+    quota_warn_text: $("t-quotatext").value,
     chain_template: $("t-chain").value
   }).then(function () {
     note.textContent = "已保存";
