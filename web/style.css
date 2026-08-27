@@ -323,3 +323,6 @@ fieldset.box summary { cursor: pointer; min-height: 44px; line-height: 44px; fon
 .auth-box h1 { text-align: center; }
 .auth-box .note { font-size: 14px; color: var(--muted); margin-top: 12px; }
 .auth-box button[type="submit"] { width: 100%; margin-top: 16px; }
+
+/* 顶栏可选的"回主站"链接（config.http.home_link） */
+.home-link { text-decoration: none; display: inline-flex; align-items: center; min-height: 44px; padding: 0 10px; margin-right: 6px; color: var(--muted); font-size: 15px; }

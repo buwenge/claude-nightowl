@@ -386,6 +386,8 @@ class _Handler(BaseHTTPRequestHandler):
             "context_warn_text": cfg.get("context_warn_text", ""),
             "chain_template": cfg.get("chain_template", ""),
             "display_tz_offset_hours": cfg.get("display_tz_offset_hours"),
+            # 可选：顶栏"回主站"链接 {"text": "...", "href": "..."}，没配就不显示
+            "home_link": (cfg.get("http") or {}).get("home_link"),
         })
 
     _TEMPLATE_KEYS = ("prompt_template", "context_warn_text", "chain_template")

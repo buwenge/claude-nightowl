@@ -586,3 +586,12 @@ def test_serve_once_smoke_still_one_tick(ns_home):
         )
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout.strip() == ""  # 空数据目录一轮 tick 无动作
+
+
+def test_config_exposes_optional_home_link(authed):
+    cfg = store.load_config()
+    cfg.setdefault("http", {})["home_link"] = {"text": "← 主站", "href": "/"}
+    store.atomic_write_json(store.home() / "config.json", cfg)
+    status, _, body = authed.request("GET", "/api/config")
+    assert status == 200
+    assert body["home_link"] == {"text": "← 主站", "href": "/"}

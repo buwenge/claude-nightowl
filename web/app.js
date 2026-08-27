@@ -538,6 +538,12 @@ function start() {
 
   api("GET", "./api/config").then(function (cfg) {
     CFG = cfg;
+    if (cfg.home_link && cfg.home_link.href) {
+      var link = $("link-home");
+      link.textContent = cfg.home_link.text || "← 主站";
+      link.setAttribute("href", cfg.home_link.href);
+      link.hidden = false;
+    }
     populateNewForm();
     showView("tasks");
   }).catch(function () {
