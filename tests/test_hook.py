@@ -606,3 +606,18 @@ def test_silence_on_bad_json():
 def test_silence_on_missing_task():
     proc = run_hook("20990101-000000- deadbeef".replace(" ", ""), "Stop", "{}")
     assert proc.returncode == 0 and proc.stdout == ""
+
+
+def test_session_end_keeps_terminal_states(tmp_path):
+    """finished/chained 之后关窗口，SessionEnd 只记 exit_reason，不把状态盖成 exited。"""
+    task_id = make_task()
+    for state in ("finished", "chained"):
+        store.update_status(task_id, state=state)
+        run_hook(task_id, "SessionEnd", '{"reason": "other"}')
+        status = store.read_status(task_id)
+        assert status["state"] == state
+        assert status["exit_reason"] == "other"
+        assert status["session_ended_at"]
+    store.update_status(task_id, state="idle")
+    run_hook(task_id, "SessionEnd", '{"reason": "other"}')
+    assert store.read_status(task_id)["state"] == "exited"

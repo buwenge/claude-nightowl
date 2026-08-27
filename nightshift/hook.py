@@ -316,12 +316,18 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
         store.append_event(task_id, "hook PreCompact（有人开了 compact？）")
 
     elif event == "SessionEnd":
-        store.update_status(
-            task_id,
-            state="exited",
-            exit_reason=payload.get("reason"),
-            last_event_at=now,
-        )
+        # 已经收尾的终态（finished/chained/…）不被"关窗口"盖成 exited：
+        # 网页上"已完成"不该因为用户关了窗就变"已退出"（8/27 真机发现）
+        keep = ("finished", "chained", "chain_exhausted", "needs_attention")
+
+        def mark_exit(status: dict) -> None:
+            if status.get("state") not in keep:
+                status["state"] = "exited"
+            status["exit_reason"] = payload.get("reason")
+            status["session_ended_at"] = now
+            status["last_event_at"] = now
+
+        store.modify_status(task_id, mark_exit)
         store.append_event(task_id, f"hook SessionEnd reason={payload.get('reason')}")
 
     else:
