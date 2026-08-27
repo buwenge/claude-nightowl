@@ -235,6 +235,6 @@ def test_create_successor_renders_all_placeholders(tmp_path, monkeypatch):
     }, config)
     succ = store.create_successor(store.load_task(parent_id), "交接Z\nNEXT: continue", config)
     prompt = store.load_task(succ)["prompt_final"]
-    for piece in ("标题X", "正文Y", "交接Z", "第 2 班", "/home/user/projects/demo", "500000"):
+    for piece in ("标题X", "正文Y", "交接Z", "第 2 班", "/home/user/projects/demo", "1000000"):
         assert piece in prompt, piece
     assert "{" not in prompt.replace("{}", "")
