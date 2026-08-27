@@ -104,11 +104,13 @@ def tick(config: dict, now: datetime) -> list[str]:
     if active_ids:
         _maybe_refresh_quota(config, now, actions)
     # 预热五小时窗口（config.warmup，网页可改）：到点发一句话给 haiku，一天一次
-    if warmup.due(config, now):
-        result = warmup.run_warmup(config, now)
+    slots = warmup.due(config, now)
+    for slot in slots:
+        result = warmup.run_warmup(config, now, slot=slot)
         actions.append(
-            "预热窗口：" + ("成功" if result.get("ok") else f"失败 {result.get('error', '')[:80]}")
+            f"预热窗口（{slot}）：" + ("成功" if result.get("ok") else f"失败 {result.get('error', '')[:80]}")
         )
+    if slots:
         # 预热后额度窗口已开始，顺手刷一次 quota.json 让页面立刻看到新刷新时间
         _maybe_refresh_quota(config, now, actions, force=True)
     return actions

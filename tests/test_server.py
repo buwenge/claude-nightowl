@@ -631,10 +631,13 @@ def test_quota_refresh_endpoint(authed, monkeypatch):
 
 
 def test_warmup_settings_roundtrip(authed):
-    status, _, body = authed.request("PUT", "/api/warmup", {"enabled": True, "time_local": "07:30"})
+    status, _, body = authed.request("PUT", "/api/warmup", {"enabled": True, "times": "18:00, 7:30"})
     assert status == 200, body
-    assert json.load(open(store.home() / "config.json", encoding="utf-8"))["warmup"] == {"enabled": True, "time_local": "07:30"}
+    w = json.load(open(store.home() / "config.json", encoding="utf-8"))["warmup"]
+    assert w["enabled"] is True and w["times"] == ["07:30", "18:00"] and w["time_local"] == "07:30"
     status, _, body = authed.request("GET", "/api/config")
-    assert body["warmup"]["time_local"] == "07:30"
-    status, _, body = authed.request("PUT", "/api/warmup", {"enabled": True, "time_local": "25:99"})
+    assert body["warmup"]["times"] == ["07:30", "18:00"]
+    status, _, body = authed.request("PUT", "/api/warmup", {"enabled": True, "times": "25:99"})
+    assert status == 400
+    status, _, body = authed.request("PUT", "/api/warmup", {"enabled": True, "times": ""})
     assert status == 400

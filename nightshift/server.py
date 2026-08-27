@@ -441,13 +441,28 @@ class _Handler(BaseHTTPRequestHandler):
         if data is None:
             return
         enabled = bool(data.get("enabled"))
-        hhmm = str(data.get("time_local") or "").strip()
-        if enabled and not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", hhmm):
-            return self._send_json(400, {"error": "时间要写成 HH:MM（本地时间）"})
+        raw = data.get("times")
+        if raw is None:
+            raw = data.get("time_local") or ""
+        if isinstance(raw, str):
+            raw = re.split(r"[\s,，、;；]+", raw.strip())
+        times = []
+        for t in raw:
+            t = str(t).strip()
+            if not t:
+                continue
+            m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", t)
+            if not m:
+                return self._send_json(400, {"error": f"时间要写成 HH:MM（本地时间），认不出：{t}"})
+            times.append(f"{int(m.group(1)):02d}:{m.group(2)}")
+        times = sorted(set(times))
+        if enabled and not times:
+            return self._send_json(400, {"error": "开着预热就得给至少一个时刻，如 06:00 18:00"})
         cfg = store.load_config()
-        cfg["warmup"] = {**(cfg.get("warmup") or {}), "enabled": enabled, "time_local": hhmm}
+        cfg["warmup"] = {**(cfg.get("warmup") or {}), "enabled": enabled, "times": times,
+                         "time_local": times[0] if times else ""}
         store.atomic_write_json(store.home() / "config.json", cfg)
-        logger.info("预热设置已更新：enabled=%s time=%s", enabled, hhmm)
+        logger.info("预热设置已更新：enabled=%s times=%s", enabled, times)
         return self._send_json(200, {"ok": True, "warmup": cfg["warmup"]})
 
     def _api_preview(self) -> None:

@@ -223,22 +223,22 @@ function renderWarmup(cfg) {
   var w = cfg.warmup || {};
   if (!WARMUP_DIRTY) {
     $("w-enabled").checked = !!w.enabled;
-    $("w-time").value = w.time_local || "";
+    $("w-time").value = (w.times && w.times.length) ? w.times.join(" ") : (w.time_local || "");
   }
   var st = cfg.warmup_state || {};
   var text = "";
   if (st.last_run_at) {
-    text = "上次预热：" + fmtLocal(st.last_run_at) + (st.ok ? "（成功，" + (st.model || "") + " 回了「" + (st.reply || "") + "」）" : "（失败：" + (st.error || "") + "）");
+    text = "上次预热：" + fmtLocal(st.last_run_at) + (st.slot ? "（" + st.slot + " 那次）" : "") + (st.ok ? "（成功，" + (st.model || "") + " 回了「" + (st.reply || "") + "」）" : "（失败：" + (st.error || "") + "）");
   } else if (w.enabled) {
-    text = "还没预热过，今天 " + (w.time_local || "") + " 到点自动发";
+    text = "还没预热过，今天 " + ((w.times && w.times.join("、")) || w.time_local || "") + " 到点自动发";
   }
   $("warmup-state").textContent = text;
 }
 
 function saveWarmup() {
-  var enabled = $("w-enabled").checked, time = $("w-time").value;
-  if (enabled && !time) { banner("先选个时间"); return; }
-  api("PUT", "./api/warmup", { enabled: enabled, time_local: time })
+  var enabled = $("w-enabled").checked, time = $("w-time").value.trim();
+  if (enabled && !time) { banner("先填时刻，如 06:00 18:00"); return; }
+  api("PUT", "./api/warmup", { enabled: enabled, times: time })
     .then(function () { WARMUP_DIRTY = false; banner("预热设置已保存"); return api("GET", "./api/config"); })
     .then(function (cfg) { CFG = cfg; renderWarmup(cfg); })
     .catch(function () {});
