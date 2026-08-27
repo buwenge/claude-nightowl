@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>夜班 · 设置口令</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<main class="auth-box">
+  <h1>夜班 · 首次设置口令</h1>
+  <form id="setup-form">
+    <label for="password"><b>设置口令（至少 8 个字符）</b></label>
+    <input type="password" id="password" autocomplete="new-password" minlength="8" required>
+    <label for="password2"><b>再输一遍</b></label>
+    <input type="password" id="password2" autocomplete="new-password" minlength="8" required>
+    <p id="err" class="err" role="alert"></p>
+    <button type="submit" class="primary">设为登录口令</button>
+  </form>
+  <p class="note">口令只能设置这一次；以后改口令请在服务器上用命令行
+  <code>python3 -m nightshift passwd</code>。这个口令的强度等于 root shell 的强度，请认真设。</p>
+</main>
+<script>
+"use strict";
+var form = document.getElementById("setup-form");
+var err = document.getElementById("err");
+form.addEventListener("submit", async function (ev) {
+  ev.preventDefault();
+  err.textContent = "";
+  var password = document.getElementById("password").value;
+  var password2 = document.getElementById("password2").value;
+  if (password !== password2) {
+    err.textContent = "两次输入不一致";
+    return;
+  }
+  try {
+    var resp = await fetch("./api/setup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Requested-With": "nightshift" },
+      body: JSON.stringify({ password: password })
+    });
+    var data = {};
+    try { data = await resp.json(); } catch (e) { /* 空响应体 */ }
+    if (resp.ok) {
+      location.href = "./";
+      return;
+    }
+    err.textContent = data.error || "设置失败（" + resp.status + "）";
+  } catch (e) {
+    err.textContent = "网络错误，稍后再试";
+  }
+});
+</script>
+</body>
+</html>

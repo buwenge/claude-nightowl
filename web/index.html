@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>夜班 · 任务台</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div id="banner" role="alert"></div>
+
+<header class="topbar">
+  <div class="brand">夜班</div>
+  <nav class="seg" aria-label="页面切换">
+    <button type="button" id="tab-tasks" aria-selected="true">任务</button>
+    <button type="button" id="tab-new" aria-selected="false">新建</button>
+    <button type="button" id="tab-tpl" aria-selected="false">模板</button>
+  </nav>
+  <button type="button" id="btn-logout" class="ghost">退出</button>
+</header>
+
+<div class="wrap">
+
+  <!-- ============ 任务页 ============ -->
+  <section id="view-tasks">
+    <div class="card" id="quota-box">
+      <h2 style="margin-top:0">额度</h2>
+      <div id="quota-body"><p class="hint">加载中…</p></div>
+    </div>
+    <div id="task-list"><p class="hint">加载中…</p></div>
+  </section>
+
+  <!-- ============ 新建页 ============ -->
+  <section id="view-new" hidden>
+    <form id="new-form">
+      <label for="f-title"><b>标题</b></label>
+      <input type="text" id="f-title" required>
+
+      <label for="f-project"><b>项目</b></label>
+      <select id="f-project" required></select>
+
+      <label for="f-model"><b>模型</b></label>
+      <select id="f-model"></select>
+      <input type="text" id="f-model-custom" placeholder="手输模型名" hidden>
+
+      <label for="f-effort"><b>思考档位</b></label>
+      <select id="f-effort"></select>
+
+      <label for="f-runat"><b>开跑时间（本地时间，必填，没有默认值）</b></label>
+      <input type="datetime-local" id="f-runat" required>
+      <p class="hint">留空不能提交。到点后调度器会先做预检（额度、目录信任、同目录互斥）。</p>
+
+      <label for="f-text"><b>任务内容</b></label>
+      <textarea id="f-text" class="tall" rows="8" required
+        placeholder="要干活的完整说明，会原样放进提示词"></textarea>
+
+      <details class="box" id="box-guards">
+        <summary>上下文与换班</summary>
+        <label for="f-warntokens"><b>警戒线 tokens</b></label>
+        <input type="number" id="f-warntokens" min="1000" step="1000">
+        <p class="hint">留空或改模型会自动按「比例 × 该模型上下文上限」重算；一旦手改就不再跟着变。</p>
+
+        <label for="f-warntext"><b>到线时注入的话</b></label>
+        <textarea id="f-warntext" rows="4"></textarea>
+
+        <label for="f-chainmax"><b>一晚最多几班</b></label>
+        <input type="number" id="f-chainmax" min="1" max="20" step="1">
+
+        <label for="f-nohandover"><b>没交接时</b></label>
+        <select id="f-nohandover">
+          <option value="continue">续班（自己看 git log 判断进度）</option>
+          <option value="stop">停下等我（标 needs_attention）</option>
+        </select>
+      </details>
+
+      <div class="prompt-head">
+        <label for="f-prompt"><b>最终提示词（会原样发给会话）</b></label>
+        <span id="tag-edited" class="tag-edited">已手改</span>
+        <button type="button" id="btn-regen" class="ghost" hidden>按模板重新生成</button>
+      </div>
+      <textarea id="f-prompt" class="mono tall" rows="10" required></textarea>
+      <p class="hint">标题 / 项目 / 模型 / 任务内容一变就自动按模板刷新；你一旦手改就不再覆盖。</p>
+
+      <p id="new-err" class="err" role="alert"></p>
+      <button type="submit" class="primary" style="width:100%">建任务</button>
+    </form>
+  </section>
+
+  <!-- ============ 模板页 ============ -->
+  <section id="view-tpl" hidden>
+    <h2>提示词模板</h2>
+    <p class="hint">占位符：{task} {title} {project_path} {context_limit}</p>
+    <textarea id="t-prompt" class="mono tall" rows="8"></textarea>
+
+    <h2>到线注入的话</h2>
+    <p class="hint">占位符：{ctx_k} {limit_k} {handover_path}</p>
+    <textarea id="t-warntext" class="tall" rows="6"></textarea>
+
+    <h2>续班模板</h2>
+    <p class="hint">占位符：{task} {shift} {handover}</p>
+    <textarea id="t-chain" class="tall" rows="6"></textarea>
+
+    <p id="tpl-note" class="ok-note"></p>
+    <button type="button" id="btn-save-tpl" class="primary" style="width:100%">保存三个模板</button>
+  </section>
+</div>
+
+<!-- ============ 屏幕快照遮罩 ============ -->
+<div id="screen-overlay" class="overlay">
+  <div class="overlay-bar">
+    <span class="t" id="screen-title">屏幕快照</span>
+    <span class="hint" style="color:#9aa">每 5 秒自动刷新</span>
+    <button type="button" id="btn-screen-close">关闭</button>
+  </div>
+  <pre id="screen-text">加载中…</pre>
+</div>
+
+<script src="./app.js"></script>
+</body>
+</html>

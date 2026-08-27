@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>夜班 · 登录</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<main class="auth-box">
+  <h1>夜班 · 登录</h1>
+  <form id="login-form">
+    <label for="password"><b>口令</b></label>
+    <input type="password" id="password" autocomplete="current-password" required>
+    <p id="err" class="err" role="alert"></p>
+    <button type="submit" class="primary">登录</button>
+  </form>
+  <p class="note">第一次用？还没设过口令时会自动跳到设置页。</p>
+</main>
+<script>
+"use strict";
+var form = document.getElementById("login-form");
+var err = document.getElementById("err");
+form.addEventListener("submit", async function (ev) {
+  ev.preventDefault();
+  err.textContent = "";
+  var password = document.getElementById("password").value;
+  try {
+    var resp = await fetch("./api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Requested-With": "nightshift" },
+      body: JSON.stringify({ password: password })
+    });
+    var data = {};
+    try { data = await resp.json(); } catch (e) { /* 空响应体 */ }
+    if (resp.ok) {
+      location.href = "./";
+      return;
+    }
+    if (resp.status === 429) {
+      err.textContent = "失败次数太多，请 15 分钟后再试";
+    } else {
+      err.textContent = data.error || "登录失败（" + resp.status + "）";
+    }
+  } catch (e) {
+    err.textContent = "网络错误，稍后再试";
+  }
+});
+</script>
+</body>
+</html>
