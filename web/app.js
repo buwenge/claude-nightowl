@@ -234,7 +234,9 @@ function renderWarmup(cfg) {
 }
 
 function saveWarmup() {
-  api("PUT", "./api/warmup", { enabled: $("w-enabled").checked, time_local: $("w-time").value })
+  var enabled = $("w-enabled").checked, time = $("w-time").value;
+  if (enabled && !time) { banner("先选个时间"); return; }
+  api("PUT", "./api/warmup", { enabled: enabled, time_local: time })
     .then(function () { WARMUP_DIRTY = false; banner("预热设置已保存"); return api("GET", "./api/config"); })
     .then(function (cfg) { CFG = cfg; renderWarmup(cfg); })
     .catch(function () {});
@@ -589,8 +591,10 @@ function start() {
   });
   $("btn-screen-close").addEventListener("click", closeScreen);
   $("btn-warmup-save").addEventListener("click", saveWarmup);
-  $("w-enabled").addEventListener("change", function () { WARMUP_DIRTY = true; });
+  // 一改就存：勾选/时间变化立刻 PUT，不给轮询插队的机会（8/28 工头勾了两次都被抹掉）
+  $("w-enabled").addEventListener("change", function () { WARMUP_DIRTY = true; saveWarmup(); });
   $("w-time").addEventListener("input", function () { WARMUP_DIRTY = true; });
+  $("w-time").addEventListener("change", function () { WARMUP_DIRTY = true; saveWarmup(); });
   $("btn-refresh").addEventListener("click", function () {
     refreshTasks(); refreshQuota(); banner("已刷新");
   });
