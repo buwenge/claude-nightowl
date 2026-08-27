@@ -17,12 +17,15 @@ import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .context import context_limit_for
+
 __all__ = [
     "ConfigMissing",
     "STATES",
     "append_event",
     "atomic_write_json",
     "atomic_write_text",
+    "build_prompt",
     "create_task",
     "ensure_dirs",
     "home",
@@ -256,3 +259,18 @@ def render(template: str, **vars) -> str:
     for key, value in vars.items():
         out = out.replace("{" + key + "}", str(value))
     return out
+
+
+def build_prompt(config: dict, title: str, project: str, model: str, task_text: str) -> str:
+    """按 config.prompt_template 渲染最终提示词。
+
+    网页 /api/preview 与 CLI cmd_add 共用这一套占位符
+    （{task} {title} {project_path} {context_limit}），保证所见即所发。
+    """
+    return render(
+        config["prompt_template"],
+        task=task_text,
+        title=title,
+        project_path=config["projects"][project],
+        context_limit=context_limit_for(model, config),
+    )

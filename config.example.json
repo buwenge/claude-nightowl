@@ -17,6 +17,7 @@
   "efforts": ["low", "medium", "high", "xhigh", "max"],
   "guards": { "session_pct_max": 80, "weekly_pct_max": 95, "context_warn_ratio": 0.8, "keepalive": true },
   "chain": { "max_windows": 3, "on_no_handover": "continue" },
+  "http": { "host": "127.0.0.1", "port": 8190, "url_prefix": "/nightshift", "secure_cookie": true, "cookie_days": 365 },
   "scheduler": {
     "interval_seconds": 30,
     "launch_grace_seconds": 180,

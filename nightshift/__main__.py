@@ -13,7 +13,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import launcher, quota, scheduler, store
-from .context import context_limit_for
 
 __all__ = ["main"]
 
@@ -65,12 +64,8 @@ def cmd_add(args) -> int:
     if args.prompt_file:
         prompt_final = Path(args.prompt_file).read_text(encoding="utf-8")
     else:
-        prompt_final = store.render(
-            config["prompt_template"],
-            task=task_text,
-            title=args.title,
-            project_path=project_path,
-            context_limit=context_limit_for(args.model, config),
+        prompt_final = store.build_prompt(
+            config, args.title, args.project, args.model, task_text
         )
 
     task = {

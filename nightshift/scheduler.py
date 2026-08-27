@@ -417,24 +417,26 @@ def _maybe_refresh_quota(
 
 
 def _setup_logging() -> logging.Logger:
-    """scheduler.log（2 MB × 3 轮转）+ stderr 各一份。"""
-    logger = logging.getLogger("nightshift.scheduler")
-    if logger.handlers:
-        return logger
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    store.ensure_dirs()
-    file_handler = logging.handlers.RotatingFileHandler(
-        store.home() / "scheduler.log",
-        maxBytes=2_000_000, backupCount=3, encoding="utf-8", delay=True,
-    )
-    file_handler.setFormatter(fmt)
-    stream_handler = logging.StreamHandler(sys.stderr)
-    stream_handler.setFormatter(fmt)
-    logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
-    return logger
+    """给 nightshift 根 logger 挂 scheduler.log（2 MB × 3 轮转）+ stderr 各一份。
+
+    scheduler 与 http 两个子 logger 靠继承共用这套 handler，自身不配置——
+    网页访问日志（nightshift.http）与调度日志（nightshift.scheduler）落同一个文件。
+    """
+    root = logging.getLogger("nightshift")
+    if not root.handlers:
+        root.setLevel(logging.INFO)
+        fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        store.ensure_dirs()
+        file_handler = logging.handlers.RotatingFileHandler(
+            store.home() / "scheduler.log",
+            maxBytes=2_000_000, backupCount=3, encoding="utf-8", delay=True,
+        )
+        file_handler.setFormatter(fmt)
+        stream_handler = logging.StreamHandler(sys.stderr)
+        stream_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
+        root.addHandler(stream_handler)
+    return logging.getLogger("nightshift.scheduler")
 
 
 def run_forever(config: dict, max_ticks: int | None = None) -> None:

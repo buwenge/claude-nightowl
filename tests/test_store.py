@@ -104,6 +104,28 @@ def test_render_only_known_placeholders():
     assert out == "你好 T，正文是 正文A，{不认识的} 和 {{ 保持原样"
 
 
+def test_build_prompt_known_placeholders():
+    """build_prompt 与 cmd_add 的模板渲染同一套占位符。"""
+    config = dict(CONFIG)
+    config["prompt_template"] = "项目 {project_path}｜标题 {title}｜上限 {context_limit}\n{task}"
+    config["models"] = {"claude-fable-5": {"context_limit": 500000}}
+    config["default_context_limit"] = 200000
+    out = store.build_prompt(config, "标题A", "demo", "claude-fable-5", "正文B")
+    assert out == "项目 /home/user/projects/demo｜标题 标题A｜上限 500000\n正文B"
+    # 模型不在 config.models 里 → 退到 default_context_limit
+    out2 = store.build_prompt(config, "标题A", "demo", "unknown-model", "正文B")
+    assert "200000" in out2
+    # 旧写法（cmd_add 原来手拼 render 的等价形式）结果一致
+    old = store.render(
+        config["prompt_template"],
+        task="正文B",
+        title="标题A",
+        project_path=config["projects"]["demo"],
+        context_limit=config["models"]["claude-fable-5"]["context_limit"],
+    )
+    assert out == old
+
+
 def _worker(task_id: str, tag: str, count: int) -> None:
     for i in range(count):
         store.update_status(task_id, **{f"{tag}_{i}": i})
