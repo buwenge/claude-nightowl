@@ -1,7 +1,7 @@
 # nightshift（夜班）
 
 到点在 tmux 里开一个新窗口、跑一个**正常的交互式 `claude`** 的定时任务调度器。
-她早上 ssh 进来 `Ctrl+B w` 选窗口就能接着聊；跑的时候靠 Claude Code 自己的
+你早上 ssh 进来 `Ctrl+B w` 选窗口就能接着聊；跑的时候靠 Claude Code 自己的
 hook 回报状态，靠机器读 transcript 算上下文水位——不猜、不接管会话。
 
 ## 依赖
@@ -21,7 +21,7 @@ cp config.example.json ~/.nightshift/config.json
 
 | 键 | 改什么 |
 |---|---|
-| `tmux_session` | 任务窗口开在哪个 tmux 会话里（她登录自动进的那个会话名） |
+| `tmux_session` | 任务窗口开在哪个 tmux 会话里（你登录自动进的那个会话名） |
 | `projects` | 项目名 → 目录绝对路径；表单/命令行只能从这里选 |
 | `models` | 各模型的上下文上限 `context_limit`、账号额度里的单模型周线标签 `usage_label` |
 | `efforts` / `guards` / `chain` | 思考档位、额度与上下文警戒线、换班策略 |
