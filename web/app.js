@@ -853,6 +853,7 @@ function loadTemplatesView() {
     $("t-quotawrap").value = cfg.quota_wrapup_text || "";
     $("t-quotaother").value = cfg.quota_other_model_text || "";
     $("t-chain").value = cfg.chain_template || "";
+    $("t-stopbg").value = cfg.stop_background_text || "";
   }).catch(function () {});
 }
 
@@ -865,7 +866,8 @@ function saveTemplates() {
     quota_pause_text: $("t-quotapause").value,
     quota_wrapup_text: $("t-quotawrap").value,
     quota_other_model_text: $("t-quotaother").value,
-    chain_template: $("t-chain").value
+    chain_template: $("t-chain").value,
+    stop_background_text: $("t-stopbg").value
   }).then(function () {
     note.textContent = "已保存";
     setTimeout(function () { note.textContent = ""; }, 3000);

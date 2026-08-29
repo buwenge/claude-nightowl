@@ -714,6 +714,7 @@ def test_message_send_calls_send_keys_and_clears_draft(authed, monkeypatch):
     store.atomic_write_text(store.task_dir(task_id) / "draft.txt", "旧草稿")
     store.update_status(task_id, state="working", window_id="@9", pane_pid=1)
     calls = []
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
     monkeypatch.setattr(launcher, "send_keys", lambda wid, text: calls.append((wid, text)))
     status, _, body = authed.request(
         "POST", f"/api/tasks/{task_id}/message",
@@ -761,6 +762,7 @@ def test_message_bad_text_400(authed):
 def test_interrupt_sends_escape_once_and_keeps_state(authed, monkeypatch):
     task_id = make_task(authed, "要中止的")
     escapes = []
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
     monkeypatch.setattr(launcher, "send_escape", lambda wid: escapes.append(wid))
     store.update_status(task_id, state="working", window_id="@10", pane_pid=1)
     status, _, body = authed.request("POST", f"/api/tasks/{task_id}/interrupt")
@@ -779,6 +781,7 @@ def test_stop_background_sends_config_text(authed, monkeypatch):
     task_id = make_task(authed, "停后台")
     store.update_status(task_id, state="waiting_background", window_id="@11", pane_pid=1)
     sent = []
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
     monkeypatch.setattr(launcher, "send_keys", lambda wid, text: sent.append((wid, text)))
     # 文案来自 config（模板页可改）
     status, _, _ = authed.request(
@@ -797,6 +800,96 @@ def test_stop_background_sends_config_text(authed, monkeypatch):
     other = make_task(authed, "没窗停后台")
     status, _, _ = authed.request("POST", f"/api/tasks/{other}/stop-background")
     assert status == 409
+
+
+# ---------- S4.1 必修1/必修3：窗口真存活现查 tmux；事件一行 ----------
+
+
+def test_message_send_window_gone_409_no_side_effects(authed, monkeypatch):
+    """S4.1：账面 window_id 在、session_ended_at 空，但 tmux 里窗口已消失
+    → 409；不 send_keys、不删草稿、不记"已发出"事件。"""
+    task_id = make_task(authed, "窗口早没了")
+    store.atomic_write_text(store.task_dir(task_id) / "draft.txt", "还没发的话")
+    store.update_status(task_id, state="working", window_id="@13", pane_pid=1)
+    calls = []
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: False)
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: calls.append((wid, text)))
+    log = store.task_dir(task_id) / "events.log"
+    before = log.read_text(encoding="utf-8") if log.is_file() else ""
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{task_id}/message", {"text": "到了吗", "send": True}
+    )
+    assert status == 409
+    assert calls == []  # 不敲键
+    assert (store.task_dir(task_id) / "draft.txt").read_text(
+        encoding="utf-8") == "还没发的话"  # 不删草稿
+    after = log.read_text(encoding="utf-8") if log.is_file() else ""
+    assert after == before  # 不记"已发出"
+
+
+def test_interrupt_and_stop_background_window_gone_409(authed, monkeypatch):
+    """S4.1：窗口真没了时，中止与停后台一律 409，不碰 tmux、不留事件。"""
+    task_id = make_task(authed, "假活窗口")
+    store.update_status(task_id, state="working", window_id="@14", pane_pid=1)
+    escapes, keys = [], []
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: False)
+    monkeypatch.setattr(launcher, "send_escape", lambda wid: escapes.append(wid))
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: keys.append((wid, text)))
+    status, _, _ = authed.request("POST", f"/api/tasks/{task_id}/interrupt")
+    assert status == 409
+    status, _, _ = authed.request("POST", f"/api/tasks/{task_id}/stop-background")
+    assert status == 409
+    assert escapes == [] and keys == []
+    log = store.task_dir(task_id) / "events.log"
+    events = log.read_text(encoding="utf-8") if log.is_file() else ""
+    assert "中止" not in events and "停后台" not in events
+
+
+def test_message_send_event_stays_one_line(authed, monkeypatch):
+    """S4.1 必修3：多行捎话发送后，events.log 新增事件只占一行、不含 \\r \\n。"""
+    task_id = make_task(authed, "多行捎话")
+    store.update_status(task_id, state="working", window_id="@15", pane_pid=1)
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: None)
+    log = store.task_dir(task_id) / "events.log"
+    before = len(log.read_text(encoding="utf-8").splitlines()) if log.is_file() else 0
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{task_id}/message",
+        {"text": "第一行\n第二行\r\n第三行", "send": True},
+    )
+    assert status == 200 and body == {"sent": True}
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == before + 1  # 一个事件一行，多行文本不许拆行
+    assert "\r" not in lines[-1]
+    assert "捎话：" in lines[-1] and "第一行 第二行 第三行" in lines[-1]
+
+
+# ---------- S4.1 必修4：PUT 不许把 guards / chain 写坏 ----------
+
+
+def test_put_task_rejects_bad_guards_chain_and_keeps_old_file(authed):
+    task_id = make_task(authed, "guards防坏")
+    before = store.load_task(task_id)
+    bad_payloads = (
+        {"guards": "不是对象"},
+        {"chain": [1, 2]},
+        {"guards": {"auto_interrupt_minutes": 0}},
+        {"guards": {"auto_interrupt_minutes": -2}},
+        {"guards": {"auto_interrupt_minutes": True}},   # bool 不算整数
+        {"guards": {"auto_interrupt_minutes": "5"}},
+        {"guards": {"auto_interrupt_minutes": 2.5}},
+    )
+    for payload in bad_payloads:
+        status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", payload)
+        assert status == 400, payload
+        assert "auto_interrupt" in body["error"] or "对象" in body["error"], payload
+        assert store.load_task(task_id) == before  # 旧 task.json 一字不改
+    # 正常值仍可整体替换
+    status, _, body = authed.request(
+        "PUT", f"/api/tasks/{task_id}", {"guards": {"auto_interrupt_minutes": 5}}
+    )
+    assert status == 200, body
+    assert store.load_task(task_id)["guards"] == {"auto_interrupt_minutes": 5}
 
 
 # ---------- quota ----------

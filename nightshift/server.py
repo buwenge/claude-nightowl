@@ -703,15 +703,19 @@ class _Handler(BaseHTTPRequestHandler):
             store.atomic_write_text(store.task_dir(task_id) / "draft.txt", text)
             logger.info("网页捎话存草稿：%s", task_id)
             return self._send_json(200, {"saved": True})
-        status = store.read_status(task_id)
-        window_id = status.get("window_id")
-        if not window_id or status.get("session_ended_at"):
-            return self._send_json(409, {"error": "会话没在跑，发不了；可以先存草稿"})
+        # S4.1：账面之外还要现查 tmux；窗口已消失 → 409，
+        # 不 send_keys、不删草稿、不记"已发出"
+        window_id = self._require_live_window(
+            task_id, error="会话没在跑，发不了；可以先存草稿"
+        )
+        if window_id is None:
+            return
         # 多行折成单行：tmux send-keys 一次敲进去，换行会变成提前回车
         single_line = " ".join(text.splitlines()) or text
         launcher.send_keys(str(window_id), single_line)
         (store.task_dir(task_id) / "draft.txt").unlink(missing_ok=True)
-        store.append_event(task_id, f"捎话：{text[:80]}")
+        # S4.1：事件日志记折行后的单行文本，多行捎话不再把 events.log 拆成多行
+        store.append_event(task_id, f"捎话：{single_line[:80]}")
         logger.info("网页捎话已发送：%s", task_id)
         return self._send_json(200, {"sent": True})
 
@@ -722,12 +726,23 @@ class _Handler(BaseHTTPRequestHandler):
         logger.info("网页删捎话草稿：%s", task_id)
         return self._send_json(200, {"ok": True})
 
-    def _require_live_window(self, task_id: str) -> str | None:
-        """会话在跑就返回 window_id；否则回 409 并返回 None。"""
+    def _require_live_window(
+        self, task_id: str, error: str = "会话没在跑（没有活着的窗口）"
+    ) -> str | None:
+        """会话真活着才返回 window_id；否则回 409 并返回 None。
+
+        S4.1：账面（window_id 在 + session_ended_at 空）只说明"上次见过这个
+        窗口"；窗口刚死、SessionEnd hook 还没报到的瞬间账面还是旧的——所以
+        动手前必须用 launcher.window_alive 现查 tmux，查不到一律 409，
+        调用方不许敲键、不删草稿、不记"已发出"。
+        """
         status = store.read_status(task_id)
         window_id = status.get("window_id")
         if not window_id or status.get("session_ended_at"):
-            self._send_json(409, {"error": "会话没在跑（没有活着的窗口）"})
+            self._send_json(409, {"error": error})
+            return None
+        if not launcher.window_alive(str(window_id), store.load_config()):
+            self._send_json(409, {"error": error})
             return None
         return str(window_id)
 

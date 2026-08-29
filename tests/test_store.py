@@ -271,6 +271,31 @@ def test_validate_task_shared_rules():
         store.validate_task({**task, "run_at": None}, CONFIG)  # 非 after 缺 run_at
 
 
+def test_validate_task_guards_chain_shapes():
+    """S4.1 必修4：guards / chain 存在必须是对象；auto_interrupt_minutes
+    非 null 必须是正整数（bool 不算整数）——网页 PUT 的最后一道闸。"""
+    task = make_task()
+    with pytest.raises(ValueError):
+        store.validate_task({**task, "guards": "不是对象"}, CONFIG)
+    with pytest.raises(ValueError):
+        store.validate_task({**task, "chain": 5}, CONFIG)
+    with pytest.raises(ValueError):
+        store.validate_task({**task, "chain": [1, 2]}, CONFIG)
+    for bad in (0, -2, True, False, "5", 2.5):
+        with pytest.raises(ValueError):
+            store.validate_task(
+                {**task, "guards": {"auto_interrupt_minutes": bad}}, CONFIG
+            )
+    # 合法形状：不给 / null / 正整数
+    assert store.validate_task({**task, "guards": None, "chain": None}, CONFIG) == "time"
+    assert store.validate_task(
+        {**task, "guards": {"auto_interrupt_minutes": None}}, CONFIG
+    ) == "time"
+    assert store.validate_task(
+        {**task, "guards": {"auto_interrupt_minutes": 5}}, CONFIG
+    ) == "time"
+
+
 def test_config_example_json_valid():
     example = Path(__file__).resolve().parent.parent / "config.example.json"
     config = json.loads(example.read_text(encoding="utf-8"))

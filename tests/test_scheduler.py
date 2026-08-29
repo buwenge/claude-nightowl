@@ -684,6 +684,44 @@ def test_auto_interrupt_fires_once(monkeypatch):
     assert escapes == ["@56"]
 
 
+def test_auto_interrupt_recovers_per_stuck_cycle(monkeypatch):
+    """S4.1 回归：第一次卡住 → Esc 一次 → hook 恢复（清 auto_interrupted /
+    stuck_since）→ 第二次卡住 → 可再 Esc 一次；同一周期内仍不重复。"""
+    from nightshift import hook
+
+    Fakes(monkeypatch)
+    escapes: list[str] = []
+    monkeypatch.setattr(launcher, "send_escape", lambda wid: escapes.append(wid))
+    tid = make_task(title="两次卡住", guards={"auto_interrupt_minutes": 5})
+    stale = scheduler.to_iso(NOW - timedelta(minutes=20))
+    store.update_status(tid, state="working", window_id="@57", pane_pid=NO_PID,
+                        last_event_at=stale)
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=6))   # 标第一次卡住
+    assert store.read_status(tid)["stuck"] is True
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=12))  # 卡满 ≥5 分钟 → Esc 一次
+    assert escapes == ["@57"]
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=13))  # 同一周期内不重复
+    assert escapes == ["@57"]
+
+    # hook 恢复（UserPromptSubmit 到场）：本次卡住周期的三个标记都要清
+    hook.handle_event(tid, "UserPromptSubmit", {})
+    status = store.read_status(tid)
+    assert status["stuck"] is False
+    assert "auto_interrupted" not in status
+    assert "stuck_since" not in status
+
+    # 第二次卡住：把 last_event_at 拉回静默线以前，再走一遍
+    store.update_status(
+        tid, last_event_at=scheduler.to_iso(NOW + timedelta(minutes=14))
+    )
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=31))  # 静默 17 分钟 → 再标卡
+    assert store.read_status(tid)["stuck"] is True
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=37))  # 又卡满 ≥5 分钟 → 再 Esc
+    assert escapes == ["@57", "@57"]
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=38))  # 仍不重复
+    assert escapes == ["@57", "@57"]
+
+
 # ---------- S3② 换班：交接判定与后继任务 ----------
 
 

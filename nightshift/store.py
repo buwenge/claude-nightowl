@@ -172,7 +172,11 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
       排序用，起不起由前置链状态决定）；
     - trigger：None 按 {"type": "time"} 看待；after 要求 task 是已存在的
       任务 id（task.json 读得到，task_id 给出时还不许指向自己）、
-      when 只认 finished / ended。
+      when 只认 finished / ended；
+    - guards / chain（S4.1）：存在时必须是 JSON 对象；guards 里的
+      auto_interrupt_minutes 若存在且非 null，必须是正整数（bool 不算
+      整数）——防止网页 PUT 把 task.json 写坏、把调度器的 int(...) 炸出来
+      或负数让它立刻中止。
     """
     for key in _REQUIRED_FIELDS:
         if key == "run_at":
@@ -183,6 +187,16 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
         raise ValueError(f"project 不在 config.projects 里：{task['project']}")
     if task["effort"] not in config["efforts"]:
         raise ValueError(f"effort 不在 config.efforts 里：{task['effort']}")
+
+    for key in ("guards", "chain"):
+        value = task.get(key)
+        if value is not None and not isinstance(value, dict):
+            raise ValueError(f"{key} 必须是对象")
+    auto = (task.get("guards") or {}).get("auto_interrupt_minutes")
+    if auto is not None and (
+        isinstance(auto, bool) or not isinstance(auto, int) or auto <= 0
+    ):
+        raise ValueError("guards.auto_interrupt_minutes 必须是正整数")
 
     trigger = task.get("trigger")
     if trigger is None:

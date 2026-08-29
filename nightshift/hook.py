@@ -328,7 +328,12 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             # 回报里带着实际生效的模式，调度器靠它开提醒窗（R2）；没有就不覆盖旧值
             if payload.get("permission_mode"):
                 status["permission_mode"] = payload["permission_mode"]
-            status["stuck"] = False  # S4：来新事件就是缓过来了，疑似卡住解除
+            # S4：来新事件就是缓过来了，疑似卡住解除。
+            # S4.1：连本次卡住周期的 auto_interrupted / stuck_since 一起清——
+            # 只清 stuck 的话，会话恢复后第二次卡住永远不会再自动 Esc
+            status["stuck"] = False
+            status.pop("auto_interrupted", None)
+            status.pop("stuck_since", None)
             status["last_event_at"] = now
 
         store.modify_status(task_id, bump_turns)
@@ -390,7 +395,15 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             fields["state"] = "waiting_wakeup"  # 它自己定了闹钟（如额度暂停的缓存闹钟），不是干完了
         else:
             fields["state"] = "idle"
-        store.update_status(task_id, **fields)
+
+        def clear_stuck_cycle(status: dict) -> None:
+            # S4.1：恢复要连本次卡住周期的 auto_interrupted / stuck_since
+            # 一起清，不然会话缓过来后第二次卡住永远不会再自动 Esc
+            status.update(fields)
+            status.pop("auto_interrupted", None)
+            status.pop("stuck_since", None)
+
+        store.modify_status(task_id, clear_stuck_cycle)
         store.append_event(task_id, f"hook Stop → {fields['state']}")
         return None
 
@@ -401,7 +414,11 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             nonlocal refresh
             calls = int(status.get("tool_calls") or 0) + 1
             status["tool_calls"] = calls
-            status["stuck"] = False  # S4：有事件就是缓过来了，疑似卡住解除
+            # S4：有事件就是缓过来了，疑似卡住解除；
+            # S4.1：连本次卡住周期的 auto_interrupted / stuck_since 一起清
+            status["stuck"] = False
+            status.pop("auto_interrupted", None)
+            status.pop("stuck_since", None)
             status["last_event_at"] = now
             if calls % 20 == 0:  # 每 20 次工具调用刷新一次上下文水位
                 refresh = True
