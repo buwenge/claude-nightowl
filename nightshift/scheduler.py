@@ -73,7 +73,16 @@ def tick(config: dict, now: datetime) -> list[str]:
     for item in items:
         task, status = item["task"], item["status"]
         state = status.get("state")
+        after = (task.get("trigger") or {}).get("type") == "after"
         if state == "scheduled":
+            if after:
+                # S4：等前置任务——"到点"的定义换成前置链状态，
+                # 不满足就什么都不做（不推迟、不开窗）
+                if not _after_ready(task, status, config, now):
+                    continue
+                status = _note_trigger_met(task, status, now)
+                actions.extend(_try_launch(task, status, config, now))
+                continue
             # R4：到点锚用 max(run_at, retry_at)——有 retry_at（启动重试时刻）
             # 就用它，task.json 的 run_at 一个字不改
             retry_at = status.get("retry_at")
@@ -85,6 +94,11 @@ def tick(config: dict, now: datetime) -> list[str]:
         elif state == "postponed":
             next_at = status.get("next_attempt_at")
             if next_at and parse_iso(next_at) <= now:
+                if after:
+                    # S4：到点后照旧再判一次前置条件，不满足就原地等
+                    if not _after_ready(task, status, config, now):
+                        continue
+                    status = _note_trigger_met(task, status, now)
                 actions.extend(_try_launch(task, status, config, now))
         elif state == "launching":
             actions.extend(_check_launching(task, status, config, now))
@@ -117,6 +131,50 @@ def tick(config: dict, now: datetime) -> list[str]:
 
 
 # ---------- 起跑前预检（设计稿 §5.1） ----------
+
+
+def _after_ready(task: dict, status: dict, config: dict, now: datetime) -> bool:
+    """after 触发的"到点"判定：前置链最新一班的状态是否满足 when。
+
+    - when == "finished"：前置链最新一班必须正好 finished（整条链完工）；
+    - when == "ended"：落在 store.ENDED_STATES 里就算；
+    - 前置任务不存在（被删了）→ 标 needs_attention 并开提醒窗（attention_noted
+      只开一次），返回 False；
+    - 不满足时返回 False，调用方什么都不做（不推迟、不开窗）。
+    """
+    task_id = task["id"]
+    trigger = task.get("trigger") or {}
+    pre_id = str(trigger.get("task") or "")
+    try:
+        store.load_task(pre_id)
+    except (OSError, ValueError):
+        if not status.get("attention_noted"):
+            store.update_status(
+                task_id, state="needs_attention", attention_noted=True,
+                last_event_at=to_iso(now),
+            )
+            store.append_event(
+                task_id, f"前置任务 {pre_id} 不存在（被删了？）→ needs_attention"
+            )
+            launcher.open_notice_window(
+                task, "(需要人工)",
+                [f"前置任务 {pre_id} 不存在（被删了？），请改成按时间或换前置"],
+                config,
+            )
+        return False
+    state = store.chain_state(pre_id)
+    when = trigger.get("when") or "finished"
+    if when == "finished":
+        return state == "finished"
+    return state in store.ENDED_STATES
+
+
+def _note_trigger_met(task: dict, status: dict, now: datetime) -> dict:
+    """首次满足前置条件时落 trigger_met_at（推迟窗口的起算锚），返回新 status。"""
+    if status.get("trigger_met_at"):
+        return status
+    store.update_status(task["id"], trigger_met_at=to_iso(now))
+    return store.read_status(task["id"])
 
 
 def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[str]:
@@ -187,7 +245,12 @@ def _postpone(
     postpone_minutes = sch.get("postpone_minutes", 30)
     max_postpone_hours = sch.get("max_postpone_hours", 6)
     run_at = parse_iso(task["run_at"])
-    give_up_at = run_at + timedelta(hours=max_postpone_hours)
+    # S4 after 任务：6 小时上限从第一次满足前置的时刻（trigger_met_at）起算，
+    # 不从 run_at 起算——等前置等了多久都不该吃掉推迟额度
+    anchor = run_at
+    if (task.get("trigger") or {}).get("type") == "after" and status.get("trigger_met_at"):
+        anchor = parse_iso(status["trigger_met_at"])
+    give_up_at = anchor + timedelta(hours=max_postpone_hours)
     if now >= give_up_at:
         return _fail_now(
             task, config, now,
@@ -354,6 +417,43 @@ def _check_running(
         )
         store.append_event(task_id, "窗口不在了且没等到 SessionEnd → exited(window_gone)")
         return [f"{task_id} 窗口消失 → exited(window_gone)"]
+
+    # S4 疑似卡住：working/waiting_background 静默太久（一条前台工具调用里
+    # 轮询、轮次不结束、hook 不响）。只标状态与事件，不动会话、不改 state；
+    # 恢复由 hook 事件清 stuck（hook.py 唯一允许的改动）。
+    sch = config.get("scheduler") or {}
+    stuck_minutes = sch.get("stuck_minutes")
+    if stuck_minutes is None:
+        stuck_minutes = 15  # config 没写时的兜底（与 config.example.json 一致）
+    stuck = False
+    if (
+        status.get("state") in ("working", "waiting_background")
+        and stuck_minutes > 0
+        and status.get("last_event_at")
+    ):
+        stuck = now - parse_iso(status["last_event_at"]) >= timedelta(minutes=stuck_minutes)
+    if stuck and not status.get("stuck"):
+        store.update_status(task_id, stuck=True, stuck_since=to_iso(now))
+        store.append_event(
+            task_id,
+            f"疑似卡住：已经 {stuck_minutes} 分钟没有任何 hook 事件（可能卡在一条工具调用里）",
+        )
+    # 可选自动中止：guards.auto_interrupt_minutes（默认关）。stuck 持续超过它
+    # 就往窗口按一次 Esc；auto_interrupted 落盘防重复。
+    auto_minutes = (task.get("guards") or {}).get("auto_interrupt_minutes")
+    if (
+        stuck
+        and auto_minutes
+        and not status.get("auto_interrupted")
+        and window_id
+        and now - parse_iso(status.get("stuck_since") or to_iso(now))
+        >= timedelta(minutes=int(auto_minutes))
+    ):
+        launcher.send_escape(str(window_id))
+        store.update_status(task_id, auto_interrupted=True)
+        store.append_event(
+            task_id, f"疑似卡住已超过 {auto_minutes} 分钟 → 自动中止（Esc）"
+        )
 
     # R2：auto 被 CC 静默回落（如 haiku 只吃 default），无人值守会整晚卡在
     # 权限问答。开窗提醒一次就够——不改 state、不杀窗口，人来处理。

@@ -21,11 +21,13 @@ from .context import context_limit_for
 
 __all__ = [
     "ConfigMissing",
+    "ENDED_STATES",
     "STATES",
     "append_event",
     "atomic_write_json",
     "atomic_write_text",
     "build_prompt",
+    "chain_state",
     "create_successor",
     "create_task",
     "ensure_dirs",
@@ -65,7 +67,7 @@ STATES = (
     "chain_exhausted",
 )
 
-# create_task 必填字段
+# create_task 必填字段（run_at 对 after 触发的任务可缺，见 create_task）
 _REQUIRED_FIELDS = (
     "title",
     "project",
@@ -74,6 +76,17 @@ _REQUIRED_FIELDS = (
     "run_at",
     "task_text",
     "prompt_final",
+)
+
+# trigger.type == "after" 且 when == "ended" 时，前置链最新一班落在这些状态
+# 就算"已结束"（调度器与网页共用这一个定义）
+ENDED_STATES = (
+    "finished",
+    "exited",
+    "failed",
+    "cancelled",
+    "chain_exhausted",
+    "needs_attention",
 )
 
 
@@ -148,25 +161,66 @@ def task_dir(task_id: str) -> Path:
     return home() / "tasks" / task_id
 
 
+def _validate_trigger(trigger, task_id: str | None = None) -> str:
+    """校验 trigger 字段，返回归一后的 type；不合法抛 ValueError。
+
+    - 缺省 / None → "time"（按 run_at 到点）；
+    - "after"：task 必须是已存在的任务 id（task.json 读得到）、
+      when 只认 finished / ended；
+    - task_id 给出时（编辑场景）不许指向自己。
+    """
+    if trigger is None:
+        return "time"
+    if not isinstance(trigger, dict):
+        raise ValueError("trigger 必须是对象")
+    ttype = trigger.get("type")
+    if ttype == "time":
+        return "time"
+    if ttype != "after":
+        raise ValueError("trigger.type 只认 time / after")
+    pre_id = trigger.get("task")
+    if not pre_id or task_id == str(pre_id) or not (
+        task_dir(str(pre_id)) / "task.json"
+    ).is_file():
+        raise ValueError(f"trigger.task 必须是已存在的任务 id：{pre_id}")
+    if trigger.get("when") not in ("finished", "ended"):
+        raise ValueError("trigger.when 只认 finished / ended")
+    return "after"
+
+
 def create_task(task: dict, config: dict) -> str:
-    """校验并落盘一个新任务（task.json + 初始 status.json），返回任务 id。"""
+    """校验并落盘一个新任务（task.json + 初始 status.json），返回任务 id。
+
+    trigger 缺省补 {"type": "time"}；type == "after" 时 run_at 可以不给
+    （补成创建时刻，只当列表排序用，起不起由前置链状态决定）。
+    """
+    data = dict(task)
+    data["trigger"] = data.get("trigger") or {"type": "time"}
+    ttype = _validate_trigger(data["trigger"])
+
     for key in _REQUIRED_FIELDS:
-        if not task.get(key):
+        if key == "run_at":
+            continue  # after 任务允许缺，下面补
+        if not data.get(key):
             raise ValueError(f"缺少必填字段：{key}")
-    if task["project"] not in config["projects"]:
-        raise ValueError(f"project 不在 config.projects 里：{task['project']}")
-    if task["effort"] not in config["efforts"]:
-        raise ValueError(f"effort 不在 config.efforts 里：{task['effort']}")
-    run_at = task["run_at"]
-    if not (isinstance(run_at, str) and run_at.endswith("Z")):
-        raise ValueError("run_at 必须是 Z 结尾的 ISO UTC 时间，如 2026-08-27T18:00:00Z")
-    try:
-        datetime.fromisoformat(run_at[:-1])
-    except ValueError:
-        raise ValueError(f"run_at 不是合法的 ISO 时间：{run_at}") from None
+    if data["project"] not in config["projects"]:
+        raise ValueError(f"project 不在 config.projects 里：{data['project']}")
+    if data["effort"] not in config["efforts"]:
+        raise ValueError(f"effort 不在 config.efforts 里：{data['effort']}")
+    run_at = data.get("run_at")
+    if run_at:
+        if not (isinstance(run_at, str) and run_at.endswith("Z")):
+            raise ValueError("run_at 必须是 Z 结尾的 ISO UTC 时间，如 2026-08-27T18:00:00Z")
+        try:
+            datetime.fromisoformat(run_at[:-1])
+        except ValueError:
+            raise ValueError(f"run_at 不是合法的 ISO 时间：{run_at}") from None
+    elif ttype == "after":
+        data["run_at"] = utc_now_iso()  # 只当排序用
+    else:
+        raise ValueError("缺少必填字段：run_at")
 
     task_id = new_task_id()
-    data = dict(task)
     data["id"] = task_id
     data["created_at"] = utc_now_iso()
     data.setdefault("shift", 1)
@@ -195,6 +249,26 @@ def load_task(task_id: str) -> dict:
     """读 task.json。"""
     with open(task_dir(task_id) / "task.json", encoding="utf-8") as f:
         return json.load(f)
+
+
+def chain_state(task_id: str) -> str:
+    """前置链判定：该任务所在链（root_id 相同的所有任务，root_id 缺省即自身）
+    最新一班（shift 最大）的 status.state。after 触发的调度用它当"到点"。
+
+    任务不存在时抛 OSError（FileNotFoundError），调用方自己区分处理。
+    """
+    task = load_task(task_id)
+    root = task.get("root_id") or task["id"]
+    latest: dict | None = None
+    for item in list_tasks():
+        other = item["task"]
+        if (other.get("root_id") or other["id"]) != root:
+            continue
+        if latest is None or int(other.get("shift") or 1) > int(latest.get("shift") or 1):
+            latest = other
+    if latest is None:  # 到不了：自己总在列表里
+        return ""
+    return read_status(latest["id"]).get("state") or ""
 
 
 # create_successor 里交接缺席时的兜底文案（与开工令一致）

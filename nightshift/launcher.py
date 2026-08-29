@@ -21,6 +21,7 @@ __all__ = [
     "open_failure_window",
     "open_notice_window",
     "pid_alive",
+    "send_escape",
     "send_keys",
     "window_alive",
     "write_task_files",
@@ -298,6 +299,11 @@ def open_failure_window(task: dict, reason: str, config: dict) -> None:
 def send_keys(window_id: str, text: str) -> subprocess.CompletedProcess:
     """往窗口的 pane 敲一段文本加回车（保活戳用）。"""
     return _tmux("send-keys", "-t", str(window_id), text, "Enter")
+
+
+def send_escape(window_id: str) -> subprocess.CompletedProcess:
+    """往窗口的 pane 按一下 Esc（中止：让 CC 停下当前轮次，不改任务状态）。"""
+    return _tmux("send-keys", "-t", str(window_id), "Escape")
 
 
 def window_alive(window_id: str, config: dict) -> bool:

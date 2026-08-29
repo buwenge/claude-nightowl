@@ -68,6 +68,22 @@ _TERMINAL_STATES = (
 )
 
 
+def _trigger_text(task: dict) -> str:
+    """给前端的一句话触发说明（卡片上替代"计划 … 还有 …"那行）。"""
+    trigger = task.get("trigger") or {}
+    if trigger.get("type") != "after":
+        return "按时间"
+    pre_id = str(trigger.get("task") or "")
+    try:
+        pre = store.load_task(pre_id)
+    except (OSError, ValueError):
+        return "前置任务不存在"
+    title = pre.get("title") or pre_id
+    if trigger.get("when") == "ended":
+        return f"等「{title}」结束后"
+    return f"等「{title}」完工后"
+
+
 def _tail_lines(path: Path, count: int) -> list[str]:
     """文本文件末 N 行；没有/读不了返回空表。"""
     if not path.is_file():
@@ -489,6 +505,7 @@ class _Handler(BaseHTTPRequestHandler):
             item["events_tail"] = _tail_lines(
                 store.task_dir(item["task"]["id"]) / "events.log", 5
             )
+            item["trigger_text"] = _trigger_text(item["task"])
         return self._send_json(200, items)
 
     def _api_task_detail(self, task_id: str) -> None:
@@ -512,7 +529,7 @@ class _Handler(BaseHTTPRequestHandler):
             key: data.get(key)
             for key in ("title", "project", "model", "effort", "run_at", "task_text", "prompt_final")
         }
-        for key in ("guards", "chain"):
+        for key in ("guards", "chain", "trigger"):
             if data.get(key) is not None:
                 if not isinstance(data[key], dict):
                     return self._send_json(400, {"error": f"{key} 必须是对象"})

@@ -328,6 +328,7 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             # 回报里带着实际生效的模式，调度器靠它开提醒窗（R2）；没有就不覆盖旧值
             if payload.get("permission_mode"):
                 status["permission_mode"] = payload["permission_mode"]
+            status["stuck"] = False  # S4：来新事件就是缓过来了，疑似卡住解除
             status["last_event_at"] = now
 
         store.modify_status(task_id, bump_turns)
@@ -374,6 +375,7 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
         fields = {
             "background_tasks": background_tasks,
             "last_message": (payload.get("last_assistant_message") or "")[:2000],
+            "stuck": False,  # S4：有事件就是缓过来了，疑似卡住解除
             "last_event_at": now,
         }
         _refresh_context(task, payload, fields)
@@ -399,6 +401,7 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             nonlocal refresh
             calls = int(status.get("tool_calls") or 0) + 1
             status["tool_calls"] = calls
+            status["stuck"] = False  # S4：有事件就是缓过来了，疑似卡住解除
             status["last_event_at"] = now
             if calls % 20 == 0:  # 每 20 次工具调用刷新一次上下文水位
                 refresh = True

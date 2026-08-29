@@ -7,6 +7,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -489,6 +490,59 @@ def test_screen_no_window_404_with_window_monkeypatched(authed, monkeypatch):
     assert status == 200
     assert body["text"] == "假屏幕内容"
     assert calls == {"window_id": "@7", "lines": 50}
+
+
+# ---------- S4① 触发方式：建 after 任务与 trigger_text ----------
+
+
+def test_create_after_task_201_and_trigger_text(authed):
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "前置任务甲", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+    })
+    assert status == 201
+    pre = body["id"]
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "后继任务乙", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": "2026-08-28T19:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+        "trigger": {"type": "after", "task": pre, "when": "finished"},
+    })
+    assert status == 201, body
+    after = body["id"]
+    assert store.load_task(after)["trigger"] == {
+        "type": "after", "task": pre, "when": "finished",
+    }
+
+    status, _, items = authed.request("GET", "/api/tasks")
+    by_id = {i["task"]["id"]: i for i in items}
+    assert by_id[after]["trigger_text"] == "等「前置任务甲」完工后"
+    assert by_id[pre]["trigger_text"] == "按时间"
+
+    # when=ended 的文案
+    task = store.load_task(after)
+    task["trigger"] = {"type": "after", "task": pre, "when": "ended"}
+    store.atomic_write_json(store.task_dir(after) / "task.json", task)
+    _, _, items = authed.request("GET", "/api/tasks")
+    by_id = {i["task"]["id"]: i for i in items}
+    assert by_id[after]["trigger_text"] == "等「前置任务甲」结束后"
+
+    # 前置被删了
+    shutil.rmtree(store.task_dir(pre))
+    _, _, items = authed.request("GET", "/api/tasks")
+    by_id = {i["task"]["id"]: i for i in items}
+    assert by_id[after]["trigger_text"] == "前置任务不存在"
+
+    # 坏 trigger → 400
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "坏触发", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": "2026-08-28T19:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+        "trigger": {"type": "after", "task": "20990101-000000-ffff", "when": "finished"},
+    })
+    assert status == 400
+    assert "trigger" in body["error"]
 
 
 # ---------- quota ----------

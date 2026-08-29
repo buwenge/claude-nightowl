@@ -501,6 +501,189 @@ def test_keepalive_disabled_not_poked(monkeypatch):
     assert fakes.send_keys_calls == []
 
 
+# ---------- S4① after 触发：等前置任务 ----------
+
+
+def _pre_chain() -> tuple[str, str]:
+    """造一条"前置在干活、后继等它"的最小场景，返回 (pre, after)。"""
+    pre = make_task(title="前置", run_at=scheduler.to_iso(NOW + timedelta(hours=1)))
+    return pre, ""
+
+
+def test_after_task_waits_until_pre_chain_finished(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    pre, _ = _pre_chain()
+    after = make_task(
+        title="后继", trigger={"type": "after", "task": pre, "when": "finished"}
+    )
+    # 前置在干活：后继不起（scheduled 分支什么都不做）
+    store.update_status(pre, state="working", window_id="@40", pane_pid=NO_PID)
+    actions = scheduler.tick(CONFIG, NOW)
+    assert fakes.launch_calls == []
+    assert all(after not in a for a in actions)
+    # 前置链开出第 2 班：链判定看最新一班，第 2 班没完仍不起
+    succ = make_task(title="前置", shift=2, root_id=pre, parent_id=pre,
+                     run_at=scheduler.to_iso(NOW + timedelta(hours=1)))
+    store.update_status(pre, state="finished")
+    store.update_status(succ, state="working", window_id="@41", pane_pid=NO_PID)
+    scheduler.tick(CONFIG, NOW)
+    assert fakes.launch_calls == []
+    # 第 2 班 finished → 后继起（launch 被叫一次）
+    store.update_status(succ, state="finished")
+    scheduler.tick(CONFIG, NOW)
+    assert fakes.launch_calls == [after]
+    assert store.read_status(after)["trigger_met_at"] == scheduler.to_iso(NOW)
+
+
+def test_after_when_ended_fires_on_failed_only(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    pre, _ = _pre_chain()
+    ended = make_task(title="等结束", trigger={"type": "after", "task": pre, "when": "ended"})
+    # 另一个项目：免得 ended 先起跑后，fin 被同目录互斥预检推迟
+    fin = make_task(title="等完工", project="other",
+                    trigger={"type": "after", "task": pre, "when": "finished"})
+    store.update_status(pre, state="failed")
+    scheduler.tick(CONFIG, NOW)
+    # when=ended：failed 也算结束 → 起；when=finished：不起
+    assert sorted(fakes.launch_calls) == sorted([ended])
+    store.update_status(pre, state="finished")
+    scheduler.tick(CONFIG, NOW)
+    assert sorted(fakes.launch_calls) == sorted([ended, fin])
+
+
+def test_after_pre_deleted_needs_attention_once(monkeypatch):
+    import shutil
+
+    fakes = Fakes(monkeypatch)
+    pre, _ = _pre_chain()
+    after = make_task(title="等前置", trigger={"type": "after", "task": pre, "when": "finished"})
+    shutil.rmtree(store.task_dir(pre))
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(after)
+    assert status["state"] == "needs_attention"
+    assert status["attention_noted"] is True
+    assert fakes.launch_calls == []
+    assert len(fakes.notice_calls) == 1
+    noticed_id, suffix, lines = fakes.notice_calls[0]
+    assert noticed_id == after and "(需要人工)" in suffix
+    assert any(pre in ln and "不存在" in ln for ln in lines)
+    # 只开一次：再 tick 不再重复标窗口
+    scheduler.tick(CONFIG, NOW)
+    assert len(fakes.notice_calls) == 1
+
+
+def test_after_postpone_window_anchored_at_trigger_met(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    fakes.usage["session_pct"] = 85  # 前置满足后预检必推迟
+    pre, _ = _pre_chain()
+    after = make_task(title="后继", trigger={"type": "after", "task": pre, "when": "finished"})
+    store.update_status(pre, state="finished")
+    met = NOW + timedelta(minutes=10)
+    scheduler.tick(CONFIG, met)
+    status = store.read_status(after)
+    assert status["state"] == "postponed"
+    assert status["trigger_met_at"] == scheduler.to_iso(met)
+    # run_at（NOW）+ 6h 已过，但从 trigger_met_at 起算还没到 → 不许判失败
+    scheduler.tick(CONFIG, NOW + timedelta(hours=6, minutes=1))
+    assert store.read_status(after)["state"] == "postponed"
+    # 下一次尝试（第二次推迟 + 30 分钟）仍不满足，且已过 trigger_met_at + 6h → 判失败
+    scheduler.tick(CONFIG, NOW + timedelta(hours=6, minutes=31))
+    status = store.read_status(after)
+    assert status["state"] == "failed"
+    assert "推迟超过 6 小时" in status["error"]
+
+
+def test_after_postponed_rejudges_trigger_at_next_attempt(monkeypatch):
+    """postponed 的 after 任务：next_attempt_at 到点后再判一次前置条件。"""
+    fakes = Fakes(monkeypatch)
+    pre, _ = _pre_chain()
+    after = make_task(title="后继", trigger={"type": "after", "task": pre, "when": "finished"})
+    store.update_status(
+        after, state="postponed",
+        next_attempt_at=scheduler.to_iso(NOW - timedelta(minutes=1)),
+    )
+    # 前置还没完工：到点也不起
+    scheduler.tick(CONFIG, NOW)
+    assert fakes.launch_calls == []
+    # 前置完工 → 起
+    store.update_status(pre, state="finished")
+    scheduler.tick(CONFIG, NOW)
+    assert fakes.launch_calls == [after]
+
+
+# ---------- S4① 疑似卡住检测 ----------
+
+
+def test_stuck_marked_after_silence_and_not_repeated(monkeypatch):
+    Fakes(monkeypatch)
+    tid = make_task(title="卡住的")
+    stale = scheduler.to_iso(NOW - timedelta(minutes=20))
+    store.update_status(tid, state="working", window_id="@50", pane_pid=NO_PID,
+                        last_event_at=stale)
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["stuck"] is True
+    assert status["stuck_since"] == scheduler.to_iso(NOW)
+    assert status["state"] == "working"  # 不改 state
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "疑似卡住" in events
+    # 已标过：再 tick 不重复记事件
+    n_before = len(events.splitlines())
+    scheduler.tick(CONFIG, NOW)
+    assert len((store.task_dir(tid) / "events.log").read_text(
+        encoding="utf-8").splitlines()) == n_before
+
+    # 刚有事件、没到线：不标；waiting_wakeup / idle 不参与卡住判定
+    fresh = make_task(title="很活跃")
+    store.update_status(fresh, state="working", window_id="@52", pane_pid=NO_PID,
+                        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=5)))
+    wakeup = make_task(title="等闹钟的")
+    store.update_status(wakeup, state="waiting_wakeup", window_id="@53",
+                        pane_pid=NO_PID,
+                        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=99)))
+    scheduler.tick(CONFIG, NOW)
+    assert not store.read_status(fresh).get("stuck")
+    assert not store.read_status(wakeup).get("stuck")
+
+
+def test_stuck_uses_configured_minutes(monkeypatch):
+    Fakes(monkeypatch)
+    tid = make_task(title="按配置判卡")
+    stale = scheduler.to_iso(NOW - timedelta(minutes=6))
+    store.update_status(tid, state="waiting_background", window_id="@54",
+                        pane_pid=NO_PID, last_event_at=stale)
+    config = {**CONFIG, "scheduler": {**CONFIG["scheduler"], "stuck_minutes": 5}}
+    scheduler.tick(config, NOW)
+    assert store.read_status(tid)["stuck"] is True
+    # stuck_minutes=0 关掉检测
+    other = make_task(title="不判卡")
+    store.update_status(other, state="working", window_id="@55", pane_pid=NO_PID,
+                        last_event_at=scheduler.to_iso(NOW - timedelta(hours=9)))
+    config_off = {**CONFIG, "scheduler": {**CONFIG["scheduler"], "stuck_minutes": 0}}
+    scheduler.tick(config_off, NOW)
+    assert not store.read_status(other).get("stuck")
+
+
+def test_auto_interrupt_fires_once(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    escapes: list[str] = []
+    monkeypatch.setattr(launcher, "send_escape", lambda wid: escapes.append(wid))
+    tid = make_task(title="自动中止", guards={"auto_interrupt_minutes": 5})
+    stale = scheduler.to_iso(NOW - timedelta(minutes=20))
+    store.update_status(tid, state="working", window_id="@56", pane_pid=NO_PID,
+                        last_event_at=stale)
+    scheduler.tick(CONFIG, NOW)  # 首次标 stuck，stuck_since=NOW，还不到 5 分钟
+    assert escapes == []
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=6))  # 卡住满 6 分钟 ≥ 5
+    assert escapes == ["@56"]
+    assert store.read_status(tid)["auto_interrupted"] is True
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "自动中止" in events
+    # 不重复
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=7))
+    assert escapes == ["@56"]
+
+
 # ---------- S3② 换班：交接判定与后继任务 ----------
 
 

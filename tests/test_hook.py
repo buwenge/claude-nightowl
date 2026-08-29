@@ -718,3 +718,26 @@ def test_own_model_line_uses_model_weekly_pct_max(tmp_path):
     proc = run_hook(task_id, "PostToolUse", payload)
     ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "Fable 单独周线剩 12%（线 15%）" in ctx and "NEXT: done" in ctx
+
+
+# ---------- S4① 疑似卡住：有新事件就清 stuck ----------
+
+
+def test_hook_events_clear_stuck():
+    task_id = make_task()
+    # UserPromptSubmit 清
+    store.update_status(task_id, stuck=True, stuck_since="2026-08-27T17:00:00Z")
+    run_hook(task_id, "UserPromptSubmit", fixture("hook_userpromptsubmit.json"))
+    assert store.read_status(task_id)["stuck"] is False
+    # PostToolUse 清
+    post_tool = next(
+        line for line in background_lines()
+        if json.loads(line).get("hook_event_name") == "PostToolUse"
+    )
+    store.update_status(task_id, stuck=True)
+    run_hook(task_id, "PostToolUse", post_tool)
+    assert store.read_status(task_id)["stuck"] is False
+    # Stop 清
+    store.update_status(task_id, stuck=True)
+    run_hook(task_id, "Stop", fixture("hook_stop_idle.json"))
+    assert store.read_status(task_id)["stuck"] is False

@@ -183,6 +183,69 @@ def test_modify_status_counts_no_loss():
     assert "updated_at" in out
 
 
+# ---------- S4① 触发方式 trigger / 前置链判定 chain_state ----------
+
+
+def test_create_task_trigger_defaults_and_after():
+    # 缺省补 {"type": "time"}
+    tid = store.create_task(make_task(), CONFIG)
+    assert store.load_task(tid)["trigger"] == {"type": "time"}
+
+    pre = store.create_task(make_task(title="前置"), CONFIG)
+    after = store.create_task(
+        make_task(title="后继", trigger={"type": "after", "task": pre, "when": "finished"}),
+        CONFIG,
+    )
+    assert store.load_task(after)["trigger"] == {
+        "type": "after", "task": pre, "when": "finished",
+    }
+    # after 任务缺 run_at 能建：补成创建时刻（Z 结尾，只当排序用）
+    no_time = store.create_task(
+        make_task(title="没时间", run_at=None,
+                  trigger={"type": "after", "task": pre, "when": "ended"}),
+        CONFIG,
+    )
+    assert store.load_task(no_time)["run_at"].endswith("Z")
+
+
+def test_create_task_trigger_validations():
+    # 前置任务不存在
+    with pytest.raises(ValueError):
+        store.create_task(
+            make_task(trigger={"type": "after", "task": "20990101-000000-ffff",
+                               "when": "finished"}),
+            CONFIG,
+        )
+    pre = store.create_task(make_task(title="前置"), CONFIG)
+    with pytest.raises(ValueError):  # when 不认识
+        store.create_task(
+            make_task(trigger={"type": "after", "task": pre, "when": "完工"}),
+            CONFIG,
+        )
+    with pytest.raises(ValueError):  # when 缺了也不行
+        store.create_task(make_task(trigger={"type": "after", "task": pre}), CONFIG)
+    with pytest.raises(ValueError):  # type 不认识
+        store.create_task(make_task(trigger={"type": "later"}), CONFIG)
+    with pytest.raises(ValueError):  # 不是对象
+        store.create_task(make_task(trigger="按时间"), CONFIG)
+
+
+def test_chain_state_returns_latest_shift_state():
+    root = store.create_task(make_task(title="链根"), CONFIG)
+    assert store.chain_state(root) == "scheduled"
+    store.update_status(root, state="finished")
+    # 造出第 2 班：最新一班变成它，链状态跟着变
+    succ = store.create_task(
+        make_task(title="链根", shift=2, root_id=root, parent_id=root), CONFIG
+    )
+    assert store.chain_state(root) == "scheduled"
+    store.update_status(succ, state="working")
+    assert store.chain_state(succ) == "working"
+    store.update_status(succ, state="finished")
+    assert store.chain_state(root) == "finished"
+    assert store.chain_state(succ) == "finished"
+
+
 def test_config_example_json_valid():
     example = Path(__file__).resolve().parent.parent / "config.example.json"
     config = json.loads(example.read_text(encoding="utf-8"))

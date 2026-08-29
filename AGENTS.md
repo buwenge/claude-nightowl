@@ -8,6 +8,6 @@
 - 数据目录里所有文件写盘一律"写临时文件 + `os.replace`"原子替换；`status.json` 的读改写要拿 `fcntl.flock` 文件锁（hook 进程和调度器会并发写）。
 - **不许碰名为 `claude` 的 tmux 会话**（那是用户的），测试用的 tmux 会话只能叫 `ns-selftest`，用完 `tmux kill-session -t ns-selftest`。
 - **不许真的起 `claude`**（花钱）。launcher 通过环境变量 `NIGHTSHIFT_CLAUDE_BIN` 换成 `tests/fake_claude.sh` 做集成测试。
-- 测试：`cd /root/CC/nightshift && python3 -m pytest tests -q`，测试写盘一律指 `tmp_path`，`NIGHTSHIFT_HOME` 在测试里必须指向临时目录。
+- 测试：在仓库根目录执行 `python3 -m pytest tests -q`，测试写盘一律指 `tmp_path`，`NIGHTSHIFT_HOME` 在测试里必须指向临时目录。
 - 注释、docstring、验收单用中文；标识符英文。
 - 不许 `git add -A`；不许 push；每个 commit 只包含开工令里说的那一部分。
