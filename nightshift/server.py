@@ -43,6 +43,10 @@ MAX_BODY_BYTES = 256 * 1024
 _TASK_ID_RE = r"[0-9]{8}-[0-9]{6}-[0-9a-f]{4}"
 _RE_TASK_DETAIL = re.compile(rf"^/api/tasks/({_TASK_ID_RE})$")
 _RE_TASK_ACTION = re.compile(rf"^/api/tasks/({_TASK_ID_RE})/(run-now|cancel)$")
+_RE_TASK_MESSAGE = re.compile(rf"^/api/tasks/({_TASK_ID_RE})/message$")
+_RE_TASK_SESSION = re.compile(
+    rf"^/api/tasks/({_TASK_ID_RE})/(interrupt|stop-background)$"
+)
 _RE_TASK_DELETE = re.compile(rf"^/api/tasks/({_TASK_ID_RE})$")
 
 # 静态文件白名单：文件名写死，其余一律 404
@@ -65,6 +69,24 @@ _RUN_NOW_STATES = ("scheduled", "postponed", "failed", "cancelled")
 _TERMINAL_STATES = (
     "exited", "finished", "failed", "cancelled", "chain_exhausted", "needs_attention",
     "chained",  # 本班已把活交给后继，自己就是结束了（8/28 工头发现删不掉）
+)
+# PUT 编辑允许的键，按状态分级（S4②）
+# 未跑状态（scheduled/postponed/failed/cancelled）：全字段可改
+_EDITABLE_UNRUN = (
+    "title", "project", "model", "effort", "run_at",
+    "task_text", "prompt_final", "guards", "chain", "trigger",
+)
+# 活跃状态（launching/working/waiting_background/waiting_wakeup/idle）：
+# 只许改标题/任务内容/额度与上下文线/换班设置/触发方式
+_EDITABLE_ACTIVE = ("title", "task_text", "guards", "chain", "trigger")
+# 编辑直接 409 的终态（failed/cancelled 仍算"未跑"可编辑）
+_EDIT_TERMINAL_STATES = (
+    "finished", "exited", "chained", "chain_exhausted", "needs_attention",
+)
+# config 缺 stop_background_text 时的兜底（与 config.example.json 保持一致）
+DEFAULT_STOP_BACKGROUND_TEXT = (
+    "来自nightshift：请立刻用 TaskStop 停掉所有后台任务和子 agent，"
+    "后台起的命令行进程也一并杀掉，然后停下不要继续。"
 )
 
 
@@ -343,6 +365,15 @@ class _Handler(BaseHTTPRequestHandler):
             if action == "run-now":
                 return self._api_run_now(task_id)
             return self._api_cancel(task_id)
+        match = _RE_TASK_MESSAGE.match(path)
+        if match:
+            return self._api_message(match.group(1))
+        match = _RE_TASK_SESSION.match(path)
+        if match:
+            task_id, action = match.group(1), match.group(2)
+            if action == "interrupt":
+                return self._api_interrupt(task_id)
+            return self._api_stop_background(task_id)
         self._send_json(404, {"error": "没有这个路径"})
 
     def _route_put(self) -> None:
@@ -355,6 +386,9 @@ class _Handler(BaseHTTPRequestHandler):
             return self._api_templates()
         if path == "/api/warmup":
             return self._api_warmup()
+        match = _RE_TASK_DETAIL.match(path)
+        if match:
+            return self._api_update_task(match.group(1))
         self._send_json(404, {"error": "没有这个路径"})
 
     def _route_delete(self) -> None:
@@ -363,6 +397,9 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(403, {"error": f"缺少 {CSRF_HEADER}: {CSRF_VALUE} 头"})
         if not self._require_auth():
             return
+        match = _RE_TASK_MESSAGE.match(path)
+        if match:
+            return self._api_delete_message(match.group(1))
         match = _RE_TASK_DELETE.match(path)
         if match:
             return self._api_delete(match.group(1))
@@ -426,6 +463,7 @@ class _Handler(BaseHTTPRequestHandler):
             "quota_wrapup_text": cfg.get("quota_wrapup_text", ""),
             "quota_other_model_text": cfg.get("quota_other_model_text", ""),
             "chain_template": cfg.get("chain_template", ""),
+            "stop_background_text": cfg.get("stop_background_text", ""),
             "display_tz_offset_hours": cfg.get("display_tz_offset_hours"),
             # 可选：顶栏"回主站"链接 {"text": "...", "href": "..."}，没配就不显示
             "home_link": (cfg.get("http") or {}).get("home_link"),
@@ -433,7 +471,7 @@ class _Handler(BaseHTTPRequestHandler):
             "warmup_state": warmup.read_state(),
         })
 
-    _TEMPLATE_KEYS = ("prompt_template", "context_warn_text", "quota_pause_text", "quota_wrapup_text", "quota_other_model_text", "chain_template")
+    _TEMPLATE_KEYS = ("prompt_template", "context_warn_text", "quota_pause_text", "quota_wrapup_text", "quota_other_model_text", "chain_template", "stop_background_text")
 
     def _api_templates(self) -> None:
         data = self._read_json()
@@ -502,10 +540,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _api_list_tasks(self) -> None:
         items = store.list_tasks()
         for item in items:
-            item["events_tail"] = _tail_lines(
-                store.task_dir(item["task"]["id"]) / "events.log", 5
-            )
+            task_id = item["task"]["id"]
+            item["events_tail"] = _tail_lines(store.task_dir(task_id) / "events.log", 5)
             item["trigger_text"] = _trigger_text(item["task"])
+            item["draft"] = self._read_draft(task_id)
         return self._send_json(200, items)
 
     def _api_task_detail(self, task_id: str) -> None:
@@ -523,7 +561,9 @@ class _Handler(BaseHTTPRequestHandler):
         data = self._read_json()
         if data is None:
             return
-        if not data.get("run_at"):
+        # after 触发的任务可以不给 run_at（create_task 补创建时刻，只当排序用）
+        trigger = data.get("trigger") or {}
+        if not data.get("run_at") and trigger.get("type") != "after":
             return self._send_json(400, {"error": "缺少开跑时间 run_at（不给默认时间）"})
         task = {
             key: data.get(key)
@@ -589,6 +629,134 @@ class _Handler(BaseHTTPRequestHandler):
         store.update_status(task_id, state="cancelled", last_event_at=store.utc_now_iso())
         store.append_event(task_id, "网页：已取消")
         logger.info("网页 cancel：%s", task_id)
+        return self._send_json(200, {"ok": True})
+
+    def _api_update_task(self, task_id: str) -> None:
+        """编辑任务（S4②）：按状态分级——未跑全字段、活跃只四个维度、终态 409。"""
+        if self._load_existing(task_id) is None:
+            return
+        state = store.read_status(task_id).get("state")
+        if state in _EDIT_TERMINAL_STATES:
+            return self._send_json(409, {"error": f"任务已结束（{state}），不能再改"})
+        unrun = state in _RUN_NOW_STATES
+        allowed = _EDITABLE_UNRUN if unrun else _EDITABLE_ACTIVE
+        data = self._read_json()
+        if data is None:
+            return
+        bad = sorted(k for k in data if k not in allowed)
+        if bad:
+            if unrun:
+                msg = f"不能改这些字段：{'、'.join(bad)}"
+            else:
+                msg = "这一班正在跑，只能改标题/任务内容/额度与上下文线/换班设置"
+            return self._send_json(400, {"error": msg})
+        task = store.load_task(task_id)
+        task.update(data)
+        try:
+            store.validate_task(task, store.load_config(), task_id=task_id)
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        store.atomic_write_json(store.task_dir(task_id) / "task.json", task)
+        if state == "postponed":
+            # 改完回到 scheduled，旧的"下次尝试"与推迟原因作废
+            def mut(status: dict) -> None:
+                status["state"] = "scheduled"
+                status["last_event_at"] = store.utc_now_iso()
+                status.pop("next_attempt_at", None)
+                status.pop("postpone_reason", None)
+                status.pop("error", None)
+
+            store.modify_status(task_id, mut)
+        if "trigger" in data:
+            # 换了前置/条件：老的满足时刻与提醒标记作废，重新按新 trigger 判
+            def mut_trigger(status: dict) -> None:
+                status.pop("trigger_met_at", None)
+                status.pop("attention_noted", None)
+
+            store.modify_status(task_id, mut_trigger)
+        keys = "、".join(sorted(data.keys()))
+        store.append_event(task_id, f"网页编辑：改了 {keys}")
+        logger.info("网页编辑任务：%s（%s）", task_id, keys)
+        return self._send_json(200, {"ok": True})
+
+    def _read_draft(self, task_id: str) -> str | None:
+        """读捎话草稿；没有/读不了返回 None。"""
+        path = store.task_dir(task_id) / "draft.txt"
+        if not path.is_file():
+            return None
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    def _api_message(self, task_id: str) -> None:
+        """捎话（S4②）：send=false 存草稿；send=true 敲进会话窗口并清草稿。"""
+        if self._load_existing(task_id) is None:
+            return
+        data = self._read_json()
+        if data is None:
+            return
+        text = data.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return self._send_json(400, {"error": "text 必须是非空字符串"})
+        if not data.get("send"):
+            store.atomic_write_text(store.task_dir(task_id) / "draft.txt", text)
+            logger.info("网页捎话存草稿：%s", task_id)
+            return self._send_json(200, {"saved": True})
+        status = store.read_status(task_id)
+        window_id = status.get("window_id")
+        if not window_id or status.get("session_ended_at"):
+            return self._send_json(409, {"error": "会话没在跑，发不了；可以先存草稿"})
+        # 多行折成单行：tmux send-keys 一次敲进去，换行会变成提前回车
+        single_line = " ".join(text.splitlines()) or text
+        launcher.send_keys(str(window_id), single_line)
+        (store.task_dir(task_id) / "draft.txt").unlink(missing_ok=True)
+        store.append_event(task_id, f"捎话：{text[:80]}")
+        logger.info("网页捎话已发送：%s", task_id)
+        return self._send_json(200, {"sent": True})
+
+    def _api_delete_message(self, task_id: str) -> None:
+        if self._load_existing(task_id) is None:
+            return
+        (store.task_dir(task_id) / "draft.txt").unlink(missing_ok=True)
+        logger.info("网页删捎话草稿：%s", task_id)
+        return self._send_json(200, {"ok": True})
+
+    def _require_live_window(self, task_id: str) -> str | None:
+        """会话在跑就返回 window_id；否则回 409 并返回 None。"""
+        status = store.read_status(task_id)
+        window_id = status.get("window_id")
+        if not window_id or status.get("session_ended_at"):
+            self._send_json(409, {"error": "会话没在跑（没有活着的窗口）"})
+            return None
+        return str(window_id)
+
+    def _api_interrupt(self, task_id: str) -> None:
+        """中止（S4②）：往窗口按一下 Esc。不改 state——hook 会自己报 Stop。"""
+        if self._load_existing(task_id) is None:
+            return
+        window_id = self._require_live_window(task_id)
+        if window_id is None:
+            return
+        launcher.send_escape(window_id)
+        store.append_event(task_id, "中止：Esc")
+        logger.info("网页中止：%s", task_id)
+        return self._send_json(200, {"ok": True})
+
+    def _api_stop_background(self, task_id: str) -> None:
+        """停后台（S4②）：把 config.stop_background_text 敲进会话窗口。"""
+        if self._load_existing(task_id) is None:
+            return
+        window_id = self._require_live_window(task_id)
+        if window_id is None:
+            return
+        text = (
+            store.load_config().get("stop_background_text")
+            or DEFAULT_STOP_BACKGROUND_TEXT
+        )
+        launcher.send_keys(window_id, text)
+        store.append_event(task_id, "停后台：已敲入停后台文案，让它自己清后台")
+        logger.info("网页停后台：%s", task_id)
         return self._send_json(200, {"ok": True})
 
     def _api_delete(self, task_id: str) -> None:

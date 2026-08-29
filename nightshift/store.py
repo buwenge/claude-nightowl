@@ -42,6 +42,7 @@ __all__ = [
     "task_dir",
     "update_status",
     "utc_now_iso",
+    "validate_task",
 ]
 
 
@@ -161,31 +162,59 @@ def task_dir(task_id: str) -> Path:
     return home() / "tasks" / task_id
 
 
-def _validate_trigger(trigger, task_id: str | None = None) -> str:
-    """校验 trigger 字段，返回归一后的 type；不合法抛 ValueError。
+def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> str:
+    """校验一个完整任务 dict；不合法抛 ValueError，通过返回归一后的触发类型。
 
-    - 缺省 / None → "time"（按 run_at 到点）；
-    - "after"：task 必须是已存在的任务 id（task.json 读得到）、
-      when 只认 finished / ended；
-    - task_id 给出时（编辑场景）不许指向自己。
+    create_task 与网页编辑（PUT /api/tasks/<id>）共用这一套，规则只此一份：
+    - 必填：title / project / model / effort / task_text / prompt_final；
+    - project、effort 必须在 config 里；run_at 必须是 Z 结尾 ISO UTC，
+      但 trigger.type == "after" 时允许缺（create_task 会补创建时刻，只当
+      排序用，起不起由前置链状态决定）；
+    - trigger：None 按 {"type": "time"} 看待；after 要求 task 是已存在的
+      任务 id（task.json 读得到，task_id 给出时还不许指向自己）、
+      when 只认 finished / ended。
     """
+    for key in _REQUIRED_FIELDS:
+        if key == "run_at":
+            continue  # after 任务允许缺，最后统一判
+        if not task.get(key):
+            raise ValueError(f"缺少必填字段：{key}")
+    if task["project"] not in config["projects"]:
+        raise ValueError(f"project 不在 config.projects 里：{task['project']}")
+    if task["effort"] not in config["efforts"]:
+        raise ValueError(f"effort 不在 config.efforts 里：{task['effort']}")
+
+    trigger = task.get("trigger")
     if trigger is None:
-        return "time"
-    if not isinstance(trigger, dict):
+        ttype = "time"
+    elif not isinstance(trigger, dict):
         raise ValueError("trigger 必须是对象")
-    ttype = trigger.get("type")
-    if ttype == "time":
-        return "time"
-    if ttype != "after":
-        raise ValueError("trigger.type 只认 time / after")
-    pre_id = trigger.get("task")
-    if not pre_id or task_id == str(pre_id) or not (
-        task_dir(str(pre_id)) / "task.json"
-    ).is_file():
-        raise ValueError(f"trigger.task 必须是已存在的任务 id：{pre_id}")
-    if trigger.get("when") not in ("finished", "ended"):
-        raise ValueError("trigger.when 只认 finished / ended")
-    return "after"
+    else:
+        ttype = trigger.get("type")
+        if ttype == "time":
+            pass
+        elif ttype == "after":
+            pre_id = trigger.get("task")
+            if not pre_id or task_id == str(pre_id) or not (
+                task_dir(str(pre_id)) / "task.json"
+            ).is_file():
+                raise ValueError(f"trigger.task 必须是已存在的任务 id：{pre_id}")
+            if trigger.get("when") not in ("finished", "ended"):
+                raise ValueError("trigger.when 只认 finished / ended")
+        else:
+            raise ValueError("trigger.type 只认 time / after")
+
+    run_at = task.get("run_at")
+    if run_at:
+        if not (isinstance(run_at, str) and run_at.endswith("Z")):
+            raise ValueError("run_at 必须是 Z 结尾的 ISO UTC 时间，如 2026-08-27T18:00:00Z")
+        try:
+            datetime.fromisoformat(run_at[:-1])
+        except ValueError:
+            raise ValueError(f"run_at 不是合法的 ISO 时间：{run_at}") from None
+    elif ttype != "after":
+        raise ValueError("缺少必填字段：run_at")
+    return ttype
 
 
 def create_task(task: dict, config: dict) -> str:
@@ -196,29 +225,9 @@ def create_task(task: dict, config: dict) -> str:
     """
     data = dict(task)
     data["trigger"] = data.get("trigger") or {"type": "time"}
-    ttype = _validate_trigger(data["trigger"])
-
-    for key in _REQUIRED_FIELDS:
-        if key == "run_at":
-            continue  # after 任务允许缺，下面补
-        if not data.get(key):
-            raise ValueError(f"缺少必填字段：{key}")
-    if data["project"] not in config["projects"]:
-        raise ValueError(f"project 不在 config.projects 里：{data['project']}")
-    if data["effort"] not in config["efforts"]:
-        raise ValueError(f"effort 不在 config.efforts 里：{data['effort']}")
-    run_at = data.get("run_at")
-    if run_at:
-        if not (isinstance(run_at, str) and run_at.endswith("Z")):
-            raise ValueError("run_at 必须是 Z 结尾的 ISO UTC 时间，如 2026-08-27T18:00:00Z")
-        try:
-            datetime.fromisoformat(run_at[:-1])
-        except ValueError:
-            raise ValueError(f"run_at 不是合法的 ISO 时间：{run_at}") from None
-    elif ttype == "after":
-        data["run_at"] = utc_now_iso()  # 只当排序用
-    else:
-        raise ValueError("缺少必填字段：run_at")
+    validate_task(data, config)
+    if not data.get("run_at"):
+        data["run_at"] = utc_now_iso()  # after 任务：只当排序用
 
     task_id = new_task_id()
     data["id"] = task_id

@@ -246,6 +246,31 @@ def test_chain_state_returns_latest_shift_state():
     assert store.chain_state(succ) == "finished"
 
 
+def test_validate_task_shared_rules():
+    """validate_task 是 create_task 与网页编辑共用的同一套校验。"""
+    pre = store.create_task(make_task(title="前置"), CONFIG)
+    task = store.load_task(pre)
+    # 整份 task.json（含 id/created_at 等额外键）过校验：行
+    assert store.validate_task(task, CONFIG, task_id=pre) == "time"
+    # 编辑时不许把自己当前置
+    with pytest.raises(ValueError):
+        store.validate_task(
+            {**task, "trigger": {"type": "after", "task": pre, "when": "finished"}},
+            CONFIG, task_id=pre,
+        )
+    # 别的任务当前置：行
+    other = store.create_task(make_task(title="别的"), CONFIG)
+    assert store.validate_task(
+        {**task, "trigger": {"type": "after", "task": other, "when": "ended"}},
+        CONFIG, task_id=pre,
+    ) == "after"
+    # 非法值同样拦
+    with pytest.raises(ValueError):
+        store.validate_task({**task, "effort": "ultra"}, CONFIG)
+    with pytest.raises(ValueError):
+        store.validate_task({**task, "run_at": None}, CONFIG)  # 非 after 缺 run_at
+
+
 def test_config_example_json_valid():
     example = Path(__file__).resolve().parent.parent / "config.example.json"
     config = json.loads(example.read_text(encoding="utf-8"))

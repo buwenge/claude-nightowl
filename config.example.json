@@ -67,6 +67,7 @@
   "quota_wrapup_text": "[nightshift] 周额度只剩 {week_left}%（线 {week_line_left}%）{model_note}，一时半会儿刷新不了。现在收尾：把已完成/未完成/下一步写进 {handover_path}，末行写 NEXT: done（本周不再续班，交接留给下次）；未提交的改动 commit；然后停下。",
   "quota_other_model_text": "[nightshift] 提示：{label} 的周额度只剩 {left}%（线 {line_left}%）。本会话的模型不受影响，但接下来别再派 {label} 的子 agent、也别切到它。",
   "chain_template": "你在无人值守的定时会话里工作，项目目录 {project_path}。任务：{title}\n\n{task}\n\n这是第 {shift} 班。上一班交接如下：\n{handover}\n\n先核对交接里说的状态再动手。没有人在场：遇到问题按合理判断继续，不要停下来等确认。长于 20 分钟的外部命令请用后台方式跑。本会话上下文上限约 {context_limit} tokens，快到线时调度器会提醒你收尾。",
+  "stop_background_text": "来自nightshift：请立刻用 TaskStop 停掉所有后台任务和子 agent，后台起的命令行进程也一并杀掉，然后停下不要继续。",
   "warmup": {
     "enabled": false,
     "time_local": "07:00",

@@ -545,6 +545,260 @@ def test_create_after_task_201_and_trigger_text(authed):
     assert "trigger" in body["error"]
 
 
+def test_create_after_task_without_run_at_ok(authed):
+    """前端 after 模式不发 run_at：服务器要放行，create_task 补创建时刻。"""
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "前置任务丙", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+    })
+    assert status == 201
+    pre = body["id"]
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "没给时间", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "task_text": "正文", "prompt_final": "提示词",
+        "trigger": {"type": "after", "task": pre, "when": "finished"},
+    })
+    assert status == 201, body
+    task = store.load_task(body["id"])
+    assert task["run_at"].endswith("Z")  # 补成创建时刻，只当排序用
+    # 按时间的任务缺 run_at 仍然 400
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "按时间没给", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "task_text": "正文", "prompt_final": "提示词",
+    })
+    assert status == 400
+    assert "run_at" in body["error"]
+
+
+# ---------- S4② 编辑：PUT /api/tasks/<id> 按状态分级 ----------
+
+
+def test_put_task_unrun_full_edit_and_event_log(authed):
+    task_id = make_task(authed, "可编辑的")
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {
+        "title": "改了标题", "project": "demo", "model": "claude-fable-5",
+        "effort": "low", "run_at": "2026-08-28T20:00:00Z",
+        "task_text": "改了正文", "prompt_final": "改了提示词",
+        "guards": {"keepalive": False}, "chain": {"max_windows": 5},
+    })
+    assert status == 200, body
+    task = store.load_task(task_id)
+    assert task["title"] == "改了标题"
+    assert task["effort"] == "low"
+    assert task["run_at"] == "2026-08-28T20:00:00Z"
+    assert task["task_text"] == "改了正文"
+    assert task["prompt_final"] == "改了提示词"
+    assert task["guards"] == {"keepalive": False}
+    assert task["chain"] == {"max_windows": 5}
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "网页编辑" in events and "chain" in events
+
+
+def test_put_task_postponed_back_to_scheduled(authed):
+    task_id = make_task(authed, "推迟中编辑")
+    store.update_status(task_id, state="postponed",
+                        next_attempt_at="2026-08-27T10:00:00Z", postpone_reason="x")
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {"title": "新标题"})
+    assert status == 200, body
+    status_data = store.read_status(task_id)
+    assert status_data["state"] == "scheduled"
+    assert "next_attempt_at" not in status_data
+    assert "postpone_reason" not in status_data
+
+
+def test_put_task_postponed_trigger_reset(authed):
+    task_id = make_task(authed, "换前置")
+    pre = make_task(authed, "新前置")
+    store.update_status(task_id, state="postponed",
+                        next_attempt_at="2026-08-27T10:00:00Z",
+                        trigger_met_at="2026-08-27T09:00:00Z")
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {
+        "trigger": {"type": "after", "task": pre, "when": "ended"},
+    })
+    assert status == 200, body
+    assert store.read_status(task_id)["state"] == "scheduled"
+    assert store.load_task(task_id)["trigger"]["task"] == pre
+    status_data = store.read_status(task_id)
+    assert "trigger_met_at" not in status_data  # 换了前置，老的满足时刻作废
+
+
+def test_put_task_active_restricted(authed):
+    task_id = make_task(authed, "在跑的")
+    store.update_status(task_id, state="working", window_id="@7", pane_pid=1)
+    # 允许的四个维度 + 触发方式
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {
+        "title": "跑着改标题", "task_text": "跑着改正文",
+        "guards": {"session_pct_max": 70}, "chain": {"max_windows": 4},
+    })
+    assert status == 200, body
+    task = store.load_task(task_id)
+    assert task["title"] == "跑着改标题"
+    assert task["task_text"] == "跑着改正文"
+    assert task["guards"] == {"session_pct_max": 70}
+    assert task["chain"] == {"max_windows": 4}
+    # 带了别的键 → 400，原文件不动
+    for key, value in (
+        ("run_at", "2026-08-28T20:00:00Z"),
+        ("prompt_final", "改提示词"),
+        ("model", "claude-haiku-4-5-20251001"),
+        ("project", "demo"),
+        ("effort", "low"),
+    ):
+        status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {key: value})
+        assert status == 400, key
+        assert "这一班正在跑" in body["error"]
+    assert store.load_task(task_id)["model"] == "claude-fable-5"
+
+
+def test_put_task_terminal_conflict(authed):
+    task_id = make_task(authed, "完了的")
+    for state in ("finished", "exited", "chained", "chain_exhausted", "needs_attention"):
+        store.update_status(task_id, state=state)
+        status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {"title": "x"})
+        assert status == 409, state
+
+
+def test_put_task_failed_cancelled_still_editable(authed):
+    task_id = make_task(authed, "失败还能改")
+    for state in ("failed", "cancelled"):
+        store.update_status(task_id, state=state)
+        status, _, body = authed.request(
+            "PUT", f"/api/tasks/{task_id}", {"title": f"{state}改的"}
+        )
+        assert status == 200, state
+        assert store.load_task(task_id)["title"] == f"{state}改的"
+
+
+def test_put_task_validation_400_and_404(authed):
+    task_id = make_task(authed, "校验")
+    for payload in ({"effort": "ultra"}, {"project": "nope"},
+                    {"run_at": "2026-08-28 20:00"},
+                    {"title": ""}, {"model": ""}):
+        status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", payload)
+        assert status == 400, payload
+    status, _, _ = authed.request("PUT", "/api/tasks/20990101-000000-ffff", {"title": "x"})
+    assert status == 404
+
+
+# ---------- S4② 捎话：草稿存/读/删/发 ----------
+
+
+def test_message_draft_save_read_delete(authed):
+    task_id = make_task(authed, "捎话对象")
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{task_id}/message", {"text": "记得先跑测试", "send": False}
+    )
+    assert status == 200 and body == {"saved": True}
+    assert (store.task_dir(task_id) / "draft.txt").read_text(
+        encoding="utf-8") == "记得先跑测试"
+    _, _, items = authed.request("GET", "/api/tasks")
+    item = next(i for i in items if i["task"]["id"] == task_id)
+    assert item["draft"] == "记得先跑测试"
+    # 覆盖存
+    authed.request("POST", f"/api/tasks/{task_id}/message", {"text": "改了主意", "send": False})
+    _, _, items = authed.request("GET", "/api/tasks")
+    item = next(i for i in items if i["task"]["id"] == task_id)
+    assert item["draft"] == "改了主意"
+    # 删草稿
+    status, _, body = authed.request("DELETE", f"/api/tasks/{task_id}/message")
+    assert status == 200
+    assert not (store.task_dir(task_id) / "draft.txt").exists()
+    _, _, items = authed.request("GET", "/api/tasks")
+    item = next(i for i in items if i["task"]["id"] == task_id)
+    assert item["draft"] is None
+
+
+def test_message_send_calls_send_keys_and_clears_draft(authed, monkeypatch):
+    task_id = make_task(authed, "要发的")
+    store.atomic_write_text(store.task_dir(task_id) / "draft.txt", "旧草稿")
+    store.update_status(task_id, state="working", window_id="@9", pane_pid=1)
+    calls = []
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: calls.append((wid, text)))
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{task_id}/message",
+        {"text": "第一行\n第二行\r\n第三行", "send": True},
+    )
+    assert status == 200 and body == {"sent": True}
+    # 多行折成单行进输入框
+    assert calls == [("@9", "第一行 第二行 第三行")]
+    assert not (store.task_dir(task_id) / "draft.txt").exists()  # 发完清草稿
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "捎话：" in events and "第一行" in events
+
+
+def test_message_send_without_live_window_409(authed):
+    task_id = make_task(authed, "没窗口")
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{task_id}/message", {"text": "hi", "send": True}
+    )
+    assert status == 409
+    # 会话已结束的窗口也发不了
+    store.update_status(task_id, state="exited", window_id="@9",
+                        session_ended_at="2026-08-27T10:00:00Z")
+    status, _, _ = authed.request(
+        "POST", f"/api/tasks/{task_id}/message", {"text": "hi", "send": True}
+    )
+    assert status == 409
+    # 但可以存草稿
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{task_id}/message", {"text": "hi", "send": False}
+    )
+    assert status == 200
+
+
+def test_message_bad_text_400(authed):
+    task_id = make_task(authed, "空文本")
+    for payload in ({"text": "   ", "send": False}, {"send": False},
+                    {"text": 123, "send": True}):
+        status, _, _ = authed.request("POST", f"/api/tasks/{task_id}/message", payload)
+        assert status == 400, payload
+
+
+# ---------- S4② 中止 / 停后台 ----------
+
+
+def test_interrupt_sends_escape_once_and_keeps_state(authed, monkeypatch):
+    task_id = make_task(authed, "要中止的")
+    escapes = []
+    monkeypatch.setattr(launcher, "send_escape", lambda wid: escapes.append(wid))
+    store.update_status(task_id, state="working", window_id="@10", pane_pid=1)
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/interrupt")
+    assert status == 200 and body == {"ok": True}
+    assert escapes == ["@10"]
+    assert store.read_status(task_id)["state"] == "working"  # 不改 state，等 hook 报
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "中止：Esc" in events
+    # 没窗口 → 409
+    other = make_task(authed, "没窗中止")
+    status, _, _ = authed.request("POST", f"/api/tasks/{other}/interrupt")
+    assert status == 409
+
+
+def test_stop_background_sends_config_text(authed, monkeypatch):
+    task_id = make_task(authed, "停后台")
+    store.update_status(task_id, state="waiting_background", window_id="@11", pane_pid=1)
+    sent = []
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: sent.append((wid, text)))
+    # 文案来自 config（模板页可改）
+    status, _, _ = authed.request(
+        "PUT", "/api/templates", {"stop_background_text": "自定义停后台文案"}
+    )
+    assert status == 200
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/stop-background")
+    assert status == 200 and body == {"ok": True}
+    assert sent == [("@11", "自定义停后台文案")]
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "停后台" in events
+    # /api/config 暴露该键
+    _, _, cfg = authed.request("GET", "/api/config")
+    assert cfg["stop_background_text"] == "自定义停后台文案"
+    # 没窗口 → 409
+    other = make_task(authed, "没窗停后台")
+    status, _, _ = authed.request("POST", f"/api/tasks/{other}/stop-background")
+    assert status == 409
+
+
 # ---------- quota ----------
 
 
