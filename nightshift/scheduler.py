@@ -30,6 +30,16 @@ ACTIVE_STATES = ("launching", "working", "waiting_background", "waiting_wakeup")
 DEFAULT_KEEPALIVE_TEXT = (
     "来自nightshift：保活探针——背景任务还在跑吗？简短回一句即可。"
 )
+# config 缺 stuck_interrupt_text 时的兜底文案（与 config.example.json 一致）。
+# Esc 中断不会触发 Stop hook（CC 官方文档明说"不会在用户中断时触发"），
+# 光按 Esc 只是让它停在输入提示符，调度器收不到任何信号、auto_interrupted
+# 也清不掉；必须紧接着敲一段文字进去起一个新轮次，靠这个新轮次自然结束
+# 时触发的 Stop/UserPromptSubmit 才能让状态机缓过来。
+DEFAULT_STUCK_INTERRUPT_TEXT = (
+    "来自nightshift：你疑似卡在一条工具调用里已经 {stuck_minutes} 分钟没反应，"
+    "刚按了 Esc 把这一轮打断。看看刚才在等的命令/进程是不是真卡死了——"
+    "换个方式重试、跳过，或者判断已经没救了就当它失败处理，然后照常继续或收尾。"
+)
 # 交接文件末行的换班指令（设计稿 §4.4）
 _RE_NEXT_CONTINUE = re.compile(r"^NEXT:\s*continue\s*$")
 _RE_NEXT_DONE = re.compile(r"^NEXT:\s*done\s*$")
@@ -457,9 +467,16 @@ def _check_running(
         >= timedelta(minutes=int(auto_minutes))
     ):
         launcher.send_escape(str(window_id))
+        # Esc 本身不会让调度器收到任何回信（Stop hook 不认用户中断）；紧接着
+        # 敲一段话进去起个新轮次，靠新轮次自然结束时的 hook 事件才能真正复原。
+        interrupt_text = store.render(
+            config.get("stuck_interrupt_text") or DEFAULT_STUCK_INTERRUPT_TEXT,
+            stuck_minutes=int(auto_minutes),
+        )
+        launcher.send_keys(str(window_id), interrupt_text)
         store.update_status(task_id, auto_interrupted=True)
         store.append_event(
-            task_id, f"疑似卡住已超过 {auto_minutes} 分钟 → 自动中止（Esc）"
+            task_id, f"疑似卡住已超过 {auto_minutes} 分钟 → 自动中止（Esc）+ 注入自检提示"
         )
 
     # R2：auto 被 CC 静默回落（如 haiku 只吃 default），无人值守会整晚卡在

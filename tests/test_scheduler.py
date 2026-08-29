@@ -717,21 +717,47 @@ def test_stuck_uses_configured_minutes(monkeypatch):
 def test_auto_interrupt_fires_once(monkeypatch):
     fakes = Fakes(monkeypatch)
     escapes: list[str] = []
+    keys: list[tuple] = []
     monkeypatch.setattr(launcher, "send_escape", lambda wid: escapes.append(wid))
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: keys.append((wid, text)))
     tid = make_task(title="自动中止", guards={"auto_interrupt_minutes": 5})
     stale = scheduler.to_iso(NOW - timedelta(minutes=20))
     store.update_status(tid, state="working", window_id="@56", pane_pid=NO_PID,
                         last_event_at=stale)
     scheduler.tick(CONFIG, NOW)  # 首次标 stuck，stuck_since=NOW，还不到 5 分钟
     assert escapes == []
+    assert keys == []
     scheduler.tick(CONFIG, NOW + timedelta(minutes=6))  # 卡住满 6 分钟 ≥ 5
     assert escapes == ["@56"]
+    # Esc 不会触发 Stop hook（CC 不认用户中断），必须紧跟着敲一句话进去起
+    # 新轮次，靠新轮次自然结束才能真正复原——这是 S5 之后补的裁决项修复。
+    assert keys == [("@56", scheduler.DEFAULT_STUCK_INTERRUPT_TEXT.replace(
+        "{stuck_minutes}", "5"))]
     assert store.read_status(tid)["auto_interrupted"] is True
     events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
     assert "自动中止" in events
+    assert "注入自检提示" in events
     # 不重复
     scheduler.tick(CONFIG, NOW + timedelta(minutes=7))
     assert escapes == ["@56"]
+    assert keys == [("@56", scheduler.DEFAULT_STUCK_INTERRUPT_TEXT.replace(
+        "{stuck_minutes}", "5"))]
+
+
+def test_auto_interrupt_uses_configured_text(monkeypatch):
+    """模板页能改这段自检提示；占位符 {stuck_minutes} 照样替换。"""
+    Fakes(monkeypatch)
+    monkeypatch.setattr(launcher, "send_escape", lambda wid: None)
+    keys: list[tuple] = []
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: keys.append((wid, text)))
+    tid = make_task(title="自定义自检文案", guards={"auto_interrupt_minutes": 3})
+    stale = scheduler.to_iso(NOW - timedelta(minutes=20))
+    store.update_status(tid, state="working", window_id="@58", pane_pid=NO_PID,
+                        last_event_at=stale)
+    config = {**CONFIG, "stuck_interrupt_text": "自定义：卡了 {stuck_minutes} 分钟"}
+    scheduler.tick(config, NOW)
+    scheduler.tick(config, NOW + timedelta(minutes=4))
+    assert keys == [("@58", "自定义：卡了 3 分钟")]
 
 
 def test_auto_interrupt_recovers_per_stuck_cycle(monkeypatch):

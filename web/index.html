@@ -198,6 +198,10 @@
     <p class="hint">点任务卡上的「停后台」时敲进会话的话，原样发送、没有占位符。</p>
     <textarea id="t-stopbg" class="tall" rows="4"></textarea>
 
+    <h2>疑似卡住自动中止后的自检提示</h2>
+    <p class="hint">占位符：{stuck_minutes} 卡住的分钟数。Esc 只能打断当前这一轮，不会触发它自己收尾（Claude Code 官方说明：Stop 不认用户中断），所以按完 Esc 会紧接着把这段话敲进去起一个新轮次，让它自己判断刚才卡在哪、要不要继续。</p>
+    <textarea id="t-stuckinterrupt" class="tall" rows="4"></textarea>
+
     <p id="tpl-note" class="ok-note"></p>
     <button type="button" id="btn-save-tpl" class="primary" style="width:100%">保存模板</button>
   </section>

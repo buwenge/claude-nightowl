@@ -485,6 +485,7 @@ class _Handler(BaseHTTPRequestHandler):
             "quota_other_model_text": cfg.get("quota_other_model_text", ""),
             "chain_template": cfg.get("chain_template", ""),
             "stop_background_text": cfg.get("stop_background_text", ""),
+            "stuck_interrupt_text": cfg.get("stuck_interrupt_text", ""),
             "display_tz_offset_hours": cfg.get("display_tz_offset_hours"),
             # 可选：顶栏"回主站"链接 {"text": "...", "href": "..."}，没配就不显示
             "home_link": (cfg.get("http") or {}).get("home_link"),
@@ -492,7 +493,7 @@ class _Handler(BaseHTTPRequestHandler):
             "warmup_state": warmup.read_state(),
         })
 
-    _TEMPLATE_KEYS = ("prompt_template", "context_warn_text", "quota_pause_text", "quota_wrapup_text", "quota_other_model_text", "chain_template", "stop_background_text")
+    _TEMPLATE_KEYS = ("prompt_template", "context_warn_text", "quota_pause_text", "quota_wrapup_text", "quota_other_model_text", "chain_template", "stop_background_text", "stuck_interrupt_text")
 
     def _api_templates(self) -> None:
         data = self._read_json()
