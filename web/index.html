@@ -41,7 +41,9 @@
       <p id="warmup-state" class="hint"></p>
     </div>
     <div id="orphan-box" class="orphan-box" hidden></div>
-    <div id="cal-box" class="cal-box">
+    <button type="button" id="cal-toggle" class="cal-toggle">展开日期</button>
+    <div id="cal-panel" class="cal-panel" hidden>
+      <input type="date" id="cal-jump" class="cal-jump">
       <div class="cal-head">
         <button type="button" id="cal-prev" class="ghost cal-nav" aria-label="上个月">‹</button>
         <span id="cal-title" class="cal-title"></span>

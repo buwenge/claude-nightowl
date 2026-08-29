@@ -17,6 +17,7 @@ var previewTimer = null;
 var LAST_ITEMS = [];       // 上一次 /api/tasks 的原始结果，供日期筛选本地重画用
 var SELECTED_DAY = null;   // 选中的日期 "YYYY-MM-DD"（本地时区），null = 不筛选
 var CAL_MONTH = new Date();  // 日历当前显示的月份（任意一天即可，只取年月）
+var CAL_OPEN = false;      // 日期面板是否展开
 
 /* ---------- 小工具 ---------- */
 
@@ -1117,6 +1118,11 @@ function start() {
   $("btn-refresh").addEventListener("click", function () {
     refreshTasks(); refreshQuota(); banner("已刷新");
   });
+  $("cal-toggle").addEventListener("click", function () {
+    CAL_OPEN = !CAL_OPEN;
+    $("cal-panel").hidden = !CAL_OPEN;
+    $("cal-toggle").textContent = CAL_OPEN ? "收起日期" : "展开日期";
+  });
   $("cal-prev").addEventListener("click", function () {
     CAL_MONTH = new Date(CAL_MONTH.getFullYear(), CAL_MONTH.getMonth() - 1, 1);
     renderCalendar();
@@ -1124,6 +1130,15 @@ function start() {
   $("cal-next").addEventListener("click", function () {
     CAL_MONTH = new Date(CAL_MONTH.getFullYear(), CAL_MONTH.getMonth() + 1, 1);
     renderCalendar();
+  });
+  // 原生日期输入：手机上是滚轮选年月日，一步跳到任意天（不限于有任务的天）
+  $("cal-jump").addEventListener("change", function (e) {
+    var v = e.target.value;  // "YYYY-MM-DD"
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v || "");
+    if (!m) return;
+    CAL_MONTH = new Date(Number(m[1]), Number(m[2]) - 1, 1);
+    SELECTED_DAY = v;
+    renderTasks(LAST_ITEMS);
   });
   $("btn-requery").addEventListener("click", function () {
     var btn = $("btn-requery");

@@ -470,12 +470,39 @@ button.danger.solid { background: var(--danger); border-color: var(--danger); co
 
 /* ---------- 日期栏 ---------- */
 
-.cal-box {
+.cal-toggle {
+  display: block;
+  width: 100%;
+  min-height: 40px;
+  margin: 12px 0;
+  padding: 0 14px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 14px;
+  text-align: center;
+  touch-action: manipulation;
+}
+.cal-panel {
   background: var(--card);
   border: 1px solid var(--line);
   border-radius: 14px;
   padding: 10px 14px 14px;
-  margin: 12px 0;
+  margin: -4px 0 12px;
+}
+.cal-jump {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 15px;
+  color-scheme: light dark;
 }
 .cal-head {
   display: flex;
