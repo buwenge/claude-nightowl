@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -14,6 +15,7 @@ from . import store, worktree
 __all__ = [
     "capture_pane",
     "claude_bin",
+    "close_windows",
     "ensure_tmux_session",
     "hook_settings",
     "is_trusted",
@@ -27,6 +29,9 @@ __all__ = [
     "workdir_for",
     "write_task_files",
 ]
+
+# 窗口 id 只认 tmux 的 @N 形状：杜绝任何模糊目标（会话名/窗口名通配）
+_WINDOW_ID_RE = re.compile(r"^@\d+$")
 
 # hook 挂的七个事件（设计稿 §4.1）
 _HOOK_EVENTS = (
@@ -354,6 +359,26 @@ def window_alive(window_id: str, config: dict) -> bool:
     if proc.returncode != 0:
         return False
     return window_id in proc.stdout.splitlines()
+
+
+def close_windows(window_ids, config: dict) -> list[str]:
+    """精确关闭任务记录里登记的窗口（S5② 合并/丢弃后的收尾）。
+
+    只认 @N 形状的 window id，且先用 window_alive 确认它还在本会话的窗口
+    列表里再 kill-window——绝不 kill-session、绝不碰名为 claude 的会话或
+    没登记的窗口。返回真正关掉的 id。
+    """
+    closed: list[str] = []
+    for raw in window_ids or []:
+        wid = str(raw)
+        if not _WINDOW_ID_RE.match(wid):
+            continue
+        if not window_alive(wid, config):
+            continue
+        proc = _tmux("kill-window", "-t", wid)
+        if proc.returncode == 0:
+            closed.append(wid)
+    return closed
 
 
 def pid_alive(pid: int) -> bool:

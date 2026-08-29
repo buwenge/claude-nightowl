@@ -52,7 +52,8 @@ class ConfigMissing(Exception):
     """数据目录里没有 config.json。"""
 
 
-# 任务状态全集（设计稿 §3 状态机）
+# 任务状态全集（设计稿 §3 状态机 + S5② 工作树收尾）
+# awaiting_merge 不是 active（不拦起跑）；merged / discarded 是终态
 STATES = (
     "scheduled",
     "postponed",
@@ -64,6 +65,9 @@ STATES = (
     "chained",
     "exited",
     "finished",
+    "awaiting_merge",
+    "merged",
+    "discarded",
     "failed",
     "cancelled",
     "needs_attention",

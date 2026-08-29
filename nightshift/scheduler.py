@@ -558,12 +558,16 @@ def _check_idle_chain(
 ) -> list[str]:
     """idle 的换班评估（设计稿 §4.4 第 3 条）。
 
-    先落 chain_checked=True 防重复评估；再看交接文件：
+    先落 chain_checked=True 防重复评估；S5② 起收工边界先打存档点（幂等，
+    失败立即止住）；再看交接文件：
     - 有交接按末行 NEXT: continue/done 判（没写 NEXT 按 continue）；
     - 没交接但这班被提醒过 → 按 chain.on_no_handover（continue/stop）；
-    - 没交接也从未被提醒 → 正常干完，finished。
+    - 没交接也从未被提醒 → 正常干完（worktree 任务走 _finalize_done 分流）。
     """
     store.update_status(task["id"], chain_checked=True)
+    blocked = _checkpoint_shift(task, status, config, now)
+    if blocked:
+        return blocked
     path = _handover_file(task, status)
     text = _read_handover(path)
     if text is not None:
@@ -595,21 +599,17 @@ def _check_idle_chain(
         )
         return _chain_continue(task, config, now, handover_text=None)
 
-    store.update_status(task["id"], state="finished", last_event_at=to_iso(now))
-    store.append_event(task["id"], "idle、没留交接、也没被提醒过 → finished（正常干完）")
-    return [f"{task['id']} 正常干完 → finished"]
+    return _finalize_done(task, config, now)
 
 
 def _handover_verdict(
     task: dict, text: str, config: dict, now: datetime
 ) -> list[str]:
-    """有交接时的判定（idle 与 exited 共用）：末行 NEXT: done → finished；
+    """有交接时的判定（idle 与 exited 共用）：末行 NEXT: done → 完工分流；
     NEXT: continue（或没写 NEXT，按 continue）→ 续班。"""
     last = _last_nonempty_line(text)
     if _RE_NEXT_DONE.match(last):
-        store.update_status(task["id"], state="finished", last_event_at=to_iso(now))
-        store.append_event(task["id"], "交接末行 NEXT: done → finished")
-        return [f"{task['id']} 交接 NEXT: done → finished"]
+        return _finalize_done(task, config, now)
     note = ""
     if not _RE_NEXT_CONTINUE.match(last):
         note = "（交接末行没写 NEXT，按 continue）"
@@ -652,14 +652,95 @@ def _check_exited_chain(
     task: dict, status: dict, config: dict, now: datetime
 ) -> list[str]:
     """exited 也评估一次换班（会话被关/崩了但交接已写完的情形）：
-    只认交接文件——有交接按 NEXT 判，没交接不动。"""
+    只认交接文件——有交接先打存档点再按 NEXT 判，没交接不动。"""
     if status.get("chain_checked"):
         return []
     store.update_status(task["id"], chain_checked=True)
     text = _read_handover(_handover_file(task, status))
     if text is None:
         return []
+    blocked = _checkpoint_shift(task, status, config, now)
+    if blocked:
+        return blocked
     return _handover_verdict(task, text, config, now)
+
+
+# ---------- S5②：收工存档点与完工分流 ----------
+
+
+def _checkpoint_shift(
+    task: dict, status: dict, config: dict, now: datetime
+) -> list[str] | None:
+    """收工边界的存档点（幂等：checkpoint_done 锁住，重复 tick 不再打）。
+
+    - 老式任务（worktree=false）原样跳过，一期路径一字不变；
+    - worktree=true 但还没登记过树（异常情形）：没东西可存，跳过不拦收工；
+    - 有改动 → commit 并把完整 sha 写本班 checkpoint_sha；无改动 → 只落
+      checkpoint_done 并记"无改动，未打存档点"；
+    - add / commit 失败 → 本班 needs_attention，止住收工流程（不判 NEXT、
+      不造后继、不合并、不把失败伪装成 finished）。
+    """
+    task_id = task["id"]
+    if not worktree.wants_worktree(task) or status.get("checkpoint_done"):
+        return None
+    wt = status.get("worktree_path")
+    if not wt:
+        return None
+    try:
+        sha = worktree.checkpoint(task, wt)
+    except worktree.WorktreeError as exc:
+        store.update_status(
+            task_id, state="needs_attention", error=f"存档点失败：{exc}",
+            last_event_at=to_iso(now),
+        )
+        store.append_event(task_id, f"存档点失败：{exc}")
+        launcher.open_notice_window(
+            task, "(需要人工)",
+            [
+                f"收工存档点失败：{exc}",
+                "工作树和分支都保留着；处理完可在卡片上合并/丢弃，这班不再自动续",
+            ],
+            config,
+        )
+        return [f"{task_id} 存档点失败 → needs_attention"]
+    shift = int(task.get("shift") or 1)
+    if sha:
+        store.update_status(task_id, checkpoint_sha=sha, checkpoint_done=True)
+        store.append_event(task_id, f"已打存档点 {sha[:12]}（第 {shift} 班）")
+    else:
+        store.update_status(task_id, checkpoint_done=True)
+        store.append_event(task_id, f"第 {shift} 班无改动，未打存档点")
+    return None
+
+
+def _finalize_done(task: dict, config: dict, now: datetime) -> list[str]:
+    """最后一班完工分流（判过 NEXT: done 或没交接正常干完都走这里）：
+    - worktree=false：原状态机一字不变 → finished；
+    - true + manual：存档后 → awaiting_merge，树与分支保留，等工头；
+    - true + auto：调度器合并 → merged / needs_attention（原因见红字）。
+    """
+    task_id = task["id"]
+    if not worktree.wants_worktree(task):
+        store.update_status(task_id, state="finished", last_event_at=to_iso(now))
+        store.append_event(task_id, "收工：worktree=false 走一期路径 → finished")
+        return [f"{task_id} 正常干完 → finished"]
+    policy = (task.get("review") or {}).get("merge_policy") or "manual"
+    if policy == "manual":
+        store.update_status(
+            task_id, state="awaiting_merge", last_event_at=to_iso(now)
+        )
+        store.append_event(
+            task_id, "最后一班已存档 → awaiting_merge（等工头合并/丢弃）"
+        )
+        return [f"{task_id} 干完 → awaiting_merge（manual）"]
+    ok, note = worktree.merge_task(
+        task, config["projects"][task["project"]],
+        store.read_status(task_id), config,
+        close_windows=lambda ids: launcher.close_windows(ids, config),
+    )
+    if ok:
+        return [f"{task_id} 干完并自动合并：{note}"]
+    return [f"{task_id} 干完但自动合并没成：{note}"]
 
 
 # ---------- 额度刷新（零开销原则） ----------

@@ -309,6 +309,238 @@ def test_create_successor_of_old_style_task_stays_false(repo):
 # ---------- 启动对账 ----------
 
 
+# ---------- S5②：存档点 ----------
+
+
+def _gitSimple(*args, cwd) -> str:
+    out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True,
+                         text=True, check=True)
+    return out.stdout
+
+
+def test_checkpoint_sees_modify_untracked_delete_and_message(repo):
+    proj, config = repo
+    task = make_task(config)
+    meta = worktree.ensure_worktree(task, proj)
+    wt = Path(meta["worktree_path"])
+    # 干净：无改动不建空 commit
+    assert worktree.checkpoint(task, wt) is None
+    assert _gitSimple("rev-list", "--count", "HEAD", cwd=wt).strip() == "1"
+    # tracked 修改 + untracked 新文件 → 一颗 commit，message 带班次
+    (wt / "README.md").write_text("changed\n", encoding="utf-8")
+    (wt / "canary.txt").write_text("new\n", encoding="utf-8")
+    sha1 = worktree.checkpoint(task, wt)
+    assert sha1 and len(sha1) == 40
+    assert _gitSimple("log", "--format=%s", "-1", cwd=wt).strip() == \
+        "ns: 修测试任务 第1轮 build#1"
+    # 删除 + 再改 → 第二颗 commit
+    (wt / "canary.txt").unlink()
+    (wt / "README.md").write_text("changed2\n", encoding="utf-8")
+    sha2 = worktree.checkpoint(task, wt)
+    assert sha2 and sha2 != sha1
+    # 收干净后再调：仍不建空 commit
+    assert worktree.checkpoint(task, wt) is None
+    assert _gitSimple("rev-list", "--count", "HEAD", cwd=wt).strip() == "3"
+    # 主签出目录从头到尾没被动过
+    assert _gitSimple("status", "--porcelain", cwd=proj).strip() == ""
+    assert (proj / "README.md").read_text(encoding="utf-8") == "demo\n"
+
+
+def _tree_with_canary(repo, **task_over):
+    """建任务 + 建树 + 提交一个 canary 文件，返回 (task, meta)。"""
+    proj, config = repo
+    task = make_task(config, **task_over)
+    meta = worktree.ensure_worktree(task, proj)
+    store.update_status(task["id"], **meta)
+    wt = Path(meta["worktree_path"])
+    (wt / "canary.txt").write_text("内容\n", encoding="utf-8")
+    worktree.checkpoint(task, wt)
+    return task, meta
+
+
+def test_merge_task_success_no_ff_and_cleanup(repo):
+    proj, config = repo
+    task, meta = _tree_with_canary(repo)
+    closed: list[str] = []
+    ok, note = worktree.merge_task(
+        task, proj, store.read_status(task["id"]), config,
+        close_windows=lambda ids: closed.extend(ids),
+    )
+    assert ok, note
+    status = store.read_status(task["id"])
+    assert status["state"] == "merged"
+    assert status["merge_sha"] == _gitSimple("rev-parse", "HEAD", cwd=proj).strip()
+    # --no-ff：merge commit 有两个 parent
+    parents = _gitSimple("rev-list", "--parents", "-n", "1", "HEAD", cwd=proj).split()
+    assert len(parents) == 3
+    assert "已合并进主线" in note
+    # 树与分支清掉；链成员元数据清掉
+    assert not Path(meta["worktree_path"]).exists()
+    assert f"ns/{worktree.slug_for(task['id'], task['title'])}" not in _gitSimple(
+        "branch", "--list", cwd=proj)
+    assert "worktree_path" not in status
+
+
+def test_merge_task_dirty_main_refuses(repo):
+    proj, config = repo
+    task, meta = _tree_with_canary(repo)
+    base_count = _gitSimple("rev-list", "--count", "HEAD", cwd=proj).strip()
+    # 主线有 untracked（工头自己的东西）
+    (proj / "工头的笔记.txt").write_text("别动\n", encoding="utf-8")
+    ok, note = worktree.merge_task(
+        task, proj, store.read_status(task["id"]), config)
+    assert not ok
+    assert note == "主线有你没提交的改动，没敢自动合并；处理完按'合并进主线'"
+    status = store.read_status(task["id"])
+    assert status["state"] == "needs_attention"
+    assert status["error"] == note
+    assert "merge_sha" not in status
+    # 主线没多 commit，树与分支保留
+    assert _gitSimple("rev-list", "--count", "HEAD", cwd=proj).strip() == base_count
+    assert Path(meta["worktree_path"]).exists()
+
+
+def test_merge_task_dirty_worktree_refuses(repo):
+    proj, config = repo
+    task, meta = _tree_with_canary(repo)
+    (Path(meta["worktree_path"]) / "late.txt").write_text("存档后又改的\n", encoding="utf-8")
+    ok, note = worktree.merge_task(
+        task, proj, store.read_status(task["id"]), config)
+    assert not ok
+    assert "存档点后工作树又有改动" in note
+    assert Path(meta["worktree_path"]).exists()
+
+
+def test_merge_task_conflict_aborts_and_keeps_tree(repo):
+    proj, config = repo
+    task, meta = _tree_with_canary(repo)
+    wt = Path(meta["worktree_path"])
+    # 主线与树各自改 README → 必冲突
+    (proj / "README.md").write_text("main-side\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(proj), "commit", "-aqm", "main change"],
+                   check=True, capture_output=True)
+    (wt / "README.md").write_text("branch-side\n", encoding="utf-8")
+    worktree.checkpoint(task, wt)
+    ok, note = worktree.merge_task(
+        task, proj, store.read_status(task["id"]), config)
+    assert not ok
+    assert "合并冲突" in note and "merge --abort" in note
+    status = store.read_status(task["id"])
+    assert status["state"] == "needs_attention"
+    # MERGE_HEAD 清掉、主线回到干净、主线内容没被改
+    assert subprocess.run(["git", "-C", str(proj), "rev-parse", "-q", "--verify",
+                           "MERGE_HEAD"], capture_output=True).returncode != 0
+    assert _gitSimple("status", "--porcelain", cwd=proj).strip() == ""
+    assert (proj / "README.md").read_text(encoding="utf-8") == "main-side\n"
+    # 树与分支保留
+    assert wt.exists()
+    assert meta["branch"] in _gitSimple("branch", "--list", cwd=proj)
+
+
+def test_merge_task_cleanup_failure_recovers(repo, monkeypatch):
+    proj, config = repo
+    task, meta = _tree_with_canary(repo)
+    real_git = worktree._git
+
+    def flaky_git(cwd, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            return subprocess.CompletedProcess(args, 1, "", "模拟 remove 失败")
+        return real_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(worktree, "_git", flaky_git)
+    ok, note = worktree.merge_task(
+        task, proj, store.read_status(task["id"]), config)
+    assert not ok
+    assert "合并成功但清理失败" in note and "merge_sha 已保留" in note
+    status = store.read_status(task["id"])
+    assert status["state"] == "needs_attention"
+    assert status.get("merge_sha")
+    # 主线确实已经合进来了（一颗 merge commit）
+    parents = _gitSimple("rev-list", "--parents", "-n", "1", "HEAD", cwd=proj).split()
+    assert len(parents) == 3
+    merge_count = _gitSimple("rev-list", "--count", "--merges", "HEAD", cwd=proj).strip()
+
+    # 第二次点"合并进主线"：只用补清理，绝不再造第二颗 merge commit
+    monkeypatch.setattr(worktree, "_git", real_git)
+    ok2, note2 = worktree.merge_task(
+        task, proj, store.read_status(task["id"]), config)
+    assert ok2, note2
+    assert _gitSimple("rev-list", "--count", "--merges", "HEAD", cwd=proj).strip() == merge_count
+    assert store.read_status(task["id"])["state"] == "merged"
+    assert not Path(meta["worktree_path"]).exists()
+
+
+def test_discard_task_removes_tree_and_branch(repo):
+    proj, config = repo
+    task, meta = _tree_with_canary(repo)
+    closed: list[str] = []
+    ok, note = worktree.discard_task(
+        task, proj, store.read_status(task["id"]), config,
+        close_windows=lambda ids: closed.extend(ids),
+    )
+    assert ok, note
+    assert store.read_status(task["id"])["state"] == "discarded"
+    assert not Path(meta["worktree_path"]).exists()
+    assert meta["branch"] not in _gitSimple("branch", "--list", cwd=proj)
+    assert "worktree_path" not in store.read_status(task["id"])
+    # 主线一个 commit 都没多
+    assert _gitSimple("rev-list", "--count", "--merges", "HEAD", cwd=proj).strip() == "0"
+
+
+def test_discard_refuses_foreign_path_and_branch_mismatch(repo):
+    proj, config = repo
+    task, meta = _tree_with_canary(repo)
+    # 路径不在项目 .claude/worktrees/ 下：拒绝且什么都不删
+    store.update_status(task["id"], worktree_path="/tmp/opencode/elsewhere")
+    ok, note = worktree.discard_task(
+        task, proj, store.read_status(task["id"]), config)
+    assert not ok and "拒绝动它" in note
+    assert Path(meta["worktree_path"]).exists()
+    # 分支与链记录不符：拒绝
+    store.update_status(task["id"], worktree_path=meta["worktree_path"],
+                        branch="feature/x")
+    ok, note = worktree.discard_task(
+        task, proj, store.read_status(task["id"]), config)
+    assert not ok and "分支与这条链的记录不符" in note
+    assert Path(meta["worktree_path"]).exists()
+    # 没登记过树：拒绝
+    other = make_task(config)
+    ok, note = worktree.discard_task(
+        other, proj, store.read_status(other["id"]), config)
+    assert not ok and "没有登记工作树" in note
+
+
+def test_discard_half_failure_keeps_branch_report(repo, monkeypatch):
+    proj, config = repo
+    task, meta = _tree_with_canary(repo)
+    real_git = worktree._git
+
+    def flaky_git(cwd, *args, **kwargs):
+        if args[:2] == ("branch", "-D"):
+            return subprocess.CompletedProcess(args, 1, "", "模拟删分支失败")
+        return real_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(worktree, "_git", flaky_git)
+    ok, note = worktree.discard_task(
+        task, proj, store.read_status(task["id"]), config)
+    assert not ok
+    assert "分支" in note and "人工" in note
+    status = store.read_status(task["id"])
+    assert status["state"] == "needs_attention"
+    assert not Path(meta["worktree_path"]).exists()  # 树删了
+    assert meta["branch"] in _gitSimple("branch", "--list", cwd=proj)  # 分支还在
+
+
+def test_chain_window_ids_only_from_records(repo):
+    proj, config = repo
+    task, meta = _tree_with_canary(repo)
+    store.update_status(task["id"], window_id="@11")
+    succ_id = store.create_successor(task, "交接\nNEXT: continue", config)
+    store.update_status(succ_id, window_id="@12")
+    ids = worktree.chain_window_ids(store.load_task(succ_id))
+    assert sorted(ids) == ["@11", "@12"]
+
+
 def test_reconcile_reports_only_ns_orphans_and_never_deletes(repo):
     proj, config = repo
     # 夜班的树：建出来，但删掉任务引用（孤儿）

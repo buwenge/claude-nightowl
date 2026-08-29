@@ -1,7 +1,6 @@
 """命令行入口的测试：add 的工作树旗标、serve --once 的启动对账。"""
 
 import json
-from pathlib import Path
 
 import pytest
 

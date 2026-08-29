@@ -1139,3 +1139,159 @@ def test_warmup_settings_roundtrip(authed):
     assert status == 400
     status, _, body = authed.request("PUT", "/api/warmup", {"enabled": True, "times": ""})
     assert status == 400
+
+
+# ---------- S5②：合并 / 丢弃 API 与删除保护 ----------
+
+
+def _make_git_repo(tmp_path) -> Path:
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=proj, check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.email", "ns@example.test"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.name", "ns"],
+                   check=True, capture_output=True)
+    (proj / "README.md").write_text("demo\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(proj), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(proj), "commit", "-q", "-m", "init"],
+                   check=True, capture_output=True)
+    return proj
+
+
+def _worktree_task(authed, proj, tmp_path, *, policy="manual", state="awaiting_merge"):
+    """网页建 worktree 任务 → 真建树并打一颗存档 → 停在指定状态。"""
+    status_code, _, body = authed.request("POST", "/api/tasks", {
+        "title": "工作树任务", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+        "review": {"enabled": False, "merge_policy": policy},
+    })
+    assert status_code == 201, body
+    task_id = body["id"]
+    from nightshift import worktree as wt_mod
+    meta = wt_mod.ensure_worktree(store.load_task(task_id), proj)
+    store.update_status(task_id, **meta)
+    wt = Path(meta["worktree_path"])
+    (wt / "canary.txt").write_text("活\n", encoding="utf-8")
+    wt_mod.checkpoint(store.load_task(task_id), wt)
+    store.update_status(task_id, state=state)
+    return task_id, wt, meta
+
+
+def test_merge_api_requires_csrf_then_success(authed, ns_home, tmp_path):
+    proj = _make_git_repo(tmp_path)
+    cfg = store.load_config()
+    cfg["projects"] = {"demo": str(proj)}
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    task_id, wt, meta = _worktree_task(authed, proj, tmp_path)
+
+    # 两道闸：缺 CSRF 头先 403
+    status, _, _ = authed.request(
+        "POST", f"/api/tasks/{task_id}/merge", {}, csrf=False)
+    assert status == 403
+
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/merge")
+    assert status == 200, body
+    task_status = store.read_status(task_id)
+    assert task_status["state"] == "merged"
+    assert task_status.get("merge_sha")
+    assert not wt.exists()  # 树清掉
+    assert meta["branch"] not in subprocess.run(
+        ["git", "-C", str(proj), "branch", "--list", meta["branch"]],
+        capture_output=True, text=True, check=True).stdout
+    # 主线多一颗 --no-ff merge commit
+    parents = subprocess.run(
+        ["git", "-C", str(proj), "rev-list", "--parents", "-n", "1", "HEAD"],
+        capture_output=True, text=True, check=True).stdout.split()
+    assert len(parents) == 3
+    # merged 可删除
+    status, _, body = authed.request("DELETE", f"/api/tasks/{task_id}")
+    assert status == 200, body
+
+
+def test_merge_api_dirty_main_409_keeps_everything(authed, ns_home, tmp_path):
+    proj = _make_git_repo(tmp_path)
+    cfg = store.load_config()
+    cfg["projects"] = {"demo": str(proj)}
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    task_id, wt, meta = _worktree_task(authed, proj, tmp_path)
+    (proj / "工头的改动.txt").write_text("别动\n", encoding="utf-8")
+
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/merge")
+    assert status == 409
+    assert "主线有你没提交的改动" in body["error"]
+    task_status = store.read_status(task_id)
+    assert task_status["state"] == "needs_attention"
+    assert task_status["error"] == body["error"]  # 卡片红字与接口一致
+    assert Path(wt).exists() and "worktree_path" in task_status
+    # 处理完主线 → needs_attention 也能重试同一 API
+    (proj / "工头的改动.txt").unlink()
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/merge")
+    assert status == 200, body
+    assert store.read_status(task_id)["state"] == "merged"
+
+
+def test_merge_api_wrong_state_409(authed, ns_home, tmp_path):
+    proj = _make_git_repo(tmp_path)
+    cfg = store.load_config()
+    cfg["projects"] = {"demo": str(proj)}
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    task_id, _, _ = _worktree_task(
+        authed, proj, tmp_path, state="awaiting_merge")
+    store.update_status(task_id, state="scheduled")
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/merge")
+    assert status == 409
+    assert "不能合并" in body["error"]
+
+
+def test_discard_api_success_and_state_guards(authed, ns_home, tmp_path):
+    proj = _make_git_repo(tmp_path)
+    cfg = store.load_config()
+    cfg["projects"] = {"demo": str(proj)}
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    task_id, wt, meta = _worktree_task(
+        authed, proj, tmp_path, state="failed")
+    # failed 但有树：可丢弃
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/discard")
+    assert status == 200, body
+    assert store.read_status(task_id)["state"] == "discarded"
+    assert not wt.exists()
+    assert meta["branch"] not in subprocess.run(
+        ["git", "-C", str(proj), "branch", "--list", meta["branch"]],
+        capture_output=True, text=True, check=True).stdout
+    # 已丢弃再丢：409
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/discard")
+    assert status == 409
+    # discarded 可删除
+    status, _, _ = authed.request("DELETE", f"/api/tasks/{task_id}")
+    assert status == 200
+
+
+def test_discard_api_refuses_foreign_path(authed, ns_home, tmp_path):
+    proj = _make_git_repo(tmp_path)
+    cfg = store.load_config()
+    cfg["projects"] = {"demo": str(proj)}
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    task_id, wt, meta = _worktree_task(authed, proj, tmp_path)
+    store.update_status(task_id, worktree_path="/tmp/opencode/not-mine")
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/discard")
+    assert status == 409
+    assert "拒绝动它" in body["error"]
+    assert Path(wt).exists()  # 什么都没删
+
+
+def test_delete_blocked_while_tree_exists(authed, ns_home, tmp_path):
+    proj = _make_git_repo(tmp_path)
+    cfg = store.load_config()
+    cfg["projects"] = {"demo": str(proj)}
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    task_id, wt, _ = _worktree_task(authed, proj, tmp_path)
+    status, _, body = authed.request("DELETE", f"/api/tasks/{task_id}")
+    assert status == 409
+    assert "先合并进主线或丢弃" in body["error"]
+    # 丢弃后即可删
+    status, _, _ = authed.request("POST", f"/api/tasks/{task_id}/discard")
+    assert status == 200
+    status, _, _ = authed.request("DELETE", f"/api/tasks/{task_id}")
+    assert status == 200

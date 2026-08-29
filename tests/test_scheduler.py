@@ -5,12 +5,13 @@ launcher / quota 全部 monkeypatch 成可控假函数；时间用固定的 awar
 
 import json
 import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from nightshift import launcher, quota, scheduler, store
+from nightshift import launcher, quota, scheduler, store, worktree
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 NOW = datetime(2026, 8, 27, 18, 0, 0, tzinfo=timezone.utc)
@@ -89,6 +90,7 @@ class Fakes:
         self.failure_calls: list[tuple] = []
         self.send_keys_calls: list[tuple] = []
         self.fetch_calls: list[int] = []
+        self.close_calls: list[list[str]] = []
 
         monkeypatch.setattr(launcher, "is_trusted", lambda path: self.trusted)
         monkeypatch.setattr(launcher, "launch", self._launch)
@@ -99,6 +101,7 @@ class Fakes:
         monkeypatch.setattr(launcher, "send_keys", self._send_keys)
         monkeypatch.setattr(launcher, "open_notice_window", self._notice)
         monkeypatch.setattr(launcher, "open_failure_window", self._failure)
+        monkeypatch.setattr(launcher, "close_windows", self._close_windows)
         monkeypatch.setattr(quota, "fetch_usage", self._fetch)
 
     def _launch(self, task_id, config):
@@ -111,6 +114,11 @@ class Fakes:
             pane_pid=NO_PID,
         )
         return store.read_status(task_id)
+
+    def _close_windows(self, window_ids, config):
+        """记录"要关哪些窗口"；只回记录里的 @N，绝不碰会话。"""
+        self.close_calls.append([str(w) for w in (window_ids or [])])
+        return [str(w) for w in (window_ids or [])]
 
     def _notice(self, task, suffix, lines, config):
         self.notice_calls.append((task["id"], suffix, list(lines)))
@@ -793,8 +801,9 @@ def test_chain_continue_creates_successor(monkeypatch):
 
 
 def test_chain_done_finishes(monkeypatch):
+    # worktree=false 走一期路径：NEXT: done → finished（S5② 回归开关）
     Fakes(monkeypatch)
-    tid = make_task()
+    tid = make_task(worktree=False)
     _go_idle(tid)
     _write_handover(tid, "全部完成，已提交。\nNEXT: done")
     actions = scheduler.tick(CONFIG, NOW)
@@ -849,8 +858,9 @@ def test_chain_no_handover_warned_stop_needs_attention(monkeypatch):
 
 
 def test_chain_no_handover_never_warned_finishes(monkeypatch):
+    # worktree=false：没交接也没被提醒 → 一期 finished 路径不变
     Fakes(monkeypatch)
-    tid = make_task()
+    tid = make_task(worktree=False)
     _go_idle(tid)
     actions = scheduler.tick(CONFIG, NOW)
     status = store.read_status(tid)
@@ -911,6 +921,255 @@ def test_chain_exited_without_handover_untouched(monkeypatch):
     assert status["state"] == "exited"  # 没交接不动
     assert status["chain_checked"] is True
     assert len(store.list_tasks()) == 1
+
+
+# ---------- S5②：收工存档点与完工分流（真 Git 仓库） ----------
+
+
+def _make_repo(tmp_path) -> Path:
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=proj, check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.email", "ns@example.test"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.name", "ns"],
+                   check=True, capture_output=True)
+    (proj / "README.md").write_text("demo\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(proj), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(proj), "commit", "-q", "-m", "init"],
+                   check=True, capture_output=True)
+    return proj
+
+
+def _config_for(proj: Path) -> dict:
+    cfg = dict(CONFIG)
+    cfg["projects"] = {"demo": str(proj), "other": str(proj / "nope")}
+    return cfg
+
+
+def _register_tree(proj: Path, tid: str, title: str) -> Path:
+    """launch 被 Fakes 替掉了，树由测试手工建好并登记（与 launcher.launch 同形，
+    含 info/exclude——否则 .claude/ 在主线是 untracked，merge 预检会判脏）。"""
+    from nightshift import worktree as wt_mod
+    slug = wt_mod.slug_for(tid, title)
+    wt = proj / ".claude" / "worktrees" / slug
+    subprocess.run(
+        ["git", "-C", str(proj), "worktree", "add", str(wt), "-b", f"ns/{slug}"],
+        check=True, capture_output=True,
+    )
+    wt_mod.ensure_exclude(proj)
+    head = subprocess.run(["git", "-C", str(proj), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+    store.update_status(tid, worktree_path=str(wt), branch=f"ns/{slug}", base_ref=head)
+    return wt
+
+
+def _branch_log(proj: Path, branch: str) -> list[str]:
+    out = subprocess.run(["git", "-C", str(proj), "log", "--format=%s", branch],
+                         capture_output=True, text=True, check=True).stdout
+    return [line for line in out.splitlines() if line]
+
+
+def test_worktree_continue_checkpoints_then_successor_same_tree(tmp_path, monkeypatch):
+    """NEXT: continue：先打 c1 再造后继；后继在同一树继续改，第二班再打 c2。"""
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _config_for(proj)
+    tid = make_task()
+    _register_tree(proj, tid, "夜间重构")
+    _go_idle(tid, window_id="@21")
+    _write_handover(tid, "做了一半。\nNEXT: continue")
+    # 工作树里有未提交改动 → 存档点必须收进来
+    wt = Path(store.read_status(tid)["worktree_path"])
+    (wt / "canary.txt").write_text("第一班\n", encoding="utf-8")
+
+    actions = scheduler.tick(cfg, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "chained"
+    assert status.get("checkpoint_done") is True
+    c1 = status.get("checkpoint_sha")
+    assert c1 and len(c1) == 40
+    assert "ns: 夜间重构 第1轮 build#1" in _branch_log(proj, status["branch"])
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "已打存档点" in events
+    assert any("续班" in a for a in actions)
+    # 后继沿用同一棵树
+    succ_id = status["successor_id"]
+    succ_status = store.read_status(succ_id)
+    for key in ("worktree_path", "branch", "base_ref"):
+        assert succ_status[key] == status[key]
+
+        # 第二班：同树再改，收工 NEXT: done（manual → awaiting_merge）
+        _go_idle(succ_id, window_id="@22")
+        (store.task_dir(succ_id) / "handover-2.md").write_text(
+            "另一半也好了。\nNEXT: done\n", encoding="utf-8")
+        (wt / "canary.txt").write_text("第一班\n第二班\n", encoding="utf-8")
+    scheduler.tick(cfg, NOW)
+    succ_status = store.read_status(succ_id)
+    assert succ_status["state"] == "awaiting_merge"
+    c2 = succ_status.get("checkpoint_sha")
+    assert c2 and c2 != c1
+    subjects = _branch_log(proj, succ_status["branch"])
+    # S5 没有轮次字段：round 固定 1，班次取真实 shift
+    assert "ns: 夜间重构 第1轮 build#2" in subjects
+    # manual 不合并：窗口都还留着（合并成功才关），没有会话级操作
+    assert fakes.close_calls == []
+
+
+def test_worktree_manual_done_awaits_merge_never_finished(tmp_path, monkeypatch):
+    Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _config_for(proj)
+    tid = make_task()
+    _register_tree(proj, tid, "夜间重构")
+    _go_idle(tid)
+    _write_handover(tid, "干完了。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "awaiting_merge"  # 不是 finished
+    assert status.get("checkpoint_done") is True
+    assert status.get("checkpoint_sha") is None  # 没改动：不打存档点
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "第 1 班无改动，未打存档点" in events
+    # 树与分支都保留
+    assert Path(status["worktree_path"]).exists()
+
+
+def test_worktree_auto_done_merges_and_cleans(tmp_path, monkeypatch):
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _config_for(proj)
+    tid = make_task(review={"enabled": False, "merge_policy": "auto"})
+    wt = _register_tree(proj, tid, "夜间重构")
+    _go_idle(tid, window_id="@31")
+    (wt / "canary.txt").write_text("自动合并的活\n", encoding="utf-8")
+    _write_handover(tid, "干完了。\nNEXT: done")
+
+    actions = scheduler.tick(cfg, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "merged", actions
+    assert status.get("merge_sha")
+    # --no-ff merge commit（两个 parent）
+    parents = subprocess.run(
+        ["git", "-C", str(proj), "rev-list", "--parents", "-n", "1", "HEAD"],
+        capture_output=True, text=True, check=True).stdout.split()
+    assert len(parents) == 3
+    # 树与分支清掉（合并成功后链成员的元数据也被清）；链上登记的窗口被关
+    assert not wt.exists()
+    assert "worktree_path" not in status
+    branch = f"ns/{worktree.slug_for(tid, '夜间重构')}"
+    out = subprocess.run(["git", "-C", str(proj), "branch", "--list", branch],
+                         capture_output=True, text=True, check=True).stdout
+    assert branch not in out
+    assert fakes.close_calls == [["@31"]]
+
+
+def test_worktree_auto_dirty_main_needs_attention_exact_text(tmp_path, monkeypatch):
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _config_for(proj)
+    tid = make_task(review={"enabled": False, "merge_policy": "auto"})
+    wt = _register_tree(proj, tid, "夜间重构")
+    (wt / "canary.txt").write_text("活\n", encoding="utf-8")
+    # 主线有工头自己的 untracked 改动
+    (proj / "note.txt").write_text("别动\n", encoding="utf-8")
+    _go_idle(tid)
+    _write_handover(tid, "干完了。\nNEXT: done")
+
+    scheduler.tick(cfg, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention"
+    assert status["error"] == "主线有你没提交的改动，没敢自动合并；处理完按'合并进主线'"
+    assert len(fakes.notice_calls) == 0  # 调度器不另开窗：卡片红字 + 首次告警在收尾 helper 里
+    # 树与分支保留、merge commit 数不变
+    assert wt.exists()
+    merges = subprocess.run(
+        ["git", "-C", str(proj), "rev-list", "--count", "--merges", "HEAD"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    assert merges == "0"
+    # 工头清完主线 → 网页重试（同一 helper）→ merged
+    (proj / "note.txt").unlink()
+    ok, note = worktree.merge_task(
+        store.load_task(tid), proj, store.read_status(tid), cfg,
+        close_windows=lambda ids: launcher.close_windows(ids, cfg))
+    assert ok, note
+    assert store.read_status(tid)["state"] == "merged"
+
+
+def test_worktree_checkpoint_failure_stops_chain(tmp_path, monkeypatch):
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _config_for(proj)
+    tid = make_task()
+    _register_tree(proj, tid, "夜间重构")
+    (Path(store.read_status(tid)["worktree_path"]) / "canary.txt").write_text(
+        "活\n", encoding="utf-8")
+    _go_idle(tid)
+    _write_handover(tid, "做了一半。\nNEXT: continue")
+    monkeypatch.setattr(
+        worktree, "checkpoint",
+        lambda task, path: (_ for _ in ()).throw(worktree.WorktreeError("git commit 失败（exit 128）：没有身份")))
+
+    actions = scheduler.tick(cfg, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention"
+    assert any("存档点失败" in a for a in actions)
+    assert "存档点失败" in status["error"]
+    assert status.get("successor_id") is None  # 不造后继
+    assert len(store.list_tasks()) == 1
+    assert len(fakes.notice_calls) == 1  # 开一次提醒窗
+    # 再 tick：不重复刷（chain_checked 已落）
+    assert scheduler.tick(cfg, NOW) == []
+
+
+def test_checkpoint_shift_is_idempotent(tmp_path, monkeypatch):
+    """重复 tick 不得多打第二颗同内容 commit（checkpoint_done 锁）。"""
+    Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    tid = make_task()
+    _register_tree(proj, tid, "夜间重构")
+    wt = Path(store.read_status(tid)["worktree_path"])
+    (wt / "canary.txt").write_text("活\n", encoding="utf-8")
+    status = store.read_status(tid)
+    now = NOW
+    blocked = scheduler._checkpoint_shift(store.load_task(tid), status, CONFIG, now)
+    assert blocked is None
+    sha = store.read_status(tid)["checkpoint_sha"]
+    # 第二次直接调：checkpoint_done 已锁，什么都不做
+    blocked = scheduler._checkpoint_shift(
+        store.load_task(tid), store.read_status(tid), CONFIG, now)
+    assert blocked is None
+    assert store.read_status(tid)["checkpoint_sha"] == sha
+    count = subprocess.run(
+        ["git", "-C", str(wt), "rev-list", "--count", "HEAD"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    assert count == "2"  # init + 一颗存档点
+
+
+def test_worktree_exited_with_handover_checkpoints_first(tmp_path, monkeypatch):
+    """exited（会话被关但交接写完）也是收工边界：先存档再判 NEXT。"""
+    Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _config_for(proj)
+    tid = make_task()
+    wt = _register_tree(proj, tid, "夜间重构")
+    (wt / "canary.txt").write_text("活\n", encoding="utf-8")
+    store.update_status(tid, state="exited", exit_reason="window_gone")
+    _write_handover(tid, "写完交接会话就被关了。\nNEXT: continue")
+    scheduler.tick(cfg, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "chained"
+    assert status.get("checkpoint_sha")
+
+
+def test_worktree_false_manual_done_still_finished(tmp_path, monkeypatch):
+    """显式 worktree=false：原状态机一字不变，done → finished。"""
+    Fakes(monkeypatch)
+    tid = make_task(worktree=False, review={"enabled": False, "merge_policy": "manual"})
+    _go_idle(tid)
+    _write_handover(tid, "干完了。\nNEXT: done")
+    scheduler.tick(CONFIG, NOW)
+    assert store.read_status(tid)["state"] == "finished"
 
 
 # ---------- 额度刷新（零开销） ----------

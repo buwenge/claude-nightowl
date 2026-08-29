@@ -440,8 +440,13 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
 
     elif event == "SessionEnd":
         # 已经收尾的终态（finished/chained/…）不被"关窗口"盖成 exited：
-        # 网页上"已完成"不该因为用户关了窗就变"已退出"（8/27 真机发现）
-        keep = ("finished", "chained", "chain_exhausted", "needs_attention")
+        # 网页上"已完成"不该因为用户关了窗就变"已退出"（8/27 真机发现）。
+        # S5②：awaiting_merge/merged/discarded 同理——等合并/已合并的卡片
+        # 不许被顺手关窗冲掉
+        keep = (
+            "finished", "chained", "chain_exhausted", "needs_attention",
+            "awaiting_merge", "merged", "discarded",
+        )
 
         def mark_exit(status: dict) -> None:
             if status.get("state") not in keep:

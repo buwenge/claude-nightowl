@@ -25,7 +25,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import auth, launcher, quota, scheduler, store, warmup
+from . import auth, launcher, quota, scheduler, store, warmup, worktree
 
 __all__ = ["make_server", "serve_http"]
 
@@ -42,7 +42,9 @@ MAX_BODY_BYTES = 256 * 1024
 # 任务 id 只认这个形状，杜绝路径拼接
 _TASK_ID_RE = r"[0-9]{8}-[0-9]{6}-[0-9a-f]{4}"
 _RE_TASK_DETAIL = re.compile(rf"^/api/tasks/({_TASK_ID_RE})$")
-_RE_TASK_ACTION = re.compile(rf"^/api/tasks/({_TASK_ID_RE})/(run-now|cancel)$")
+_RE_TASK_ACTION = re.compile(
+    rf"^/api/tasks/({_TASK_ID_RE})/(run-now|cancel|merge|discard)$"
+)
 _RE_TASK_MESSAGE = re.compile(rf"^/api/tasks/({_TASK_ID_RE})/message$")
 _RE_TASK_SESSION = re.compile(
     rf"^/api/tasks/({_TASK_ID_RE})/(interrupt|stop-background)$"
@@ -65,10 +67,11 @@ _CONTENT_TYPES = {
 
 # "现在就跑"允许的状态（设计稿：让调度器下一 tick 走完整预检，不直接 launch）
 _RUN_NOW_STATES = ("scheduled", "postponed", "failed", "cancelled")
-# 可删除的终态
+# 可删除的终态（S5②：merged / discarded 加入；有树的删除被 409 挡住）
 _TERMINAL_STATES = (
     "exited", "finished", "failed", "cancelled", "chain_exhausted", "needs_attention",
     "chained",  # 本班已把活交给后继，自己就是结束了（8/28 工头发现删不掉）
+    "merged", "discarded",
 )
 # PUT 编辑允许的键，按状态分级（S4②）
 # 未跑状态（scheduled/postponed/failed/cancelled）：全字段可改
@@ -80,9 +83,18 @@ _EDITABLE_UNRUN = (
 # 活跃状态（launching/working/waiting_background/waiting_wakeup/idle）：
 # 只许改标题/任务内容/额度与上下文线/换班设置/触发方式
 _EDITABLE_ACTIVE = ("title", "task_text", "guards", "chain", "trigger")
-# 编辑直接 409 的终态（failed/cancelled 仍算"未跑"可编辑）
+# 编辑直接 409 的终态（failed/cancelled 仍算"未跑"可编辑；S5②：
+# awaiting_merge / merged / discarded 也定死，不许再改）
 _EDIT_TERMINAL_STATES = (
     "finished", "exited", "chained", "chain_exhausted", "needs_attention",
+    "awaiting_merge", "merged", "discarded",
+)
+# 能按"合并进主线"的状态：等合并，或 needs_attention（工头清完主线后重试）
+_MERGE_STATES = ("awaiting_merge", "needs_attention")
+# 能按"丢弃"的状态：有树且不会再自动跑（活跃班正在树里施工，不许拆脚手架）
+_DISCARD_STATES = (
+    "awaiting_merge", "needs_attention", "failed", "cancelled",
+    "chain_exhausted", "exited",
 )
 # config 缺 stop_background_text 时的兜底（与 config.example.json 保持一致）
 DEFAULT_STOP_BACKGROUND_TEXT = (
@@ -369,7 +381,11 @@ class _Handler(BaseHTTPRequestHandler):
             task_id, action = match.group(1), match.group(2)
             if action == "run-now":
                 return self._api_run_now(task_id)
-            return self._api_cancel(task_id)
+            if action == "cancel":
+                return self._api_cancel(task_id)
+            if action == "merge":
+                return self._api_merge(task_id)
+            return self._api_discard(task_id)
         match = _RE_TASK_MESSAGE.match(path)
         if match:
             return self._api_message(match.group(1))
@@ -800,10 +816,68 @@ class _Handler(BaseHTTPRequestHandler):
         logger.info("网页停后台：%s", task_id)
         return self._send_json(200, {"ok": True})
 
+    def _api_merge(self, task_id: str) -> None:
+        """合并进主线（S5②）：与 auto 收工共用 worktree.merge_task 同一套安全检查。"""
+        if self._load_existing(task_id) is None:
+            return
+        status = store.read_status(task_id)
+        state = status.get("state")
+        if state not in _MERGE_STATES:
+            return self._send_json(
+                409,
+                {"error": f"状态 {state or '-'} 不能合并"
+                          f"（只允许 {'/'.join(_MERGE_STATES)}）"},
+            )
+        task = store.load_task(task_id)
+        if not store.worktree_enabled(task):
+            return self._send_json(409, {"error": "老式任务没有工作树，不需要合并"})
+        cfg = store.load_config()
+        ok, note = worktree.merge_task(
+            task, cfg["projects"][task["project"]], status, cfg,
+            close_windows=lambda ids: launcher.close_windows(ids, cfg),
+        )
+        if ok:
+            logger.info("网页合并进主线：%s（%s）", task_id, note)
+            return self._send_json(200, {"ok": True, "note": note})
+        # merge_task 已把状态落 needs_attention、原因写进 error；红字会留在卡片上
+        return self._send_json(409, {"error": note})
+
+    def _api_discard(self, task_id: str) -> None:
+        """丢弃（S5②，破坏性）：树与 ns 分支删除，只按记录双核验后动手。"""
+        if self._load_existing(task_id) is None:
+            return
+        status = store.read_status(task_id)
+        state = status.get("state")
+        if state not in _DISCARD_STATES:
+            return self._send_json(
+                409,
+                {"error": f"状态 {state or '-'} 不能丢弃"
+                          f"（只允许 {'/'.join(_DISCARD_STATES)}）"},
+            )
+        task = store.load_task(task_id)
+        if not store.worktree_enabled(task):
+            return self._send_json(409, {"error": "老式任务没有工作树，无从丢弃"})
+        cfg = store.load_config()
+        ok, note = worktree.discard_task(
+            task, cfg["projects"][task["project"]], status, cfg,
+            close_windows=lambda ids: launcher.close_windows(ids, cfg),
+        )
+        if ok:
+            logger.info("网页丢弃工作树：%s（%s）", task_id, note)
+            return self._send_json(200, {"ok": True, "note": note})
+        return self._send_json(409, {"error": note})
+
     def _api_delete(self, task_id: str) -> None:
         if self._load_existing(task_id) is None:
             return
-        state = store.read_status(task_id).get("state")
+        status = store.read_status(task_id)
+        state = status.get("state")
+        # S5②：还占着工作树的任务不许直接删任务目录，避免人为制造孤儿
+        # （这条先于终态判断：awaiting_merge 也不是终态，但提示该指向树）
+        if store.worktree_enabled(store.load_task(task_id)) and status.get("worktree_path"):
+            return self._send_json(
+                409, {"error": "这条任务的工作树还没处理：先合并进主线或丢弃，再删任务"}
+            )
         if state not in _TERMINAL_STATES:
             return self._send_json(
                 409, {"error": f"只允许删除终态任务，当前是 {state or '-'}"}

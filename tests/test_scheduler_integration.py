@@ -258,11 +258,37 @@ def test_chain_two_shifts_end_to_end(trusted_env):
         encoding="utf-8"
     ).count("--session-id") == 2
 
-    # ⑤ 交接写 NEXT: done → 后继 finished；父任务停在 chained
+    # ⑤ 交接写 NEXT: done → 后继 awaiting_merge（worktree=true + manual，
+    #    不再直接 finished）；收工边界打过存档点账（假 claude 没改文件 → 不 commit）
     (store.task_dir(successor_id) / "handover-2.md").write_text(
         "支付页也干完了。\nNEXT: done\n", encoding="utf-8"
     )
     out4 = serve_once()
-    assert store.read_status(successor_id)["state"] == "finished"
-    assert "finished" in out4
-    assert store.read_status(task_id)["state"] == "chained"
+    succ_status = store.read_status(successor_id)
+    assert succ_status["state"] == "awaiting_merge"
+    assert "awaiting_merge" in out4
+    assert succ_status.get("checkpoint_done") is True
+    assert "未打存档点" in (store.task_dir(successor_id) / "events.log").read_text(
+        encoding="utf-8"
+    )
+    # 整条链只有一棵树：后继沿用首班的 worktree 元数据
+    parent_status = store.read_status(task_id)
+    assert parent_status["state"] == "chained"
+    for key in ("worktree_path", "branch", "base_ref"):
+        assert succ_status[key] == parent_status[key]
+    # 一期路径回归：显式 worktree=false 的任务 NEXT: done 仍 finished
+    old_task = store.create_task(
+        {
+            "title": "老式集成", "project": "demo", "model": "claude-fable-5",
+            "effort": "high", "run_at": "2026-08-27T00:00:00Z",
+            "task_text": "正文", "prompt_final": "只回复：好", "worktree": False,
+        },
+        config,
+    )
+    serve_once()
+    wait_for_state(old_task)
+    (store.task_dir(old_task) / "handover-1.md").write_text(
+        "干完了。\nNEXT: done\n", encoding="utf-8"
+    )
+    serve_once()
+    assert store.read_status(old_task)["state"] == "finished"
