@@ -90,23 +90,47 @@ function fmtDelta(ms) {
   return Math.floor(h / 24) + " 天 " + (h % 24) + " 小时";
 }
 
+function copyText(text) {
+  // 剪贴板 API 优先（要 https/localhost），不行退回 execCommand 兜底
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise(function (resolve, reject) {
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    if (ok) resolve(); else reject(new Error("copy failed"));
+  });
+}
+
 var STATE_TEXT = {
   scheduled: "已排班", postponed: "已推迟", launching: "正在启动", working: "干活中",
   waiting_background: "等背景任务", waiting_wakeup: "等闹钟", idle: "一轮干完", chained: "已续班",
   exited: "已退出", finished: "已完成", failed: "已失败",
-  cancelled: "已取消", needs_attention: "需要人工", chain_exhausted: "班次用尽"
+  cancelled: "已取消", needs_attention: "需要人工", chain_exhausted: "班次用尽",
+  awaiting_merge: "等你合并", merged: "已合并", discarded: "已丢弃"
 };
 
 var ACTIVE_STATES = ["launching", "working", "waiting_background", "waiting_wakeup", "idle"];
 var RUNNOW_STATES = ["scheduled", "postponed", "failed", "cancelled"];
 var CANCEL_STATES = ["scheduled", "postponed"];
 var TERMINAL_STATES = ["exited", "finished", "failed", "cancelled",
-  "chain_exhausted", "needs_attention", "chained"];
+  "chain_exhausted", "needs_attention", "chained", "merged", "discarded"];
+// 有树且等人工的状态：卡片给"合并进主线 / 丢弃 / 先留着"
+var MERGE_BUTTON_STATES = ["awaiting_merge", "needs_attention"];
 
 function groupOf(state) {
-  if (ACTIVE_STATES.indexOf(state) >= 0) return 0;
-  if (state === "scheduled" || state === "postponed") return 1;
-  return 2;
+  if (state === "awaiting_merge") return 0;  // 等合并：最前面的待处理组
+  if (ACTIVE_STATES.indexOf(state) >= 0) return 1;
+  if (state === "scheduled" || state === "postponed") return 2;
+  return 3;
 }
 
 /* ---------- 顶栏分段切换 ---------- */
@@ -127,10 +151,32 @@ function showView(name) {
 
 /* ---------- 任务页 ---------- */
 
+// 终态组按 run_at 降序那段依赖 groupOf 的编号，awaiting_merge 在 0、终态在 3
 function refreshTasks() {
   api("GET", "./api/tasks").then(function (items) {
     renderTasks(items || []);
   }).catch(function () { /* banner 已提示 */ });
+  api("GET", "./api/worktrees").then(function (orphans) {
+    renderOrphans(orphans || []);
+  }).catch(function () { /* 拉不到就不显示，不拦任务列表 */ });
+}
+
+function renderOrphans(orphans) {
+  var box = $("orphan-box");
+  box.textContent = "";
+  if (!orphans.length) { box.hidden = true; return; }
+  box.hidden = false;
+  var det = el("details", { class: "orphan-details" }, [
+    el("summary", { text: "发现 " + orphans.length + " 棵孤儿工作树（只提示，不会自动删）" })
+  ]);
+  orphans.forEach(function (o) {
+    det.appendChild(el("div", { class: "orphan-item" }, [
+      el("div", { text: "项目 " + (o.project || "-") + " · 分支 " + (o.branch || "-") }),
+      el("div", { class: "orphan-path mono", text: o.path || "-" }),
+      el("div", { class: "hint", text: o.reason || "" })
+    ]));
+  });
+  box.appendChild(det);
 }
 
 function refreshQuota() {
@@ -314,6 +360,35 @@ function taskActions(item, chainIds) {
     add("看屏幕", "", function () { openScreen(task.id, task.title); });
     add("捎话", "", function () { openMsg(task.id, task.title, item.draft); });
   }
+  // S5③：工作树收口——等合并 / 清完主线重试 / failed·cancelled 有树都能处理
+  var hasTree = !!status.worktree_path;
+  function addKeep() {
+    add("先留着", "", function () {
+      banner("工作树和分支已保留，之后还能回来处理");  // 纯前端 no-op，不打 API
+    });
+  }
+  function addDiscard() {
+    add("丢弃", "danger", function () {
+      if (!confirm("确定丢弃「" + task.title + "」的工作树？")) return;
+      if (!confirm("再确认一次：会永久删除这棵工作树和 ns 分支，未合并内容无法从页面恢复。")) return;
+      api("POST", "./api/tasks/" + task.id + "/discard")
+        .then(function () { banner("已丢弃"); refreshTasks(); })
+        .catch(function () {});
+    });
+  }
+  if (MERGE_BUTTON_STATES.indexOf(state) >= 0 && hasTree) {
+    add("合并进主线", "primary", function () {
+      if (!confirm("把「" + task.title + "」的工作树分支合并进主线？（成功后自动清理工作树与分支）")) return;
+      api("POST", "./api/tasks/" + task.id + "/merge")
+        .then(function (data) { banner(data && data.note ? data.note : "已合并进主线"); refreshTasks(); })
+        .catch(function () { refreshTasks(); });  // 主线脏/冲突：错误留在卡片红字，不显示假成功
+    });
+    addDiscard();
+    addKeep();
+  } else if (hasTree && ["failed", "cancelled", "chain_exhausted", "exited"].indexOf(state) >= 0) {
+    addDiscard();
+    addKeep();
+  }
   if (ACTIVE_STATES.indexOf(state) >= 0 && live) {
     add("中止", status.stuck ? "danger solid" : "danger", function () {
       if (!confirm("往窗口按一下 Esc？它会停下当前这轮，等你看了屏幕再说。")) return;
@@ -356,7 +431,7 @@ function renderTasks(items) {
     var ga = groupOf(a.latest.status.state), gb = groupOf(b.latest.status.state);
     if (ga !== gb) return ga - gb;
     // 终态组按 run_at 降序（最新在前）；其余组保持升序（早的先跑）
-    if (ga === 2) return a.first.task.run_at > b.first.task.run_at ? -1 : 1;
+    if (ga === 3) return a.first.task.run_at > b.first.task.run_at ? -1 : 1;
     return a.first.task.run_at < b.first.task.run_at ? -1 : 1;
   });
   var now = Date.now();
@@ -402,6 +477,23 @@ function taskCard(item, now, chainIds) {
   card.appendChild(el("div", { class: "task-meta", text:
     "项目 " + task.project + " · 模型 " + task.model + " · 档位 " + task.effort +
     (chainIds && chainIds.length > 1 ? " · 共 " + chainIds.length + " 班" : "") }));
+
+  // S5③：工作树任务的分支与施工目录（分支可点复制）
+  if (status.worktree_path || status.branch) {
+    var branchText = status.branch || "-";
+    card.appendChild(el("div", { class: "task-wt" }, [
+      el("span", {
+        class: "wt-branch", text: "🌿 " + branchText, title: "点击复制分支名",
+        onclick: function () {
+          copyText(branchText).then(
+            function () { banner("分支名已复制：" + branchText); },
+            function () { banner("复制失败，分支名：" + branchText); }
+          );
+        }
+      }),
+      el("span", { class: "wt-path", text: status.worktree_path || "" })
+    ]));
+  }
 
   // 计划时间与倒计时 / 等前置 / 已跑时长
   var whenText;
@@ -544,7 +636,8 @@ function schedulePreview() {
     var model = currentModel();
     var text = $("f-text").value;
     if (!project || !text) return;
-    api("POST", "./api/preview", { title: title, project: project, model: model, task_text: text })
+    api("POST", "./api/preview", { title: title, project: project, model: model,
+      task_text: text, worktree: $("f-worktree").checked })
       .then(function (data) {
         if (PROMPT_EDITED) return;
         $("f-prompt").value = data.prompt_final;
@@ -563,6 +656,24 @@ function unmarkPromptEdited() {
   PROMPT_EDITED = false;
   $("tag-edited").classList.remove("show");
   $("btn-regen").hidden = true;
+}
+
+/* ---------- S5③：工作树开关与完工后选择 ---------- */
+
+function syncWorktreeUI() {
+  var on = $("f-worktree").checked;
+  $("f-worktree-off-hint").hidden = on;
+  $("merge-row").hidden = !on;
+  $("f-mergepolicy").disabled = !on || !!(EDIT_TASK && EDIT_TASK.active);
+  schedulePreview();
+}
+
+// 表单 → {worktree, review}；S5 只接受 review.enabled=false（审稿 S7 才有）
+function worktreeFromForm() {
+  return {
+    worktree: $("f-worktree").checked,
+    review: { enabled: false, merge_policy: $("f-mergepolicy").value || "manual" }
+  };
 }
 
 /* ---------- 编辑模式与触发方式（S4③） ---------- */
@@ -592,7 +703,10 @@ function applyEditMode() {
   $("only-create").hidden = active;
   $("prompt-box").hidden = active;
   $("f-prompt").required = !active;
+  // S5③：活跃编辑不许改工作树开关（这一班已经在某个目录里干了）
+  $("f-worktree").disabled = active;
   setTriggerMode(document.querySelector('input[name="f-trigger"]:checked').value);
+  syncWorktreeUI();
 }
 
 function enterCreate() {
@@ -601,6 +715,9 @@ function enterCreate() {
   setTriggerMode("time");
   unmarkPromptEdited();
   WARN_EDITED = false;
+  $("f-worktree").checked = true;   // 新建默认建树
+  $("f-mergepolicy").value = "manual";
+  syncWorktreeUI();
   showView("new");
 }
 
@@ -627,6 +744,10 @@ function enterEdit(item) {
   var runat = task.run_at ? new Date(task.run_at) : null;
   $("f-runat").value = runat && !isNaN(runat) ? toLocalInput(runat) : "";
   $("f-text").value = task.task_text || "";
+
+  // S5③：编辑旧任务缺 worktree 字段必须显示关，不能因新建默认而误翻成开
+  $("f-worktree").checked = task.worktree === true;
+  $("f-mergepolicy").value = (task.review && task.review.merge_policy) || "manual";
 
   $("f-warntokens").value = guards.context_warn_tokens != null ? guards.context_warn_tokens : "";
   $("f-warntext").value = guards.context_warn_text != null ?
@@ -815,17 +936,19 @@ function submitNewForm(ev) {
 
   var guards = guardsFromForm(editing ? (EDIT_TASK.item.task.guards || {}) : null);
   var chain = chainFromForm(editing ? (EDIT_TASK.item.task.chain || {}) : null);
+  var wt = worktreeFromForm();  // S5③：worktree + review 占位形状
 
   var body;
   if (active) {
-    // 这一班正在跑：服务器只认这几个键，其他发了也是白发
+    // 这一班正在跑：服务器只认这几个键，其他发了也是白发（工作树不许改）
     body = { title: title, task_text: text, guards: guards, chain: chain,
              trigger: trigger || { type: "time" } };
   } else {
     body = {
       title: title, project: project, model: model, effort: effort,
       task_text: text, prompt_final: prompt, guards: guards, chain: chain,
-      trigger: trigger || { type: "time" }
+      trigger: trigger || { type: "time" },
+      worktree: wt.worktree, review: wt.review
     };
     if (mode !== "after") body.run_at = runAtIso;  // after 模式不发
   }
@@ -893,7 +1016,7 @@ function start() {
   $("btn-msg-save").addEventListener("click", saveDraft);
   $("btn-msg-delete").addEventListener("click", deleteDraft);
   $("btn-logout").addEventListener("click", function () {
-    if (!confirm("退出登录？之后打开夜班页要重新输口令。想回小予首页请用左上角的链接。")) return;
+    if (!confirm("退出登录？之后打开夜班页要重新输口令。要回主站首页请用左上角的链接。")) return;
     api("POST", "./api/logout").catch(function () {}).then(function () {
       location.href = "./login.html";
     });
@@ -926,6 +1049,7 @@ function start() {
   });
 
   $("new-form").addEventListener("submit", submitNewForm);
+  $("f-worktree").addEventListener("change", syncWorktreeUI);
   $("f-title").addEventListener("input", schedulePreview);
   $("f-project").addEventListener("change", schedulePreview);
   $("f-model").addEventListener("change", function () {

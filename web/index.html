@@ -40,6 +40,7 @@
       <button type="button" id="btn-warmup-add" class="ghost">＋ 再加一个时刻</button>
       <p id="warmup-state" class="hint"></p>
     </div>
+    <div id="orphan-box" class="orphan-box" hidden></div>
     <div id="task-list"><p class="hint">加载中…</p></div>
   </section>
 
@@ -86,6 +87,20 @@
         <label for="f-runat"><b>开跑时间（本地时间，必填，没有默认值）</b></label>
         <input type="datetime-local" id="f-runat" required>
         <p class="hint">留空不能提交。到点后调度器会先做预检（额度、目录信任、同目录互斥）。</p>
+      </div>
+
+      <label><b>工作树</b></label>
+      <div class="choice-row">
+        <label class="inline"><input type="checkbox" id="f-worktree" checked> 隔离工作树（在 <code>&lt;项目&gt;/.claude/worktrees/</code> 里施工，每班收工自动打存档点）</label>
+      </div>
+      <p class="hint" id="f-worktree-off-hint" hidden>老式模式：直接在项目目录施工，不打存档点。</p>
+      <div id="merge-row">
+        <label for="f-mergepolicy"><b>完工后</b></label>
+        <select id="f-mergepolicy">
+          <option value="manual">等我合并（存档后停在工作树，由你合并或丢弃）</option>
+          <option value="auto">自动合并（最后一班存档后自动并进主线）</option>
+        </select>
+        <p class="hint">联动审稿要到 S7 才开放；现在的任务都只施工、不审稿。</p>
       </div>
 
       <label for="f-text"><b>任务内容</b></label>
@@ -145,11 +160,11 @@
   <!-- ============ 模板页 ============ -->
   <section id="view-tpl" hidden>
     <h2>提示词模板</h2>
-    <p class="hint">占位符：{task} {title} {project_path} {context_limit}</p>
+    <p class="hint">占位符：{task} {title} {project_path} {context_limit} {worktree_instruction}（工作树任务渲染成"只在当前工作树施工、不要 commit"的前言，老式任务为空）</p>
     <textarea id="t-prompt" class="mono tall" rows="8"></textarea>
 
     <h2>到线注入的话</h2>
-    <p class="hint">占位符：{ctx_k} {limit_k} {handover_path}</p>
+    <p class="hint">占位符：{ctx_k} {limit_k} {handover_path} {commit_step}（工作树任务渲染为空，老式任务渲染成"把未提交的改动 commit；"）</p>
     <textarea id="t-warntext" class="tall" rows="6"></textarea>
 
     <h2>五小时额度到线：暂停等刷新</h2>
@@ -157,7 +172,7 @@
     <textarea id="t-quotapause" class="tall" rows="5"></textarea>
 
     <h2>周额度到线：收尾交接</h2>
-    <p class="hint">占位符：{week_left} 剩余% · {week_line_left} 线（剩余%）· {model_line_left} 单模型线（剩余%）· {model_note} 单模型周线说明 · {handover_path}</p>
+    <p class="hint">占位符：{week_left} 剩余% · {week_line_left} 线（剩余%）· {model_line_left} 单模型线（剩余%）· {model_note} 单模型周线说明 · {handover_path} · {commit_step}</p>
     <textarea id="t-quotawrap" class="tall" rows="5"></textarea>
 
     <h2>别的模型周额度到线：只提示</h2>
@@ -165,7 +180,7 @@
     <textarea id="t-quotaother" class="tall" rows="4"></textarea>
 
     <h2>续班模板</h2>
-    <p class="hint">占位符：{task} {shift} {handover} {title} {project_path} {context_limit}（系统自动填，改文案别删花括号）</p>
+    <p class="hint">占位符：{task} {shift} {handover} {title} {project_path} {context_limit} {worktree_instruction}（系统自动填，改文案别删花括号）</p>
     <textarea id="t-chain" class="tall" rows="6"></textarea>
 
     <h2>停后台指令</h2>

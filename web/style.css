@@ -114,7 +114,11 @@ button, .btn {
   background: var(--card);
   color: var(--text);
   cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
+button:active { opacity: 0.7; }
+button.primary:active, button.danger.solid:active { opacity: 0.85; transform: scale(0.98); }
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
@@ -188,6 +192,10 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
 .chip.st-failed, .chip.st-needs_attention, .chip.st-chain_exhausted { background: var(--danger); }
 .chip.st-cancelled { background: var(--chip-cancel); }
 .chip.st-chained { background: var(--accent); }
+/* S5③：工作树收尾三态 */
+.chip.st-awaiting_merge { background: var(--warn); color: #201a00; }
+.chip.st-merged { background: var(--ok); }
+.chip.st-discarded { background: var(--chip-cancel); }
 
 .task-when { font-size: 15px; margin-top: 8px; }
 .task-when .count { color: var(--accent); font-weight: 600; }
@@ -385,6 +393,53 @@ button.danger.solid { background: var(--danger); border-color: var(--danger); co
   cursor: pointer;
   word-break: break-all;
 }
+
+/* ---------- S5③：工作树卡片行 / 孤儿提示 ---------- */
+
+.task-wt {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 13px;
+}
+.wt-branch {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 600;
+  cursor: pointer;
+  min-height: 32px;
+  line-height: 32px;
+  border-bottom: 1px dashed var(--accent);
+  color: var(--accent);
+  touch-action: manipulation;
+}
+.wt-branch:active { opacity: 0.6; }
+.wt-path {
+  color: var(--muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.orphan-box {
+  border: 1px solid var(--danger);
+  background: var(--danger-bg);
+}
+.orphan-details summary {
+  cursor: pointer;
+  min-height: 44px;
+  line-height: 44px;
+  font-weight: 600;
+  color: var(--danger);
+}
+.orphan-item {
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+  font-size: 14px;
+  word-break: break-all;
+}
+.orphan-path { margin-top: 2px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
 /* ---------- S4③：捎话弹层 ---------- */
 
