@@ -43,25 +43,50 @@
     <div id="task-list"><p class="hint">加载中…</p></div>
   </section>
 
-  <!-- ============ 新建页 ============ -->
+  <!-- ============ 新建 / 编辑页 ============ -->
   <section id="view-new" hidden>
+    <h2 id="form-title">新建任务</h2>
+    <p id="edit-hint" class="edit-hint" hidden>
+      这一班正在跑：改额度线立即生效，改任务内容影响下一班，这一班的提示词不能改。
+    </p>
     <form id="new-form">
       <label for="f-title"><b>标题</b></label>
       <input type="text" id="f-title" required>
 
-      <label for="f-project"><b>项目</b></label>
-      <select id="f-project" required></select>
+      <div id="only-create">
+        <label for="f-project"><b>项目</b></label>
+        <select id="f-project" required></select>
 
-      <label for="f-model"><b>模型</b></label>
-      <select id="f-model"></select>
-      <input type="text" id="f-model-custom" placeholder="手输模型名" hidden>
+        <label for="f-model"><b>模型</b></label>
+        <select id="f-model"></select>
+        <input type="text" id="f-model-custom" placeholder="手输模型名" hidden>
 
-      <label for="f-effort"><b>思考档位</b></label>
-      <select id="f-effort"></select>
+        <label for="f-effort"><b>思考档位</b></label>
+        <select id="f-effort"></select>
+      </div>
 
-      <label for="f-runat"><b>开跑时间（本地时间，必填，没有默认值）</b></label>
-      <input type="datetime-local" id="f-runat" required>
-      <p class="hint">留空不能提交。到点后调度器会先做预检（额度、目录信任、同目录互斥）。</p>
+      <label><b>触发方式</b></label>
+      <div class="choice-row" id="trigger-radios">
+        <label class="inline"><input type="radio" name="f-trigger" value="time" checked> 按时间</label>
+        <label class="inline"><input type="radio" name="f-trigger" value="after"> 等某任务完工后</label>
+      </div>
+
+      <div id="after-box" hidden>
+        <label for="f-after-task"><b>前置任务（只列各链的根任务）</b></label>
+        <select id="f-after-task"></select>
+        <label for="f-after-when"><b>条件</b></label>
+        <select id="f-after-when">
+          <option value="finished">整条链完工</option>
+          <option value="ended">任一班结束（完工/退出/失败/取消都算）</option>
+        </select>
+        <p class="hint">到点不算数，要等前置任务整条链满足条件才起跑；前置被删会标"需要人工"。</p>
+      </div>
+
+      <div id="time-box">
+        <label for="f-runat"><b>开跑时间（本地时间，必填，没有默认值）</b></label>
+        <input type="datetime-local" id="f-runat" required>
+        <p class="hint">留空不能提交。到点后调度器会先做预检（额度、目录信任、同目录互斥）。</p>
+      </div>
 
       <label for="f-text"><b>任务内容</b></label>
       <textarea id="f-text" class="tall" rows="8" required
@@ -88,6 +113,10 @@
         <input type="number" id="f-modelleft" min="0" max="100" step="1">
         <p class="hint">比如 Fable 有自己的周线。别的模型的周线到了不叫停本会话，只提示一句"别再派它的子 agent"。</p>
 
+        <label for="f-autointerrupt"><b>疑似卡住几分钟后自动按 Esc 中止</b></label>
+        <input type="number" id="f-autointerrupt" min="1" step="1">
+        <p class="hint">留空 = 不自动中止。正经的长构建也会显示卡住，默认不自动中止。</p>
+
         <label for="f-chainmax"><b>一晚最多几班</b></label>
         <input type="number" id="f-chainmax" min="1" max="20" step="1">
 
@@ -98,16 +127,18 @@
         </select>
       </details>
 
-      <div class="prompt-head">
-        <label for="f-prompt"><b>最终提示词（会原样发给会话）</b></label>
-        <span id="tag-edited" class="tag-edited">已手改</span>
-        <button type="button" id="btn-regen" class="ghost" hidden>按模板重新生成</button>
+      <div id="prompt-box">
+        <div class="prompt-head">
+          <label for="f-prompt"><b>最终提示词（会原样发给会话）</b></label>
+          <span id="tag-edited" class="tag-edited">已手改</span>
+          <button type="button" id="btn-regen" class="ghost" hidden>按模板重新生成</button>
+        </div>
+        <textarea id="f-prompt" class="mono tall" rows="10" required></textarea>
+        <p class="hint">标题 / 项目 / 模型 / 任务内容一变就自动按模板刷新；你一旦手改就不再覆盖。</p>
       </div>
-      <textarea id="f-prompt" class="mono tall" rows="10" required></textarea>
-      <p class="hint">标题 / 项目 / 模型 / 任务内容一变就自动按模板刷新；你一旦手改就不再覆盖。</p>
 
       <p id="new-err" class="err" role="alert"></p>
-      <button type="submit" class="primary" style="width:100%">建任务</button>
+      <button type="submit" id="new-submit" class="primary" style="width:100%">建任务</button>
     </form>
   </section>
 
@@ -141,6 +172,23 @@
     <button type="button" id="btn-save-tpl" class="primary" style="width:100%">保存模板</button>
   </section>
   <p class="foot"><button type="button" id="btn-logout" class="link-btn">退出登录（之后要重输口令）</button></p>
+</div>
+
+<!-- ============ 捎话弹层 ============ -->
+<div id="msg-overlay" class="overlay msg-overlay">
+  <div class="msg-card">
+    <div class="overlay-bar">
+      <span class="t" id="msg-title">捎话</span>
+      <button type="button" id="btn-msg-close">关闭</button>
+    </div>
+    <textarea id="msg-text" rows="6" placeholder="要捎给会话的话（发送时多行会折成一行）"></textarea>
+    <p class="hint">立即发送会把文本敲进会话输入框，它下一轮就能看到；草稿先存着不动会话。</p>
+    <div class="msg-btns">
+      <button type="button" id="btn-msg-send" class="primary">立即发送</button>
+      <button type="button" id="btn-msg-save">保存暂不发送</button>
+      <button type="button" id="btn-msg-delete" class="danger">删草稿</button>
+    </div>
+  </div>
 </div>
 
 <!-- ============ 屏幕快照遮罩 ============ -->

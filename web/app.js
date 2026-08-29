@@ -10,6 +10,8 @@ var PROMPT_EDITED = false; // 用户手改过最终提示词
 var WARN_EDITED = false;   // 用户手改过警戒线 tokens
 var HIGHLIGHT_ID = null;   // 新建成功后要高亮的任务
 var SCREEN_TASK = null;    // 正在看屏幕的任务 {id, title}
+var EDIT_TASK = null;      // 正在编辑的任务 {id, item, active}；null = 新建模式
+var MSG_TASK = null;       // 正在捎话的任务 {id, title}
 var screenTimer = null;
 var previewTimer = null;
 
@@ -119,6 +121,7 @@ function showView(name) {
     $("tab-" + v).setAttribute("aria-selected", v === name ? "true" : "false");
   });
   if (name === "tasks") { refreshTasks(); refreshQuota(); }
+  if (name === "new") refreshTriggerChoices();
   if (name === "tpl") loadTemplatesView();
 }
 
@@ -284,6 +287,9 @@ function taskActions(item, chainIds) {
         .catch(function () {});
     });
   }
+  if (RUNNOW_STATES.indexOf(state) >= 0 || ACTIVE_STATES.indexOf(state) >= 0) {
+    add("编辑", "", function () { enterEdit(item); });
+  }
   if (CANCEL_STATES.indexOf(state) >= 0) {
     add("取消", "danger", function () {
       if (!confirm("确定取消「" + task.title + "」？")) return;
@@ -303,8 +309,24 @@ function taskActions(item, chainIds) {
       }, Promise.resolve()).then(function () { refreshTasks(); });
     });
   }
-  if (status.window_id && !status.session_ended_at) {  // 会话已关的窗口抓不到画面
+  var live = status.window_id && !status.session_ended_at;  // 会话已关的窗口动不了
+  if (live) {
     add("看屏幕", "", function () { openScreen(task.id, task.title); });
+    add("捎话", "", function () { openMsg(task.id, task.title, item.draft); });
+  }
+  if (ACTIVE_STATES.indexOf(state) >= 0 && live) {
+    add("中止", status.stuck ? "danger solid" : "danger", function () {
+      if (!confirm("往窗口按一下 Esc？它会停下当前这轮，等你看了屏幕再说。")) return;
+      api("POST", "./api/tasks/" + task.id + "/interrupt")
+        .then(function () { banner("已发出，看屏幕确认"); refreshTasks(); })
+        .catch(function () {});
+    });
+    add("停后台", "", function () {
+      if (!confirm("往窗口敲停后台指令？它会被要求立刻停掉后台任务和子 agent 并停下。")) return;
+      api("POST", "./api/tasks/" + task.id + "/stop-background")
+        .then(function () { banner("已发出，看屏幕确认"); refreshTasks(); })
+        .catch(function () {});
+    });
   }
   return box.childNodes.length ? box : null;
 }
@@ -366,21 +388,29 @@ function taskCard(item, now, chainIds) {
   var state = status.state || "-";
   var card = el("article", { class: "card" + (task.id === HIGHLIGHT_ID ? " flash" : "") });
 
-  card.appendChild(el("div", { class: "task-head" }, [
+  var headKids = [
     el("span", { class: "chip st-" + state, text: STATE_TEXT[state] || state }),
     el("span", { class: "task-title", text: task.title }),
     el("span", { class: "task-id", text: task.id })
-  ]));
+  ];
+  if (status.stuck) {  // S4①：疑似卡住——黄色徽章 + 中止按钮高亮（见 taskActions）
+    var mins = status.stuck_since ?
+      Math.max(0, Math.round((now - new Date(status.stuck_since)) / 60000)) : 0;
+    headKids.push(el("span", { class: "chip stuck-chip", text: "疑似卡住 " + mins + " 分钟" }));
+  }
+  card.appendChild(el("div", { class: "task-head" }, headKids));
   card.appendChild(el("div", { class: "task-meta", text:
     "项目 " + task.project + " · 模型 " + task.model + " · 档位 " + task.effort +
     (chainIds && chainIds.length > 1 ? " · 共 " + chainIds.length + " 班" : "") }));
 
-  // 计划时间与倒计时 / 已跑时长
+  // 计划时间与倒计时 / 等前置 / 已跑时长
   var whenText;
   if (state === "postponed" && status.next_attempt_at) {
     var due = new Date(status.next_attempt_at) - now;
     whenText = "下次尝试 " + fmtLocal(status.next_attempt_at) + "（" +
       (due > 0 ? "还有 " + fmtDelta(due) : "已到点，等下一轮调度") + "）";
+  } else if (item.trigger_text && item.trigger_text !== "按时间") {
+    whenText = item.trigger_text;  // after 任务：不按时间起跑，没有"计划/还有"
   } else if (ACTIVE_STATES.indexOf(state) >= 0 && status.launched_at) {
     whenText = "开跑于 " + fmtLocal(status.launched_at) +
       "（已跑 " + fmtDelta(now - new Date(status.launched_at)) + "）";
@@ -428,6 +458,15 @@ function taskCard(item, now, chainIds) {
   }
   var reason = status.postpone_reason || status.error;
   if (reason) card.appendChild(el("p", { class: "warn-reason", text: reason }));
+
+  if (item.draft) {  // S4②：有一条捎话草稿待发，点它打开弹层
+    var preview = item.draft.replace(/\s+/g, " ").trim().slice(0, 40);
+    card.appendChild(el("div", {
+      class: "draft-line",
+      text: "📝 有一条待发的话：" + preview,
+      onclick: function () { openMsg(task.id, task.title, item.draft); }
+    }));
+  }
 
   if (item.events_tail && item.events_tail.length) {
     var pre = el("pre", { text: item.events_tail.join("\n") });
@@ -499,6 +538,7 @@ function schedulePreview() {
   if (previewTimer) clearTimeout(previewTimer);
   previewTimer = setTimeout(function () {
     if (PROMPT_EDITED) return;
+    if (EDIT_TASK && EDIT_TASK.active) return;  // 这一班的提示词改不了，不预览
     var title = $("f-title").value;
     var project = $("f-project").value;
     var model = currentModel();
@@ -523,6 +563,187 @@ function unmarkPromptEdited() {
   PROMPT_EDITED = false;
   $("tag-edited").classList.remove("show");
   $("btn-regen").hidden = true;
+}
+
+/* ---------- 编辑模式与触发方式（S4③） ---------- */
+
+function toLocalInput(d) {
+  var p = function (n) { return (n < 10 ? "0" : "") + n; };
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+    "T" + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+
+function setTriggerMode(mode) {
+  var after = mode === "after";
+  document.querySelector('input[name="f-trigger"][value="time"]').checked = !after;
+  document.querySelector('input[name="f-trigger"][value="after"]').checked = after;
+  $("after-box").hidden = !after;
+  // after 模式不看时间；活跃编辑本来就不让改时间
+  $("time-box").hidden = after || !!(EDIT_TASK && EDIT_TASK.active);
+  $("f-runat").required = !after && !(EDIT_TASK && EDIT_TASK.active);
+}
+
+function applyEditMode() {
+  var editing = !!EDIT_TASK;
+  var active = editing && EDIT_TASK.active;
+  $("form-title").textContent = editing ? "编辑任务" : "新建任务";
+  $("new-submit").textContent = editing ? "保存修改" : "建任务";
+  $("edit-hint").hidden = !active;
+  $("only-create").hidden = active;
+  $("prompt-box").hidden = active;
+  $("f-prompt").required = !active;
+  setTriggerMode(document.querySelector('input[name="f-trigger"]:checked').value);
+}
+
+function enterCreate() {
+  EDIT_TASK = null;
+  applyEditMode();
+  setTriggerMode("time");
+  unmarkPromptEdited();
+  WARN_EDITED = false;
+  showView("new");
+}
+
+function enterEdit(item) {
+  var task = item.task, status = item.status, guards = task.guards || {};
+  EDIT_TASK = { id: task.id, item: item, active: ACTIVE_STATES.indexOf(status.state) >= 0 };
+  $("f-title").value = task.title || "";
+  if (task.project) $("f-project").value = task.project;
+  var modelSel = $("f-model");
+  if (CFG.models && CFG.models[task.model]) {
+    modelSel.value = task.model;
+    $("f-model-custom").hidden = true;
+  } else {
+    modelSel.value = "__custom__";
+    $("f-model-custom").hidden = false;
+    $("f-model-custom").value = task.model || "";
+  }
+  if ((CFG.efforts || []).indexOf(task.effort) >= 0) $("f-effort").value = task.effort;
+
+  var trigger = task.trigger || { type: "time" };
+  if (trigger.type === "after") $("f-after-when").value = trigger.when || "finished";
+  setTriggerMode(trigger.type === "after" ? "after" : "time");
+
+  var runat = task.run_at ? new Date(task.run_at) : null;
+  $("f-runat").value = runat && !isNaN(runat) ? toLocalInput(runat) : "";
+  $("f-text").value = task.task_text || "";
+
+  $("f-warntokens").value = guards.context_warn_tokens != null ? guards.context_warn_tokens : "";
+  $("f-warntext").value = guards.context_warn_text != null ?
+    guards.context_warn_text : (CFG.context_warn_text || "");
+  WARN_EDITED = guards.context_warn_tokens != null;
+  $("f-sessionleft").value = typeof guards.session_pct_max === "number" ? 100 - guards.session_pct_max : "";
+  $("f-weekleft").value = typeof guards.weekly_pct_max === "number" ? 100 - guards.weekly_pct_max : "";
+  $("f-modelleft").value = typeof guards.model_weekly_pct_max === "number" ? 100 - guards.model_weekly_pct_max : "";
+  $("f-autointerrupt").value = guards.auto_interrupt_minutes != null ? guards.auto_interrupt_minutes : "";
+  $("f-chainmax").value = (task.chain && typeof task.chain.max_windows === "number") ? task.chain.max_windows : "";
+  $("f-nohandover").value = (task.chain && task.chain.on_no_handover) ||
+    (CFG.chain && CFG.chain.on_no_handover) || "continue";
+
+  unmarkPromptEdited();
+  $("f-prompt").value = task.prompt_final || "";
+  applyEditMode();
+  showView("new");  // 里面会刷新前置任务下拉（并保持当前选中）
+}
+
+// 前置任务下拉：按链只列根任务，显示"标题（id 后 4 位）"
+function refreshTriggerChoices() {
+  api("GET", "./api/tasks").then(function (items) {
+    var sel = $("f-after-task");
+    var want = EDIT_TASK ?
+      String((EDIT_TASK.item.task.trigger || {}).task || "") : "";
+    sel.textContent = "";
+    groupChains(items || []).forEach(function (chain) {
+      var rep = chain.first.task;  // 展示用：链根任务的标题
+      sel.appendChild(el("option", {
+        value: chain.root,
+        text: rep.title + "（" + chain.root.slice(-4) + "）"
+      }));
+    });
+    var found = Array.prototype.some.call(sel.options, function (o) { return o.value === want; });
+    if (want && !found)  // 当前前置不在列表里（比如不是根任务），原样列出来免得静默丢
+      sel.appendChild(el("option", { value: want, text: "（id " + want.slice(-4) + "）" }));
+    if (want) sel.value = want;
+  }).catch(function () { /* 列表拉不到就不填，提交时会校验 */ });
+}
+
+// 表单 → guards：编辑时在任务已有 guards 上覆盖（keepalive 等表单外键不动）
+function guardsFromForm(base) {
+  var guards = base ? Object.assign({}, base) : {};
+  var cfgText = CFG.context_warn_text || "";
+  var warn = $("f-warntokens").value;
+  if (warn !== "") guards.context_warn_tokens = Number(warn);
+  else delete guards.context_warn_tokens;
+  var wtext = $("f-warntext").value;
+  if (wtext !== cfgText) guards.context_warn_text = wtext;
+  else delete guards.context_warn_text;
+  var sl = $("f-sessionleft").value;
+  if (sl !== "") guards.session_pct_max = 100 - Number(sl);
+  else if (base) delete guards.session_pct_max;
+  var wl = $("f-weekleft").value;
+  if (wl !== "") guards.weekly_pct_max = 100 - Number(wl);
+  else if (base) delete guards.weekly_pct_max;
+  var ml = $("f-modelleft").value;
+  if (ml !== "") guards.model_weekly_pct_max = 100 - Number(ml);
+  else if (base) delete guards.model_weekly_pct_max;
+  var ai = $("f-autointerrupt").value;
+  if (ai !== "") guards.auto_interrupt_minutes = Number(ai);
+  else delete guards.auto_interrupt_minutes;
+  return guards;
+}
+
+function chainFromForm(base) {
+  var chain = base ? Object.assign({}, base) : {};
+  var max = $("f-chainmax").value;
+  if (max !== "") chain.max_windows = Number(max);
+  else if (base) delete chain.max_windows;
+  var nh = $("f-nohandover").value;
+  var cfgNh = (CFG.chain && CFG.chain.on_no_handover) || "continue";
+  if (nh !== cfgNh) chain.on_no_handover = nh;
+  else if (base) delete chain.on_no_handover;
+  return chain;
+}
+
+/* ---------- 捎话弹层（S4③） ---------- */
+
+function openMsg(id, title, draft) {
+  MSG_TASK = { id: id, title: title };
+  $("msg-title").textContent = "捎话 · " + title;
+  $("msg-text").value = draft || "";
+  $("btn-msg-delete").hidden = !draft;
+  $("msg-overlay").classList.add("show");
+  $("msg-text").focus();
+}
+
+function closeMsg() {
+  MSG_TASK = null;
+  $("msg-overlay").classList.remove("show");
+  refreshTasks();  // 草稿行/按钮状态以服务器为准
+}
+
+function sendMessage() {
+  if (!MSG_TASK) return;
+  var text = $("msg-text").value;
+  if (!text.trim()) { banner("先写点什么再发"); return; }
+  api("POST", "./api/tasks/" + MSG_TASK.id + "/message", { text: text, send: true })
+    .then(function () { closeMsg(); banner("已发出，看屏幕确认"); })
+    .catch(function () {});
+}
+
+function saveDraft() {
+  if (!MSG_TASK) return;
+  var text = $("msg-text").value;
+  if (!text.trim()) { banner("先写点什么再存"); return; }
+  api("POST", "./api/tasks/" + MSG_TASK.id + "/message", { text: text, send: false })
+    .then(function () { closeMsg(); banner("草稿已存，还没发"); })
+    .catch(function () {});
+}
+
+function deleteDraft() {
+  if (!MSG_TASK) return;
+  api("DELETE", "./api/tasks/" + MSG_TASK.id + "/message")
+    .then(function () { closeMsg(); banner("草稿已删"); })
+    .catch(function () {});
 }
 
 function populateNewForm() {
@@ -561,6 +782,8 @@ function submitNewForm(ev) {
   ev.preventDefault();
   var errBox = $("new-err");
   errBox.textContent = "";
+  var editing = !!EDIT_TASK;
+  var active = editing && EDIT_TASK.active;
   var title = $("f-title").value.trim();
   var project = $("f-project").value;
   var model = currentModel();
@@ -570,38 +793,52 @@ function submitNewForm(ev) {
   var prompt = $("f-prompt").value;
 
   if (!title) { errBox.textContent = "标题不能为空"; return; }
-  if (!project) { errBox.textContent = "项目不能为空"; return; }
-  if (!model) { errBox.textContent = "模型不能为空（选一个或手输）"; return; }
-  if (!runAtRaw) { errBox.textContent = "开跑时间不能为空——没有默认时间，请自己选"; return; }
+  if (!active) {
+    if (!project) { errBox.textContent = "项目不能为空"; return; }
+    if (!model) { errBox.textContent = "模型不能为空（选一个或手输）"; return; }
+  }
   if (!text.trim()) { errBox.textContent = "任务内容不能为空"; return; }
-  if (!prompt.trim()) { errBox.textContent = "最终提示词不能为空"; return; }
 
+  // 触发方式：after 模式不发 run_at（run_at 只是排序用）
+  var mode = document.querySelector('input[name="f-trigger"]:checked').value;
+  var trigger = null;
   var runAtIso;
-  try { runAtIso = new Date(runAtRaw).toISOString(); }
-  catch (e) { errBox.textContent = "开跑时间认不出来"; return; }
+  if (mode === "after") {
+    var pre = $("f-after-task").value;
+    if (!pre) { errBox.textContent = "先选一个前置任务"; return; }
+    trigger = { type: "after", task: pre, when: $("f-after-when").value };
+  } else if (!active) {
+    if (!runAtRaw) { errBox.textContent = "开跑时间不能为空——没有默认时间，请自己选"; return; }
+    try { runAtIso = new Date(runAtRaw).toISOString(); }
+    catch (e) { errBox.textContent = "开跑时间认不出来"; return; }
+  }
 
-  var guards = {};
-  var warnTokens = $("f-warntokens").value;
-  if (warnTokens !== "") guards.context_warn_tokens = Number(warnTokens);
-  if ($("f-warntext").value !== (CFG.context_warn_text || ""))
-    guards.context_warn_text = $("f-warntext").value;
-  if ($("f-sessionleft").value !== "") guards.session_pct_max = 100 - Number($("f-sessionleft").value);
-  if ($("f-weekleft").value !== "") guards.weekly_pct_max = 100 - Number($("f-weekleft").value);
-  if ($("f-modelleft").value !== "") guards.model_weekly_pct_max = 100 - Number($("f-modelleft").value);
-  var chain = {};
-  if ($("f-chainmax").value !== "")
-    chain.max_windows = Number($("f-chainmax").value);
-  if (CFG.chain && $("f-nohandover").value !== CFG.chain.on_no_handover)
-    chain.on_no_handover = $("f-nohandover").value;
+  var guards = guardsFromForm(editing ? (EDIT_TASK.item.task.guards || {}) : null);
+  var chain = chainFromForm(editing ? (EDIT_TASK.item.task.chain || {}) : null);
 
-  api("POST", "./api/tasks", {
-    title: title, project: project, model: model, effort: effort,
-    run_at: runAtIso, task_text: text, prompt_final: prompt,
-    guards: guards, chain: chain
-  }).then(function (data) {
-    HIGHLIGHT_ID = data.id;
+  var body;
+  if (active) {
+    // 这一班正在跑：服务器只认这几个键，其他发了也是白发
+    body = { title: title, task_text: text, guards: guards, chain: chain,
+             trigger: trigger || { type: "time" } };
+  } else {
+    body = {
+      title: title, project: project, model: model, effort: effort,
+      task_text: text, prompt_final: prompt, guards: guards, chain: chain,
+      trigger: trigger || { type: "time" }
+    };
+    if (mode !== "after") body.run_at = runAtIso;  // after 模式不发
+  }
+
+  var req = editing ?
+    api("PUT", "./api/tasks/" + EDIT_TASK.id, body) :
+    api("POST", "./api/tasks", body);
+  req.then(function (data) {
+    if (editing) HIGHLIGHT_ID = EDIT_TASK.id;
+    else HIGHLIGHT_ID = data.id;
+    EDIT_TASK = null;
     showView("tasks");
-    banner("任务已建：" + data.id);
+    banner(editing ? "已保存修改" : "任务已建：" + HIGHLIGHT_ID);
   }).catch(function () { /* 错误已显示 */ });
 }
 
@@ -639,8 +876,20 @@ function saveTemplates() {
 
 function start() {
   $("tab-tasks").addEventListener("click", function () { showView("tasks"); });
-  $("tab-new").addEventListener("click", function () { showView("new"); });
+  $("tab-new").addEventListener("click", enterCreate);
   $("tab-tpl").addEventListener("click", function () { showView("tpl"); });
+  // 触发方式单选：切显示"按时间/等前置"
+  Array.prototype.forEach.call(
+    document.querySelectorAll('input[name="f-trigger"]'),
+    function (radio) {
+      radio.addEventListener("change", function () { setTriggerMode(radio.value); });
+    }
+  );
+  // 捎话弹层
+  $("btn-msg-close").addEventListener("click", closeMsg);
+  $("btn-msg-send").addEventListener("click", sendMessage);
+  $("btn-msg-save").addEventListener("click", saveDraft);
+  $("btn-msg-delete").addEventListener("click", deleteDraft);
   $("btn-logout").addEventListener("click", function () {
     if (!confirm("退出登录？之后打开夜班页要重新输口令。想回小予首页请用左上角的链接。")) return;
     api("POST", "./api/logout").catch(function () {}).then(function () {

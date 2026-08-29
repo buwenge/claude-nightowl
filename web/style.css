@@ -352,3 +352,63 @@ fieldset.box summary { cursor: pointer; min-height: 44px; line-height: 44px; fon
 .warmup-times .row { display: flex; align-items: center; gap: 8px; }
 .warmup-times input[type="time"] { width: auto; min-height: 40px; padding: 0 8px; }
 .warmup-times .x { min-height: 40px; min-width: 40px; }
+
+/* ---------- S4③：触发方式单选 / 编辑模式 ---------- */
+
+.choice-row { display: flex; gap: 18px; flex-wrap: wrap; }
+.choice-row label.inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0;
+  color: var(--text);
+}
+
+.edit-hint {
+  background: var(--accent-weak);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 14px;
+  margin: 10px 0 0;
+}
+
+.stuck-chip { background: var(--warn); color: #201a00; }
+
+/* 卡住时中止按钮高亮：实心红 */
+button.danger.solid { background: var(--danger); border-color: var(--danger); color: #fff; font-weight: 600; }
+
+.draft-line {
+  font-size: 14px;
+  margin-top: 8px;
+  color: var(--warn);
+  cursor: pointer;
+  word-break: break-all;
+}
+
+/* ---------- S4③：捎话弹层 ---------- */
+
+.msg-overlay {
+  justify-content: center;
+  align-items: center;
+  background: rgba(0, 0, 0, 0.6);
+  padding: 16px;
+}
+.msg-card {
+  background: var(--card);
+  color: var(--text);
+  border-radius: 14px;
+  padding: 14px;
+  width: 100%;
+  max-width: 560px;
+  display: flex;
+  flex-direction: column;
+}
+.msg-card .overlay-bar {
+  color: var(--text);
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 10px;
+  padding: 0 0 8px;
+}
+.msg-btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.msg-btns button { flex: 1; min-width: 120px; }
