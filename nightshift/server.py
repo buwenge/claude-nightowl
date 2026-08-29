@@ -75,6 +75,7 @@ _TERMINAL_STATES = (
 _EDITABLE_UNRUN = (
     "title", "project", "model", "effort", "run_at",
     "task_text", "prompt_final", "guards", "chain", "trigger",
+    "worktree", "review",  # S5：没起跑还能改工作树/审稿占位形状
 )
 # 活跃状态（launching/working/waiting_background/waiting_wakeup/idle）：
 # 只许改标题/任务内容/额度与上下文线/换班设置/触发方式
@@ -322,6 +323,10 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._require_auth():
                 return
             return self._api_list_tasks()
+        if path == "/api/worktrees":
+            if not self._require_auth():
+                return
+            return self._api_worktrees()
         if path == "/api/quota":
             if not self._require_auth():
                 return
@@ -532,7 +537,10 @@ class _Handler(BaseHTTPRequestHandler):
         cfg = store.load_config()
         if project not in (cfg.get("projects") or {}):
             return self._send_json(400, {"error": f"project 不在 config.projects 里：{project}"})
-        prompt = store.build_prompt(cfg, title, str(project), str(model or ""), task_text)
+        prompt = store.build_prompt(
+            cfg, title, str(project), str(model or ""), task_text,
+            worktree=bool(data.get("worktree")),
+        )
         return self._send_json(200, {"prompt_final": prompt})
 
     # ---------- 任务 ----------
@@ -545,6 +553,20 @@ class _Handler(BaseHTTPRequestHandler):
             item["trigger_text"] = _trigger_text(item["task"])
             item["draft"] = self._read_draft(task_id)
         return self._send_json(200, items)
+
+    def _api_worktrees(self) -> None:
+        """孤儿工作树列表（S5 只读：只提示，绝不自动删）。"""
+        path = store.home() / "orphan_worktrees.json"
+        orphans: list = []
+        if path.is_file():
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    orphans = data
+            except (OSError, ValueError):
+                orphans = []
+        return self._send_json(200, orphans)
 
     def _api_task_detail(self, task_id: str) -> None:
         try:
@@ -569,11 +591,15 @@ class _Handler(BaseHTTPRequestHandler):
             key: data.get(key)
             for key in ("title", "project", "model", "effort", "run_at", "task_text", "prompt_final")
         }
-        for key in ("guards", "chain", "trigger"):
+        for key in ("guards", "chain", "trigger", "review"):
             if data.get(key) is not None:
                 if not isinstance(data[key], dict):
                     return self._send_json(400, {"error": f"{key} 必须是对象"})
                 task[key] = data[key]
+        if data.get("worktree") is not None:
+            if not isinstance(data["worktree"], bool):
+                return self._send_json(400, {"error": "worktree 必须是布尔值"})
+            task["worktree"] = data["worktree"]
         try:
             task_id = store.create_task(task, store.load_config())
         except ValueError as exc:

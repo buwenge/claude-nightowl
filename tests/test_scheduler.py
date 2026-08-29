@@ -4,6 +4,7 @@ launcher / quota 全部 monkeypatch 成可控假函数；时间用固定的 awar
 """
 
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -228,25 +229,46 @@ def test_postpone_past_deadline_fails_with_window(monkeypatch):
 # ---------- 同目录不并跑 / 目录信任 ----------
 
 
-def test_same_project_busy_postpones_without_window(monkeypatch):
-    fakes = Fakes(monkeypatch)  # 窗口在、pid 在
-    busy = make_task(title="在跑的")
+def test_same_project_worktree_parallel_matrix(monkeypatch):
+    """S5 同项目并跑矩阵：true/true 不互挡；只要一方是 false 仍按一期同目录锁推迟。"""
+    for busy_wt, cand_wt, blocked in ((True, True, False), (True, False, True),
+                                      (False, True, True), (False, False, True)):
+        fakes = Fakes(monkeypatch)  # 窗口在、pid 在
+        shutil.rmtree(store.home() / "tasks", ignore_errors=True)  # 每格重开一局
+        busy = make_task(title="在跑的", worktree=busy_wt)
+        store.update_status(busy, state="working", window_id="@1", pane_pid=NO_PID)
+        cand = make_task(title="同目录的", worktree=cand_wt)
+
+        fakes.now = NOW
+        scheduler.tick(CONFIG, NOW)
+
+        status = store.read_status(cand)
+        if blocked:
+            assert status["state"] == "postponed", (busy_wt, cand_wt)
+            assert "还在跑" in status["postpone_reason"]
+            assert status["postponed_count"] == 1
+            assert fakes.notice_calls == []  # 同目录推迟不开窗口
+            assert fakes.launch_calls == []
+        else:
+            assert status["state"] == "launching", (busy_wt, cand_wt)
+            assert fakes.launch_calls == [cand]
+        assert store.read_status(busy)["state"] == "working"
+
+
+def test_worktree_false_postpones_with_reason(monkeypatch):
+    """老式任务撞上同项目活跃任务：推迟原因照旧，不开窗口。"""
+    fakes = Fakes(monkeypatch)
+    busy = make_task(title="在跑的", worktree=False)
     store.update_status(busy, state="working", window_id="@1", pane_pid=NO_PID)
-    same_dir = make_task(title="同目录的")
-    other_dir = make_task(title="别的目录", project="other")
+    same_dir = make_task(title="老式同目录", worktree=False)
 
     fakes.now = NOW
     scheduler.tick(CONFIG, NOW)
 
     status = store.read_status(same_dir)
     assert status["state"] == "postponed"
-    assert "还在跑" in status["postpone_reason"]
-    assert status["postponed_count"] == 1
-    assert fakes.notice_calls == []  # 同目录推迟不开窗口
-    # 另一个目录不受影响，照常起跑
-    assert sorted(fakes.launch_calls) == [other_dir]
-    assert store.read_status(other_dir)["state"] == "launching"
-    assert store.read_status(busy)["state"] == "working"
+    assert busy in status["postpone_reason"]
+    assert fakes.notice_calls == []
 
 
 def test_untrusted_project_fails_without_postpone(monkeypatch):

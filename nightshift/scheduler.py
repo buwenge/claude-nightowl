@@ -18,9 +18,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import launcher, quota, store, warmup
+from . import launcher, quota, store, warmup, worktree
 
-__all__ = ["parse_iso", "to_iso", "tick", "run_forever"]
+__all__ = ["parse_iso", "to_iso", "tick", "run_forever", "reconcile_worktrees"]
 
 # retry_max 的兜底值（task.json 里没写时按 3）
 DEFAULT_RETRY_MAX = 3
@@ -188,7 +188,10 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
             f"目录未信任，请先手动在该目录开一次 claude：{project_path}",
         )
 
-    # b. 同目录不并跑：开第二个窗口两边抢文件系统，纯坏事
+    # b. 同目录不并跑：开第二个窗口两边抢文件系统，纯坏事。
+    # S5 起：两个 worktree=true 的流水线各在各的树里施工，互不相干，允许并跑；
+    # 只要候选或正在跑的一方是 worktree=false（一期老路径，直接在项目目录），
+    # 仍按一期同目录锁推迟
     for other in store.list_tasks():
         if other["task"]["id"] == task_id:
             continue
@@ -196,6 +199,8 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
             other["task"]["project"] == task["project"]
             and other["status"].get("state") in ACTIVE_STATES
         ):
+            if worktree.wants_worktree(task) and worktree.wants_worktree(other["task"]):
+                continue
             reason = f"同目录任务 {other['task']['id']} 还在跑"
             return _postpone(task, status, config, now, reason, notify=False)
 
@@ -681,6 +686,17 @@ def _maybe_refresh_quota(
         payload = {"error": str(exc), "fetched_at": to_iso(now)}
     store.atomic_write_json(qpath, payload)
     actions.append("已刷新 quota.json")
+
+
+# ---------- 启动对账（S5：孤儿工作树只提示，绝不自动删） ----------
+
+
+def reconcile_worktrees(config: dict) -> list[dict]:
+    """服务启动时（长期循环前一次；--once 也跑一次）对账所有项目的工作树：
+    孤儿树写 orphan_worktrees.json（无孤儿也原子写 []），引用丢失的任务标
+    needs_attention。返回孤儿列表给调用方留日志。"""
+    result = worktree.reconcile_all(config)
+    return result["orphans"]
 
 
 # ---------- 常驻主循环 ----------

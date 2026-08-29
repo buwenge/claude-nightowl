@@ -80,7 +80,17 @@ def tmux_session():
 def trusted_env(tmp_path, monkeypatch, tmux_session):
     """假 claude + 假信任记录 + 假 /usage 文件 + 参数日志，都指到 tmp。"""
     proj = tmp_path / "proj"
+    # S5：工作树任务的项目必须是 Git 仓库（树建在 .claude/worktrees/ 下）
     proj.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=proj, check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.email", "ns@example.test"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.name", "ns"],
+                   check=True, capture_output=True)
+    (proj / "README.md").write_text("demo\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(proj), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(proj), "commit", "-q", "-m", "init"],
+                   check=True, capture_output=True)
     claude_json = tmp_path / "claude.json"
     claude_json.write_text(
         json.dumps({"projects": {str(proj): {"hasTrustDialogAccepted": True}}}),

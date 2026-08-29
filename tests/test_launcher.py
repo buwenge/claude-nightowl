@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from nightshift import launcher, store
+from nightshift import launcher, store, worktree
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -120,7 +120,20 @@ def test_write_task_files(tmp_path):
 
     settings = json.loads((d / "settings.json").read_text(encoding="utf-8"))
     assert len(settings["hooks"]) == 7
-    assert (d / "prompt.txt").read_text(encoding="utf-8") == task["prompt_final"]
+    # S5：新任务缺省 worktree=true，prompt.txt 必须带运行时安全前言（不可遗漏），
+    # 且原文仍在；老式任务（显式 false）prompt.txt 与 prompt_final 一字不差
+    prompt_txt = (d / "prompt.txt").read_text(encoding="utf-8")
+    assert prompt_txt.startswith(store.WORKTREE_INSTRUCTION)
+    assert prompt_txt.endswith(task["prompt_final"])
+    task_id2, config2 = make_task(
+        project_path="/home/user/projects/demo", worktree=False
+    )
+    launcher.write_task_files(
+        store.load_task(task_id2), config2, "01234567-89ab-cdef-0123-456789abcdee"
+    )
+    assert (store.task_dir(task_id2) / "prompt.txt").read_text(
+        encoding="utf-8"
+    ) == store.load_task(task_id2)["prompt_final"]
 
 
 def test_claude_bin_env_override(tmp_path, monkeypatch):
@@ -186,7 +199,7 @@ def tmux_session():
 def trusted_env(tmux_session, tmp_path, monkeypatch):
     """假 claude + 假信任记录 + 参数日志，都指到 tmp。"""
     proj = tmp_path / "proj"
-    proj.mkdir()
+    init_git_repo(proj)
     claude_json = tmp_path / "claude.json"
     claude_json.write_text(
         json.dumps({"projects": {str(proj): {"hasTrustDialogAccepted": True}}}),
@@ -205,6 +218,20 @@ def trusted_env(tmux_session, tmp_path, monkeypatch):
         capture_output=True,
     )
     return {"proj": proj, "fake_log": fake_log}
+
+
+def init_git_repo(path: Path) -> None:
+    """把目录变成最小 Git 仓库（S5：工作树任务的项目必须是 Git 仓库）。"""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "ns@example.test"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "ns"],
+                   check=True, capture_output=True)
+    (path / "README.md").write_text("demo\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "init"],
+                   check=True, capture_output=True)
 
 
 def wait_for_state(task_id: str, timeout: float = 15.0):
@@ -275,7 +302,10 @@ def test_launch_full_cycle(tmux_session, trusted_env, tmp_path):
     if prompt_txt.endswith("\n"):
         prompt_txt = prompt_txt[:-1]
     assert prompt_arg == prompt_txt
-    assert prompt_arg == "第一行 有空格\n第二行 *.py $HOME it's\n第三行"
+    # S5：新任务缺省建树，prompt.txt 前面多了运行时安全前言，任务原文原样跟在后面
+    assert prompt_arg == store.WORKTREE_INSTRUCTION + "\n\n" + (
+        "第一行 有空格\n第二行 *.py $HOME it's\n第三行"
+    )
 
 
 def test_launch_untrusted_opens_failure_window(tmux_session, trusted_env, tmp_path):
@@ -305,7 +335,7 @@ def test_tmux_targets_use_session_colon(tmp_path, monkeypatch):
     """-t 目标必须是 "会话名:"——不带冒号时 tmux 会先按窗口名解析，
     会话里恰好有个同名窗口就会撞 index（8/27 真机踩到：用户当前窗口就叫 claude）。"""
     proj = tmp_path / "proj"
-    proj.mkdir()
+    init_git_repo(proj)
     claude_json = tmp_path / "claude.json"
     claude_json.write_text(
         json.dumps({"projects": {str(proj): {"hasTrustDialogAccepted": True}}}),
@@ -360,10 +390,88 @@ def test_notice_window_suffix_and_send_keys(tmp_path, monkeypatch):
     assert calls == [("send-keys", "-t", "@7", "保活探针", "Enter")]
 
 
+def test_launch_worktree_cwd_and_transcript(tmp_path, monkeypatch):
+    """S5①：worktree=true 的 run.sh cd 到工作树、transcript 按实际 cwd 编码；
+    worktree=false 仍 cd 主目录。tmux 用假的，不起真窗口。"""
+    proj = tmp_path / "proj"
+    init_git_repo(proj)
+    claude_json = tmp_path / "claude.json"
+    claude_json.write_text(
+        json.dumps({"projects": {str(proj): {"hasTrustDialogAccepted": True}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NIGHTSHIFT_CLAUDE_JSON", str(claude_json))
+    monkeypatch.setattr(
+        launcher, "_tmux",
+        lambda *a: subprocess.CompletedProcess(a, 0, "@1\n" if a[0] == "new-window" else "123\n", ""),
+    )
+
+    task_id, config = make_task(str(proj))
+    status = launcher.launch(task_id, config)
+    assert status["state"] == "launching"
+    slug = worktree.slug_for(task_id, "集成测试任务")
+    wt = proj / ".claude" / "worktrees" / slug
+    assert wt.is_dir()
+    run_sh = (store.task_dir(task_id) / "run.sh").read_text(encoding="utf-8")
+    assert f"cd '{wt}'" in run_sh
+    st = store.read_status(task_id)
+    assert st["worktree_path"] == str(wt)
+    assert st["branch"] == f"ns/{slug}"
+    assert len(st["base_ref"]) == 40
+    encoded = str(wt).replace("/", "-").replace(".", "-")
+    assert st["transcript_path"] == str(
+        Path.home() / ".claude" / "projects" / encoded / f"{st['session_id']}.jsonl"
+    )
+    # prompt.txt 带运行时安全前言（模板没写占位符也跑不掉）
+    prompt_txt = (store.task_dir(task_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert prompt_txt.startswith(store.WORKTREE_INSTRUCTION)
+
+    # 老式任务：不建树、cd 主目录、transcript 按主目录编码
+    task_id2, _ = make_task(str(proj), worktree=False)
+    status2 = launcher.launch(task_id2, config)
+    assert status2["state"] == "launching"
+    run_sh2 = (store.task_dir(task_id2) / "run.sh").read_text(encoding="utf-8")
+    assert f"cd '{proj}'" in run_sh2
+    assert ".claude/worktrees" not in run_sh2
+    st2 = store.read_status(task_id2)
+    assert "worktree_path" not in st2
+    encoded2 = str(proj).replace("/", "-").replace(".", "-")
+    assert st2["transcript_path"].startswith(
+        str(Path.home() / ".claude" / "projects" / encoded2)
+    )
+    assert not ((proj / ".claude" / "worktrees").exists() and
+                any(p.name != slug for p in (proj / ".claude" / "worktrees").iterdir()))
+
+
+def test_launch_ensure_failure_fails_task(tmp_path, monkeypatch):
+    """建树失败（非 Git 项目）→ 任务 failed、错误人话、不开窗口。"""
+    proj = tmp_path / "plain"
+    proj.mkdir()
+    claude_json = tmp_path / "claude.json"
+    claude_json.write_text(
+        json.dumps({"projects": {str(proj): {"hasTrustDialogAccepted": True}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NIGHTSHIFT_CLAUDE_JSON", str(claude_json))
+    monkeypatch.setattr(
+        launcher, "_tmux",
+        lambda *a: subprocess.CompletedProcess(a, 0, "@1\n" if a[0] == "new-window" else "123\n", ""),
+    )
+    task_id, config = make_task(str(proj))
+    status = launcher.launch(task_id, config)
+    assert status["state"] == "failed"
+    assert "建工作树失败" in status["error"]
+    assert "Git 仓库" in status["error"]
+    # run-now 的直接 CLI 路径也走 launch，绕不过建树
+    store.update_status(task_id, state="scheduled")
+    status2 = launcher.launch(task_id, config)
+    assert status2["state"] == "failed"
+
+
 def test_launch_clears_stale_error(tmp_path, monkeypatch):
     """重跑成功后旧的 error/postpone_reason 必须清掉——否则卡片一直显示上一次失败原因。"""
     proj = tmp_path / "proj"
-    proj.mkdir()
+    init_git_repo(proj)
     claude_json = tmp_path / "claude.json"
     claude_json.write_text(
         json.dumps({"projects": {str(proj): {"hasTrustDialogAccepted": True}}}),

@@ -391,6 +391,103 @@ def test_create_task_value_errors_are_400(authed):
     assert status == 400
 
 
+# ---------- S5①：worktree / review 字段与孤儿工作树 API ----------
+
+
+def test_create_task_worktree_fields(authed):
+    # 缺省：服务器不塞字段，create_task 落盘时补 true + review 占位形状
+    task_id = make_task(authed, "默认建树")
+    task = store.load_task(task_id)
+    assert task["worktree"] is True
+    assert task["review"] == {"enabled": False, "merge_policy": "manual"}
+    # 显式 worktree=false + auto
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "老式任务", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+        "worktree": False, "review": {"enabled": False, "merge_policy": "auto"},
+    })
+    assert status == 201, body
+    task = store.load_task(body["id"])
+    assert task["worktree"] is False
+    assert task["review"] == {"enabled": False, "merge_policy": "auto"}
+    # 非法值：400 带人话
+    base = {
+        "title": "非法", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+    }
+    status, _, body = authed.request(
+        "POST", "/api/tasks", {**base, "worktree": "yes"})
+    assert status == 400
+    status, _, body = authed.request(
+        "POST", "/api/tasks", {**base, "review": {"enabled": True}})
+    assert status == 400
+    assert "S7" in body["error"]
+    status, _, body = authed.request(
+        "POST", "/api/tasks", {**base, "review": {"enabled": False, "merge_policy": "yolo"}})
+    assert status == 400
+
+
+def test_preview_worktree_instruction(authed, ns_home):
+    # {worktree_instruction} 是可选占位符：模板里有才会渲染
+    cfg = store.load_config()
+    cfg["prompt_template"] = "项目 {project_path}｜任务：{title}\n\n{task}\n\n{worktree_instruction}上下文上限 {context_limit}。"
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    body = {
+        "title": "T", "project": "demo", "model": "claude-fable-5",
+        "task_text": "正文",
+    }
+    status, _, data = authed.request("POST", "/api/preview", body)
+    assert status == 200
+    plain = data["prompt_final"]
+    status, _, data = authed.request("POST", "/api/preview", {**body, "worktree": True})
+    assert status == 200
+    assert store.WORKTREE_INSTRUCTION in data["prompt_final"]
+    assert store.WORKTREE_INSTRUCTION not in plain
+
+
+def test_put_task_worktree_review_edit_rules(authed):
+    # 未跑：可改 worktree / review
+    task_id = make_task(authed, "未跑可改树")
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {
+        "worktree": False, "review": {"enabled": False, "merge_policy": "auto"},
+    })
+    assert status == 200, body
+    task = store.load_task(task_id)
+    assert task["worktree"] is False
+    assert task["review"]["merge_policy"] == "auto"
+    # review.enabled=true 一样被 400 拦下，task.json 不被写坏
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {
+        "review": {"enabled": True},
+    })
+    assert status == 400 and "S7" in body["error"]
+    assert store.load_task(task_id)["review"]["enabled"] is False
+    # 活跃编辑：worktree / review 不在允许键里
+    store.update_status(task_id, state="working")
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {
+        "worktree": True,
+    })
+    assert status == 400
+    assert store.load_task(task_id)["worktree"] is False
+
+
+def test_worktrees_api_requires_auth_and_lists_orphans(authed, ns_home):
+    status, _, _ = Client(authed.base).request("GET", "/api/worktrees", csrf=False)
+    assert status == 401
+    # 没有文件 → 空列表
+    status, _, body = authed.request("GET", "/api/worktrees")
+    assert status == 200 and body == []
+    store.atomic_write_json(ns_home / "orphan_worktrees.json", [
+        {"project": "demo", "path": "/p/.claude/worktrees/x",
+         "branch": "ns/x", "reason": "夜班工作树没有任务引用它（任务被删了？），只提示不自动删"},
+    ])
+    status, _, body = authed.request("GET", "/api/worktrees")
+    assert status == 200
+    assert isinstance(body, list) and len(body) == 1
+    assert set(body[0]) == {"project", "path", "branch", "reason"}
+
+
 # ---------- 任务操作：run-now / cancel / delete / 详情 / 列表 / screen ----------
 
 

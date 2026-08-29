@@ -23,6 +23,7 @@ __all__ = [
     "ConfigMissing",
     "ENDED_STATES",
     "STATES",
+    "WORKTREE_INSTRUCTION",
     "append_event",
     "atomic_write_json",
     "atomic_write_text",
@@ -43,6 +44,7 @@ __all__ = [
     "update_status",
     "utc_now_iso",
     "validate_task",
+    "worktree_enabled",
 ]
 
 
@@ -78,6 +80,16 @@ _REQUIRED_FIELDS = (
     "task_text",
     "prompt_final",
 )
+
+# S5：工作树任务提示词里的运行时安全前言（经 {worktree_instruction} 占位符
+# 渲染进模板；launcher 还会在 prompt.txt 缺它时补一层，保证不可遗漏）
+WORKTREE_INSTRUCTION = (
+    "只在当前工作树里施工，不要切回主签出目录；不要 git commit，"
+    "调度器会在每班收工后替你打存档点。完成或换班时照常写交接，"
+    "末行写 NEXT: done 或 NEXT: continue。"
+)
+# review.merge_policy 只认这两个值（S7 扩写同一个 review 对象，不做二次迁移）
+_MERGE_POLICIES = ("manual", "auto")
 
 # trigger.type == "after" 且 when == "ended" 时，前置链最新一班落在这些状态
 # 就算"已结束"（调度器与网页共用这一个定义）
@@ -162,6 +174,12 @@ def task_dir(task_id: str) -> Path:
     return home() / "tasks" / task_id
 
 
+def worktree_enabled(task: dict) -> bool:
+    """该任务是否走工作树路径：只有显式 true 才算；S5 上线前落盘的旧任务
+    没有 worktree 字段，必须按 false 解释（一期路径），绝不偷偷迁移。"""
+    return task.get("worktree") is True
+
+
 def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> str:
     """校验一个完整任务 dict；不合法抛 ValueError，通过返回归一后的触发类型。
 
@@ -177,6 +195,9 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
       auto_interrupt_minutes 若存在且非 null，必须是正整数（bool 不算
       整数）——防止网页 PUT 把 task.json 写坏、把调度器的 int(...) 炸出来
       或负数让它立刻中止。
+    - worktree / review（S5）：worktree 存在必须是布尔值；review 存在必须是
+      对象且只认 enabled / merge_policy 两个键，enabled 只能 false
+      （联动审稿要到 S7 才开放），merge_policy 只认 manual / auto。
     """
     for key in _REQUIRED_FIELDS:
         if key == "run_at":
@@ -197,6 +218,25 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
         isinstance(auto, bool) or not isinstance(auto, int) or auto <= 0
     ):
         raise ValueError("guards.auto_interrupt_minutes 必须是正整数")
+
+    # S5：worktree 只有显式 true/false 两种；review 占住形状但 enabled 必须 false
+    if task.get("worktree") is not None and not isinstance(task.get("worktree"), bool):
+        raise ValueError("worktree 必须是布尔值")
+    review = task.get("review")
+    if review is not None:
+        if not isinstance(review, dict):
+            raise ValueError("review 必须是对象")
+        unknown = sorted(set(review) - {"enabled", "merge_policy"})
+        if unknown:
+            raise ValueError(f"review 只认 enabled / merge_policy，多出：{'、'.join(unknown)}")
+        enabled = review.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValueError("review.enabled 必须是布尔值")
+        if enabled:
+            raise ValueError("联动审稿要到 S7 才开放，现在只能 enabled=false")
+        policy = review.get("merge_policy", "manual")
+        if policy not in _MERGE_POLICIES:
+            raise ValueError("review.merge_policy 只认 manual / auto")
 
     trigger = task.get("trigger")
     if trigger is None:
@@ -235,11 +275,23 @@ def create_task(task: dict, config: dict) -> str:
     """校验并落盘一个新任务（task.json + 初始 status.json），返回任务 id。
 
     trigger 缺省补 {"type": "time"}；type == "after" 时 run_at 可以不给
-    （补成创建时刻，只当列表排序用，起不起由前置链状态决定）。
+    （补成创建时刻，只当排序用）。S5 起新任务缺省 worktree=true（建树施工），
+    review 占住 {"enabled": false, "merge_policy": "manual"} 的形状供 S7 扩写；
+    显式 worktree=false 走一期旧路径。
     """
     data = dict(task)
     data["trigger"] = data.get("trigger") or {"type": "time"}
-    validate_task(data, config)
+    if data.get("worktree") is None:
+        data["worktree"] = True  # 新任务缺省建树
+    validate_task(data, config)  # 先原样校验：review 形状不对在这里报人话错误
+    review = data.get("review")
+    if not isinstance(review, dict):
+        data["review"] = {"enabled": False, "merge_policy": "manual"}
+    else:
+        data["review"] = {
+            "enabled": bool(review.get("enabled", False)),
+            "merge_policy": review.get("merge_policy") or "manual",
+        }
     if not data.get("run_at"):
         data["run_at"] = utc_now_iso()  # after 任务：只当排序用
 
@@ -305,6 +357,9 @@ def create_successor(parent_task: dict, handover_text: str | None, config: dict)
     """换班：按父任务造后继任务并落盘，返回后继任务 id。
 
     - 复制 title/project/model/effort/task_text/guards/chain/retry_max；
+    - S5：显式复制 worktree 与 review，并让后继班沿用父班的
+      worktree_path / branch / base_ref——一条换班链从头到尾只有一棵树、
+      一个分支、一个基准提交；
     - shift = 父 shift + 1，parent_id / root_id（根任务的 root_id 是它自己）；
     - run_at = 现在（后继下一轮 tick 就能走预检）；
     - prompt_final = render(config.chain_template, task=…, shift=…, handover=…)，
@@ -330,10 +385,17 @@ def create_successor(parent_task: dict, handover_text: str | None, config: dict)
             title=parent_task["title"],
             project_path=config["projects"][parent_task["project"]],
             context_limit=context_limit_for(parent_task["model"], config),
+            worktree_instruction=(
+                WORKTREE_INSTRUCTION if worktree_enabled(parent_task) else ""
+            ),
         ),
         "shift": shift,
         "parent_id": parent_id,
         "root_id": parent_task.get("root_id") or parent_id,
+        # S5：显式复制——旧式父任务（缺 worktree 字段）的后继必须保持 false，
+        # 不能吃 create_task 的新任务缺省 true
+        "worktree": worktree_enabled(parent_task),
+        "review": dict(parent_task.get("review") or {}),
     }
     if parent_task.get("retry_max") is not None:
         task["retry_max"] = parent_task["retry_max"]
@@ -342,6 +404,15 @@ def create_successor(parent_task: dict, handover_text: str | None, config: dict)
     if parent_task.get("chain"):
         task["chain"] = parent_task["chain"]
     successor_id = create_task(task, config)
+    # 沿用父班的工作树三件元数据（有才写；父班还没建树就没有）
+    parent_status = read_status(parent_id)
+    meta = {
+        key: parent_status[key]
+        for key in ("worktree_path", "branch", "base_ref")
+        if parent_status.get(key)
+    }
+    if meta:
+        update_status(successor_id, **meta)
     update_status(parent_id, state="chained", successor_id=successor_id)
     return successor_id
 
@@ -422,11 +493,16 @@ def render(template: str, **vars) -> str:
     return out
 
 
-def build_prompt(config: dict, title: str, project: str, model: str, task_text: str) -> str:
+def build_prompt(
+    config: dict, title: str, project: str, model: str, task_text: str,
+    worktree: bool = False,
+) -> str:
     """按 config.prompt_template 渲染最终提示词。
 
     网页 /api/preview 与 CLI cmd_add 共用这一套占位符
-    （{task} {title} {project_path} {context_limit}），保证所见即所发。
+    （{task} {title} {project_path} {context_limit} {worktree_instruction}），
+    保证所见即所发。工作树任务把 {worktree_instruction} 渲染成运行时安全前言；
+    老式任务渲染成空串。
     """
     return render(
         config["prompt_template"],
@@ -434,4 +510,5 @@ def build_prompt(config: dict, title: str, project: str, model: str, task_text: 
         title=title,
         project_path=config["projects"][project],
         context_limit=context_limit_for(model, config),
+        worktree_instruction=WORKTREE_INSTRUCTION if worktree else "",
     )

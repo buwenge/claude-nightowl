@@ -319,6 +319,93 @@ def test_config_example_json_valid():
         assert key in config, f"config.example.json 缺键：{key}"
 
 
+# ---------- S5：worktree / review 字段 ----------
+
+
+def test_new_task_worktree_review_defaults():
+    tid = store.create_task(make_task(), CONFIG)
+    task = store.load_task(tid)
+    assert task["worktree"] is True  # 新任务缺省建树
+    assert task["review"] == {"enabled": False, "merge_policy": "manual"}
+    # 显式 false 原样保留（一期回归开关）
+    tid2 = store.create_task(make_task(worktree=False), CONFIG)
+    assert store.load_task(tid2)["worktree"] is False
+
+
+def test_worktree_review_validation_rejects_bad_shapes():
+    for over in (
+        {"worktree": "true"},
+        {"worktree": 1},
+        {"review": {"enabled": True}},                       # S7 才开放
+        {"review": {"enabled": False, "merge_policy": "yolo"}},
+        {"review": {"enabled": "yes"}},
+        {"review": "审一下"},
+        {"review": {"enabled": False, "criteria_text": "多出来的键"}},
+    ):
+        with pytest.raises(ValueError):
+            store.create_task(make_task(**over), CONFIG)
+
+
+def test_old_task_json_missing_worktree_stays_false():
+    """S5 上线前落盘的旧记录：没有 worktree 字段按 false，不回写不迁移。"""
+    old = {
+        "id": "20250101-000000-ffff", "title": "旧任务", "project": "demo",
+        "model": "claude-fable-5", "effort": "high", "shift": 1,
+        "run_at": "2025-01-01T00:00:00Z", "task_text": "正文",
+        "prompt_final": "提示词", "created_at": "2025-01-01T00:00:00Z",
+        "trigger": {"type": "time"},
+    }
+    d = store.task_dir("20250101-000000-ffff")
+    d.mkdir(parents=True, exist_ok=True)
+    store.atomic_write_json(d / "task.json", old)
+    loaded = store.load_task("20250101-000000-ffff")
+    assert "worktree" not in loaded
+    assert store.worktree_enabled(loaded) is False
+    # 整份旧记录过校验（网页编辑旧任务不能被新字段卡死）
+    assert store.validate_task(loaded, CONFIG, task_id=loaded["id"]) == "time"
+
+
+def test_build_prompt_worktree_instruction():
+    config = dict(CONFIG)
+    config["prompt_template"] = "任务 {title}。{worktree_instruction}正文：{task}"
+    config["models"] = {"claude-fable-5": {"context_limit": 500000}}
+    config["default_context_limit"] = 200000
+    out_true = store.build_prompt(config, "T", "demo", "claude-fable-5", "B", worktree=True)
+    assert store.WORKTREE_INSTRUCTION in out_true
+    out_false = store.build_prompt(config, "T", "demo", "claude-fable-5", "B")
+    assert out_false == "任务 T。正文：B"  # 老式任务渲染为空
+
+
+def test_create_successor_explicitly_copies_worktree_review():
+    config = dict(CONFIG)
+    config["models"] = {"claude-fable-5": {"context_limit": 500000}}
+    config["default_context_limit"] = 200000
+    config["chain_template"] = "{task} 第 {shift} 班 {handover}"
+    parent_id = store.create_task(
+        make_task(worktree=True, review={"enabled": False, "merge_policy": "auto"}),
+        config,
+    )
+    store.update_status(parent_id, worktree_path="/p/.claude/worktrees/x",
+                        branch="ns/x", base_ref="abc")
+    succ = store.load_task(store.create_successor(
+        store.load_task(parent_id), "交接", config))
+    assert succ["worktree"] is True
+    assert succ["review"] == {"enabled": False, "merge_policy": "auto"}
+    status = store.read_status(succ["id"])
+    assert status["worktree_path"] == "/p/.claude/worktrees/x"
+    assert status["branch"] == "ns/x"
+    assert status["base_ref"] == "abc"
+    # 旧式父任务：后继必须仍是 false，不吃新任务缺省
+    parent2 = make_task(worktree=False)
+    pid2 = store.create_task(parent2, config)
+    data = store.load_task(pid2)
+    del data["worktree"]  # 手工退回旧记录形状
+    store.atomic_write_json(store.task_dir(pid2) / "task.json", data)
+    succ2 = store.load_task(store.create_successor(data, "交接", config))
+    assert succ2["worktree"] is False
+    assert "worktree_path" not in store.read_status(succ2["id"])
+
+
 # ---------- 原子写 mode（S3①：凭据类文件落盘即收紧）----------
 
 

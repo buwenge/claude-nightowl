@@ -67,7 +67,8 @@ def cmd_add(args) -> int:
         prompt_final = Path(args.prompt_file).read_text(encoding="utf-8")
     else:
         prompt_final = store.build_prompt(
-            config, args.title, args.project, args.model, task_text
+            config, args.title, args.project, args.model, task_text,
+            worktree=not args.no_worktree,
         )
 
     task = {
@@ -78,6 +79,10 @@ def cmd_add(args) -> int:
         "run_at": run_at,
         "task_text": task_text,
         "prompt_final": prompt_final,
+        # S5：缺省建树施工；--no-worktree 回一期老路径。review 先占形状，
+        # enabled 固定 false（联动审稿要到 S7）
+        "worktree": not args.no_worktree,
+        "review": {"enabled": False, "merge_policy": args.merge_policy},
     }
     try:
         task_id = store.create_task(task, config)
@@ -179,6 +184,12 @@ def cmd_serve(args) -> int:
     """
     config = store.load_config()
     store.ensure_dirs()
+    # S5：启动对账一次（--once 也跑，便于测试）——孤儿工作树只提示不自动删
+    orphans = scheduler.reconcile_worktrees(config)
+    if orphans:
+        print(f"[nightshift] 发现 {len(orphans)} 棵孤儿工作树，"
+              f"详见 {store.home() / 'orphan_worktrees.json'}（只提示，不会自动删）",
+              file=sys.stderr)
     if args.once:
         actions = scheduler.tick(config, datetime.now(timezone.utc))
         for line in actions:
@@ -238,6 +249,10 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--task-file", help="任务内容从文件读")
     p.add_argument("--prompt-file", default=None,
                    help="直接给最终提示词文件（不给就按模板渲染）")
+    p.add_argument("--no-worktree", action="store_true",
+                   help="不建隔离工作树，直接在项目目录施工（一期老路径）")
+    p.add_argument("--merge-policy", choices=("manual", "auto"), default="manual",
+                   help="工作树完工后：manual=等我合并（默认）/ auto=调度器自动合并")
     p.set_defaults(func=cmd_add)
 
     p = sub.add_parser("list", help="列出所有任务")

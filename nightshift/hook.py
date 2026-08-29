@@ -37,7 +37,7 @@ QUOTA_OTHER_MODEL_TEXT = (
 QUOTA_WRAPUP_TEXT = (
     "[nightshift] 周额度只剩 {week_left}%（线 {week_line_left}%）{model_note}，一时半会儿刷新不了。"
     "现在收尾：把已完成/未完成/下一步写进 {handover_path}，末行写 NEXT: done（本周不再续班，交接留给下次）；"
-    "未提交的改动 commit；然后停下。"
+    "{commit_step}然后停下。"
 )
 # 闹钟规矩：50 分钟一个（缓存 TTL 约 1 小时），尾数补一个短的，再加几分钟缓冲
 ALARM_UNIT_MINUTES = 50
@@ -66,6 +66,12 @@ def warn_threshold(task: dict, config: dict) -> int:
     if ratio is None:
         raise ValueError("guards 里既没有 context_warn_tokens 也没有 context_warn_ratio")
     return int(ratio * _context_limit(task, config))
+
+
+def _commit_step(task: dict) -> str:
+    """收尾话术里的 commit 那一步：工作树任务由调度器打存档点，渲染成空；
+    老式任务（worktree=false）保留"把未提交的改动 commit"的原规矩。"""
+    return "" if store.worktree_enabled(task) else "把未提交的改动 commit；"
 
 
 def handover_path(task: dict) -> Path:
@@ -172,6 +178,7 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
             model_line_left=100 - model_max,
             model_note=model_note,
             handover_path=str(handover_path(task)),
+            commit_step=_commit_step(task),
         )
         return "wrapup", text, {}
 
@@ -265,6 +272,7 @@ def _post_tool_use_refresh(task: dict, status: dict, payload: dict) -> str | Non
                             ctx_k=round(tokens / 1000),
                             limit_k=round(limit / 1000),
                             handover_path=str(handover_path(task)),
+                            commit_step=_commit_step(task),
                         )
                         inject.append(ctx)
                         count = int(status.get("context_warn_count") or 0) + 1

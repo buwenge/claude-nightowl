@@ -659,6 +659,30 @@ def test_weekly_quota_wrapup_beats_pause(tmp_path):
     assert status["quota_warn_count"] == 1 and status["context_warned_at"]
 
 
+def test_wrapup_commit_step_old_style_only(tmp_path):
+    """S5 {commit_step}：工作树任务渲染为空（调度器打存档点）；
+    老式任务（worktree=false）保留"把未提交的改动 commit"。"""
+    cfg = dict(CONFIG)
+    cfg["quota_wrapup_text"] = "收尾：写 {handover_path}；{commit_step}然后停下。"
+    store.atomic_write_json(store.home() / "config.json", cfg)
+    payload = make_transcript(tmp_path / "transcript.jsonl", 100)
+    for worktree_flag, want_commit in ((True, False), (False, True)):
+        task_id = make_task(
+            worktree=worktree_flag,
+            guards={
+                "session_pct_max": 80, "weekly_pct_max": 95,
+                "context_warn_tokens": 100000, "context_limit_tokens": 200000,
+            },
+        )
+        write_quota(session=90, week=97)
+        for _ in range(19):
+            run_hook(task_id, "PostToolUse", payload)
+        proc = run_hook(task_id, "PostToolUse", payload)
+        ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        assert ("把未提交的改动 commit" in ctx) is want_commit, (worktree_flag, ctx)
+        assert "然后停下" in ctx
+
+
 def test_stop_with_session_crons_is_waiting_wakeup():
     task_id = make_task()
     run_hook(task_id, "Stop", json.dumps({

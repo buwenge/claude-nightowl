@@ -9,7 +9,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from . import store
+from . import store, worktree
 
 __all__ = [
     "capture_pane",
@@ -24,6 +24,7 @@ __all__ = [
     "send_escape",
     "send_keys",
     "window_alive",
+    "workdir_for",
     "write_task_files",
 ]
 
@@ -86,10 +87,20 @@ def _sq(value) -> str:
     return "'" + str(value).replace("'", "'\\''") + "'"
 
 
+def workdir_for(task: dict, config: dict) -> str:
+    """claude 实际施工的目录：工作树任务用 status 里登记的 worktree_path
+    （launch 已幂等建好树）；老式任务仍是 config 里的项目主目录。"""
+    if worktree.wants_worktree(task):
+        wt = store.read_status(task["id"]).get("worktree_path")
+        if wt:
+            return str(wt)
+    return str(config["projects"][task["project"]])
+
+
 def run_sh_text(task: dict, config: dict, session_id: str) -> str:
     """run.sh 的内容（模板见开工令）：环境、cgroup 内存围栏、起 claude、留窗。"""
     d = store.task_dir(task["id"])
-    project_path = config["projects"][task["project"]]
+    workdir = workdir_for(task, config)
     repo_root = Path(__file__).resolve().parent.parent
     lines = [
         "#!/bin/bash",
@@ -97,7 +108,7 @@ def run_sh_text(task: dict, config: dict, session_id: str) -> str:
         f"export NIGHTSHIFT_HOME={_sq(store.home())}",
         f"export PYTHONPATH={_sq(repo_root)}",
         "unset CLAUDECODE",
-        f"cd {_sq(project_path)} || {{ echo \"[nightshift] 进不了项目目录\"; read; exit 1; }}",
+        f"cd {_sq(workdir)} || {{ echo \"[nightshift] 进不了施工目录\"; read; exit 1; }}",
         f"CGROUP=\"/sys/fs/cgroup/nightshift-{task['id']}\"",
         'if mkdir "$CGROUP" 2>/dev/null; then',
         f"    echo {config['memory_max_bytes']} > \"$CGROUP/memory.max\" 2>/dev/null",
@@ -124,6 +135,19 @@ def run_sh_text(task: dict, config: dict, session_id: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _prompt_text(task: dict) -> str:
+    """真正写进 prompt.txt 的提示词。
+
+    工作树任务保证带上运行时安全前言（不要 commit、只在工作树施工）：
+    模板经 {worktree_instruction} 渲染过就已有这句；用户用 --prompt-file
+    给的全文若漏了它，在这里补上——前言只追加、绝不改用户正文。
+    """
+    text = task["prompt_final"]
+    if worktree.wants_worktree(task) and store.WORKTREE_INSTRUCTION not in text:
+        text = store.WORKTREE_INSTRUCTION + "\n\n" + text
+    return text
+
+
 def write_task_files(task: dict, config: dict, session_id: str) -> None:
     """写 prompt.txt / settings.json / run.sh（0o700）。"""
     d = store.task_dir(task["id"])
@@ -131,7 +155,7 @@ def write_task_files(task: dict, config: dict, session_id: str) -> None:
     # 上一轮窗口留下的 exit_code 先删：那是旧 claude 的死讯，不能拿来误判新窗口
     (d / "exit_code").unlink(missing_ok=True)
     store.atomic_write_json(d / "settings.json", hook_settings(task["id"]))
-    store.atomic_write_text(d / "prompt.txt", task["prompt_final"])
+    store.atomic_write_text(d / "prompt.txt", _prompt_text(task))
     run_sh = d / "run.sh"
     store.atomic_write_text(run_sh, run_sh_text(task, config, session_id))
     os.chmod(run_sh, 0o700)
@@ -168,13 +192,14 @@ def _fail(task: dict, config: dict, error: str) -> dict:
 
 
 def launch(task_id: str, config: dict) -> dict:
-    """起一个任务的窗口。顺序是硬性的：信任检查 → 预定 session → 落盘 → 先写
-    launching 再碰 tmux（崩溃恢复三条的根基，设计稿 §3）。
+    """起一个任务的窗口。顺序是硬性的：信任检查 → 工作树建树 → 预定
+    session → 落盘 → 先写 launching 再碰 tmux（崩溃恢复三条的根基，设计稿 §3）。
     """
     task = store.load_task(task_id)
     project_path = config["projects"][task["project"]]
 
-    # ① 目录没信任过，交互式 claude 会卡在信任问答 → 直接判失败
+    # ① 目录没信任过，交互式 claude 会卡在信任问答 → 直接判失败。
+    # 只查主项目路径：信任预检不要求工作树单独出现在 ~/.claude.json 里
     if not is_trusted(project_path):
         reason = f"目录未信任，请先手动在该目录开一次 claude：{project_path}"
         store.append_event(task_id, f"启动被拦：{reason}")
@@ -184,9 +209,26 @@ def launch(task_id: str, config: dict) -> dict:
         open_failure_window(task, reason, config)
         return status
 
-    # ② 预定 session_id 与 transcript 路径（--session-id 决定文件名，设计稿 F4）
+    # ①' S5：工作树任务先幂等建树/复用（直接 CLI run-now 也走这里，绕不过）。
+    # 元数据落 status，后继班靠 create_successor 沿用同一棵树
+    if worktree.wants_worktree(task):
+        try:
+            meta = worktree.ensure_worktree(task, project_path)
+        except worktree.WorktreeError as exc:
+            reason = f"建工作树失败：{exc}"
+            store.append_event(task_id, f"启动被拦：{reason}")
+            status = store.update_status(
+                task_id, state="failed", error=reason,
+                last_event_at=store.utc_now_iso(),
+            )
+            open_failure_window(task, reason, config)
+            return status
+        store.update_status(task_id, **meta)
+
+    # ② 预定 session_id 与 transcript 路径（--session-id 决定文件名，设计稿 F4）。
+    # 编码路径必须按实际 cwd 算：工作树任务在 <项目>/.claude/worktrees/<slug> 里跑
     session_id = str(uuid.uuid4())
-    encoded = str(project_path).replace("/", "-").replace(".", "-")
+    encoded = workdir_for(task, config).replace("/", "-").replace(".", "-")
     expected_transcript = str(
         Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
     )
