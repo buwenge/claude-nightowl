@@ -147,6 +147,14 @@ def test_ensure_is_idempotent_and_exclude_not_duplicated(repo):
     assert not (proj / ".gitignore").exists()
 
 
+def test_ensure_refuses_partial_recorded_metadata(repo):
+    proj, config = repo
+    task = make_task(config)
+    store.update_status(task["id"], worktree_path=str(proj / ".claude/worktrees/x"))
+    with pytest.raises(worktree.WorktreeError, match="元数据不完整"):
+        worktree.ensure_worktree(task, proj)
+
+
 def test_ensure_reuse_keeps_original_base(repo):
     """launching 重试再进来：树已存在且元数据匹配 → 复用，base_ref 保持登记值。"""
     proj, config = repo
@@ -380,6 +388,45 @@ def test_merge_task_success_no_ff_and_cleanup(repo):
         "branch", "--list", cwd=proj)
     assert "worktree_path" not in status
 
+    # 模拟并发第二个请求拿着旧 status 晚到：锁内重读后只返回既有结果
+    ok2, note2 = worktree.merge_task(task, proj, meta, config)
+    assert ok2 and "已经合并" in note2
+    assert _gitSimple("rev-list", "--count", "--merges", "HEAD", cwd=proj).strip() == "1"
+
+
+def test_title_change_after_tree_created_does_not_block_merge(repo):
+    """标题是可编辑字段；建树后改标题不能让旧分支失去合并资格。"""
+    proj, config = repo
+    task, _ = _tree_with_canary(repo)
+    changed = store.load_task(task["id"])
+    changed["title"] = "运行中改过的新标题"
+    store.atomic_write_json(store.task_dir(task["id"]) / "task.json", changed)
+    ok, note = worktree.merge_task(
+        changed, proj, store.read_status(task["id"]), config,
+    )
+    assert ok, note
+    assert store.read_status(task["id"])["state"] == "merged"
+
+
+def test_merge_refuses_fully_gone_without_persisted_proof(repo):
+    """树/分支被手工删掉不等于已合并；没有 merge_sha 证据绝不猜成功。"""
+    proj, config = repo
+    task, meta = _tree_with_canary(repo)
+    subprocess.run(
+        ["git", "-C", str(proj), "worktree", "remove", "--force", meta["worktree_path"]],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(proj), "branch", "-D", meta["branch"]],
+        check=True, capture_output=True,
+    )
+    ok, note = worktree.merge_task(
+        task, proj, store.read_status(task["id"]), config,
+    )
+    assert not ok
+    assert "不是项目登记的工作树" in note
+    assert store.read_status(task["id"])["state"] == "needs_attention"
+
 
 def test_merge_task_dirty_main_refuses(repo):
     proj, config = repo
@@ -485,6 +532,9 @@ def test_discard_task_removes_tree_and_branch(repo):
     assert "worktree_path" not in store.read_status(task["id"])
     # 主线一个 commit 都没多
     assert _gitSimple("rev-list", "--count", "--merges", "HEAD", cwd=proj).strip() == "0"
+    # 模拟双击的第二个请求：不重复 Git，仍返回成功
+    ok2, note2 = worktree.discard_task(task, proj, meta, config)
+    assert ok2 and "已经丢弃" in note2
 
 
 def test_discard_refuses_foreign_path_and_branch_mismatch(repo):
@@ -501,7 +551,7 @@ def test_discard_refuses_foreign_path_and_branch_mismatch(repo):
                         branch="feature/x")
     ok, note = worktree.discard_task(
         task, proj, store.read_status(task["id"]), config)
-    assert not ok and "分支与这条链的记录不符" in note
+    assert not ok and "安全 ns 分支" in note
     assert Path(meta["worktree_path"]).exists()
     # 没登记过树：拒绝
     other = make_task(config)
@@ -529,6 +579,26 @@ def test_discard_half_failure_keeps_branch_report(repo, monkeypatch):
     assert status["state"] == "needs_attention"
     assert not Path(meta["worktree_path"]).exists()  # 树删了
     assert meta["branch"] in _gitSimple("branch", "--list", cwd=proj)  # 分支还在
+    # 恢复 Git 后再点一次：只补删分支，终态 discarded，不要求人工 SSH
+    monkeypatch.setattr(worktree, "_git", real_git)
+    ok2, note2 = worktree.discard_task(
+        task, proj, store.read_status(task["id"]), config,
+    )
+    assert ok2, note2
+    assert store.read_status(task["id"])["state"] == "discarded"
+    assert meta["branch"] not in _gitSimple("branch", "--list", cwd=proj)
+
+
+def test_ensure_refuses_symlink_escape(repo, tmp_path):
+    """工作树根若通过软链接指到项目外，建树前就必须拒绝。"""
+    proj, config = repo
+    task = make_task(config)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (proj / ".claude").mkdir(exist_ok=True)
+    (proj / ".claude" / "worktrees").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(worktree.WorktreeError, match="软链接指到项目外"):
+        worktree.ensure_worktree(task, proj)
 
 
 def test_chain_window_ids_only_from_records(repo):

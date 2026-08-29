@@ -165,7 +165,9 @@ def _after_ready(task: dict, status: dict, config: dict, now: datetime) -> bool:
     state = store.chain_state(pre_id)
     when = trigger.get("when") or "finished"
     if when == "finished":
-        return state == "finished"
+        # 老式任务以 finished 成功收口；工作树任务只有真正合入主线的 merged
+        # 才算“整条链完工”。awaiting_merge 只对 when=ended 算一班已结束。
+        return state in ("finished", "merged")
     return state in store.ENDED_STATES
 
 
@@ -674,7 +676,7 @@ def _checkpoint_shift(
     """收工边界的存档点（幂等：checkpoint_done 锁住，重复 tick 不再打）。
 
     - 老式任务（worktree=false）原样跳过，一期路径一字不变；
-    - worktree=true 但还没登记过树（异常情形）：没东西可存，跳过不拦收工；
+    - worktree=true 但没登记树是元数据损坏：needs_attention，不能假装收工；
     - 有改动 → commit 并把完整 sha 写本班 checkpoint_sha；无改动 → 只落
       checkpoint_done 并记"无改动，未打存档点"；
     - add / commit 失败 → 本班 needs_attention，止住收工流程（不判 NEXT、
@@ -685,7 +687,34 @@ def _checkpoint_shift(
         return None
     wt = status.get("worktree_path")
     if not wt:
-        return None
+        reason = "工作树任务没有登记 worktree_path，不能打存档点或收工"
+        store.update_status(
+            task_id, state="needs_attention", error=reason,
+            last_event_at=to_iso(now),
+        )
+        store.append_event(task_id, f"存档点失败：{reason}")
+        launcher.open_notice_window(task, "(需要人工)", [reason], config)
+        return [f"{task_id} 工作树元数据缺失 → needs_attention"]
+    project_path = (config.get("projects") or {}).get(task.get("project"))
+    if not project_path:
+        reason = f"项目 {task.get('project')} 已不在 config.projects，不能核验工作树或收工"
+        store.update_status(
+            task_id, state="needs_attention", error=reason,
+            last_event_at=to_iso(now),
+        )
+        store.append_event(task_id, f"存档点失败：{reason}")
+        launcher.open_notice_window(task, "(需要人工)", [reason], config)
+        return [f"{task_id} 项目配置缺失 → needs_attention"]
+    identity_error = worktree.check_task_tree(task, project_path, status)
+    if identity_error:
+        reason = f"存档点前工作树核验失败：{identity_error}"
+        store.update_status(
+            task_id, state="needs_attention", error=reason,
+            last_event_at=to_iso(now),
+        )
+        store.append_event(task_id, reason)
+        launcher.open_notice_window(task, "(需要人工)", [reason], config)
+        return [f"{task_id} 工作树核验失败 → needs_attention"]
     try:
         sha = worktree.checkpoint(task, wt)
     except worktree.WorktreeError as exc:
@@ -733,13 +762,30 @@ def _finalize_done(task: dict, config: dict, now: datetime) -> list[str]:
             task_id, "最后一班已存档 → awaiting_merge（等工头合并/丢弃）"
         )
         return [f"{task_id} 干完 → awaiting_merge（manual）"]
+    project_path = (config.get("projects") or {}).get(task.get("project"))
+    if not project_path:
+        reason = f"项目 {task.get('project')} 已不在 config.projects，不能自动合并"
+        store.update_status(
+            task_id, state="needs_attention", error=reason,
+            last_event_at=to_iso(now),
+        )
+        launcher.open_notice_window(task, "(需要人工)", [reason], config)
+        return [f"{task_id} 干完但自动合并没成：{reason}"]
     ok, note = worktree.merge_task(
-        task, config["projects"][task["project"]],
+        task, project_path,
         store.read_status(task_id), config,
         close_windows=lambda ids: launcher.close_windows(ids, config),
     )
     if ok:
         return [f"{task_id} 干完并自动合并：{note}"]
+    latest = store.read_status(task_id)
+    if not latest.get("merge_attention_noted"):
+        store.update_status(task_id, merge_attention_noted=True)
+        launcher.open_notice_window(
+            task, "(需要人工)",
+            [f"自动合并没有完成：{note}", "工作树与分支都保留着，请在网页处理"],
+            config,
+        )
     return [f"{task_id} 干完但自动合并没成：{note}"]
 
 

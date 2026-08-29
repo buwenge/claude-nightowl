@@ -581,6 +581,26 @@ def test_after_when_ended_fires_on_failed_only(monkeypatch):
     assert sorted(fakes.launch_calls) == sorted([ended, fin])
 
 
+def test_after_understands_worktree_completion_states(monkeypatch):
+    """merged 算真正完工；awaiting_merge 只算施工已经结束。"""
+    fakes = Fakes(monkeypatch)
+    pre = make_task(title="工作树前置", run_at=scheduler.to_iso(NOW + timedelta(hours=1)))
+    wait_finished = make_task(
+        title="等真正合入", project="other",
+        trigger={"type": "after", "task": pre, "when": "finished"},
+    )
+    wait_ended = make_task(
+        title="等施工结束", trigger={"type": "after", "task": pre, "when": "ended"},
+    )
+    store.update_status(pre, state="awaiting_merge")
+    scheduler.tick(CONFIG, NOW)
+    assert wait_ended in fakes.launch_calls
+    assert wait_finished not in fakes.launch_calls
+    store.update_status(pre, state="merged")
+    scheduler.tick(CONFIG, NOW)
+    assert wait_finished in fakes.launch_calls
+
+
 def test_after_pre_deleted_needs_attention_once(monkeypatch):
     import shutil
 
@@ -769,7 +789,7 @@ def _write_handover(tid: str, text: str, shift: int = 1) -> None:
 
 def test_chain_continue_creates_successor(monkeypatch):
     fakes = Fakes(monkeypatch)
-    tid = make_task(retry_max=2)
+    tid = make_task(retry_max=2, worktree=False)
     _go_idle(tid)
     _write_handover(tid, "登录页已完成。\n还差支付页。\nNEXT: continue")
     actions = scheduler.tick(CONFIG, NOW)
@@ -816,7 +836,7 @@ def test_chain_done_finishes(monkeypatch):
 
 def test_chain_handover_without_next_treated_as_continue(monkeypatch):
     Fakes(monkeypatch)
-    tid = make_task()
+    tid = make_task(worktree=False)
     _go_idle(tid)
     _write_handover(tid, "做了一半，进度记在这里")
     scheduler.tick(CONFIG, NOW)
@@ -830,7 +850,7 @@ def test_chain_handover_without_next_treated_as_continue(monkeypatch):
 
 def test_chain_no_handover_warned_continue_uses_fallback_text(monkeypatch):
     Fakes(monkeypatch)
-    tid = make_task()
+    tid = make_task(worktree=False)
     _go_idle(tid, context_warned_at=scheduler.to_iso(NOW - timedelta(minutes=10)))
     scheduler.tick(CONFIG, NOW)
     status = store.read_status(tid)
@@ -843,7 +863,7 @@ def test_chain_no_handover_warned_continue_uses_fallback_text(monkeypatch):
 
 def test_chain_no_handover_warned_stop_needs_attention(monkeypatch):
     fakes = Fakes(monkeypatch)
-    tid = make_task(chain={"on_no_handover": "stop"})
+    tid = make_task(chain={"on_no_handover": "stop"}, worktree=False)
     _go_idle(tid, context_warned_at=scheduler.to_iso(NOW - timedelta(minutes=10)))
     scheduler.tick(CONFIG, NOW)
     status = store.read_status(tid)
@@ -871,7 +891,7 @@ def test_chain_no_handover_never_warned_finishes(monkeypatch):
 
 def test_chain_shift_at_max_windows_exhausted(monkeypatch):
     fakes = Fakes(monkeypatch)
-    tid = make_task(shift=3)  # chain.max_windows=3，这班就是最后一班
+    tid = make_task(shift=3, worktree=False)  # chain.max_windows=3，这班就是最后一班
     _go_idle(tid)
     _write_handover(tid, "还没做完。\nNEXT: continue", shift=3)
     actions = scheduler.tick(CONFIG, NOW)
@@ -885,7 +905,7 @@ def test_chain_shift_at_max_windows_exhausted(monkeypatch):
 
 def test_chain_evaluated_only_once(monkeypatch):
     fakes = Fakes(monkeypatch)
-    tid = make_task()
+    tid = make_task(worktree=False)
     _go_idle(tid, context_warned_at=scheduler.to_iso(NOW - timedelta(minutes=10)))
     scheduler.tick(CONFIG, NOW)
     successor_id = store.read_status(tid)["successor_id"]
@@ -899,7 +919,7 @@ def test_chain_evaluated_only_once(monkeypatch):
 
 def test_chain_exited_with_handover_continues(monkeypatch):
     Fakes(monkeypatch)
-    tid = make_task()
+    tid = make_task(worktree=False)
     store.update_status(tid, state="exited", exit_reason="window_gone")
     _write_handover(tid, "上下文写完交接时会话被关了。\nNEXT: continue")
     actions = scheduler.tick(CONFIG, NOW)
@@ -1080,7 +1100,8 @@ def test_worktree_auto_dirty_main_needs_attention_exact_text(tmp_path, monkeypat
     status = store.read_status(tid)
     assert status["state"] == "needs_attention"
     assert status["error"] == "主线有你没提交的改动，没敢自动合并；处理完按'合并进主线'"
-    assert len(fakes.notice_calls) == 0  # 调度器不另开窗：卡片红字 + 首次告警在收尾 helper 里
+    assert len(fakes.notice_calls) == 1  # 设计要求：卡片红字之外再开一次告警窗
+    assert "自动合并没有完成" in fakes.notice_calls[0][2][0]
     # 树与分支保留、merge commit 数不变
     assert wt.exists()
     merges = subprocess.run(
@@ -1122,6 +1143,19 @@ def test_worktree_checkpoint_failure_stops_chain(tmp_path, monkeypatch):
     assert scheduler.tick(cfg, NOW) == []
 
 
+def test_worktree_missing_metadata_stops_instead_of_fake_finish(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    tid = make_task(worktree=True)
+    _go_idle(tid)
+    _write_handover(tid, "干完了。\nNEXT: done")
+    actions = scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention"
+    assert "没有登记 worktree_path" in status["error"]
+    assert any("元数据缺失" in action for action in actions)
+    assert len(fakes.notice_calls) == 1
+
+
 def test_checkpoint_shift_is_idempotent(tmp_path, monkeypatch):
     """重复 tick 不得多打第二颗同内容 commit（checkpoint_done 锁）。"""
     Fakes(monkeypatch)
@@ -1132,12 +1166,13 @@ def test_checkpoint_shift_is_idempotent(tmp_path, monkeypatch):
     (wt / "canary.txt").write_text("活\n", encoding="utf-8")
     status = store.read_status(tid)
     now = NOW
-    blocked = scheduler._checkpoint_shift(store.load_task(tid), status, CONFIG, now)
+    cfg = _config_for(proj)
+    blocked = scheduler._checkpoint_shift(store.load_task(tid), status, cfg, now)
     assert blocked is None
     sha = store.read_status(tid)["checkpoint_sha"]
     # 第二次直接调：checkpoint_done 已锁，什么都不做
     blocked = scheduler._checkpoint_shift(
-        store.load_task(tid), store.read_status(tid), CONFIG, now)
+        store.load_task(tid), store.read_status(tid), cfg, now)
     assert blocked is None
     assert store.read_status(tid)["checkpoint_sha"] == sha
     count = subprocess.run(

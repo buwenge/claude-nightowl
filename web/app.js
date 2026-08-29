@@ -321,6 +321,7 @@ function saveWarmup() {
 function taskActions(item, chainIds) {
   var task = item.task, status = item.status;
   var state = status.state;
+  var hasTree = !!status.worktree_path;
   var box = el("div", { class: "actions" });
   function add(text, cls, handler) {
     box.appendChild(el("button", { type: "button", class: cls, text: text, onclick: handler }));
@@ -344,7 +345,7 @@ function taskActions(item, chainIds) {
         .catch(function () {});
     });
   }
-  if (TERMINAL_STATES.indexOf(state) >= 0) {
+  if (TERMINAL_STATES.indexOf(state) >= 0 && !hasTree) {
     var many = chainIds.length > 1;
     add(many ? "删除（整条链 " + chainIds.length + " 班）" : "删除", "danger", function () {
       if (!confirm("删除「" + task.title + "」" + (many ? "的全部 " + chainIds.length + " 班" : "") + "？任务目录（含事件日志）会一并清掉。")) return;
@@ -361,7 +362,6 @@ function taskActions(item, chainIds) {
     add("捎话", "", function () { openMsg(task.id, task.title, item.draft); });
   }
   // S5③：工作树收口——等合并 / 清完主线重试 / failed·cancelled 有树都能处理
-  var hasTree = !!status.worktree_path;
   function addKeep() {
     add("先留着", "", function () {
       banner("工作树和分支已保留，之后还能回来处理");  // 纯前端 no-op，不打 API

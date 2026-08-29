@@ -11,8 +11,10 @@
 
 from __future__ import annotations
 
+import fcntl
 import re
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import store
@@ -86,6 +88,8 @@ def _git(cwd: str | Path, *args: str, timeout: float = _GIT_TIMEOUT) -> subproce
         raise WorktreeError(
             f"git {args[0]} 超时（>{timeout:.0f} 秒），先放弃不动任何东西"
         ) from None
+    except OSError as exc:
+        raise WorktreeError(f"git {args[0]} 起不来：{exc}") from None
 
 
 def git_out(cwd: str | Path, *args: str, timeout: float = _GIT_TIMEOUT) -> str:
@@ -164,10 +168,60 @@ def list_worktrees(project_path: str | Path) -> list[dict]:
 
 def registered_worktree(project_path: str | Path, path: str | Path) -> dict | None:
     """path 若是该项目登记在册的工作树，返回它的条目；否则 None。"""
-    want = Path(path).absolute()
+    want = Path(path).resolve(strict=False)
     for entry in list_worktrees(project_path):
-        if Path(entry["path"]).absolute() == want:
+        if Path(entry["path"]).resolve(strict=False) == want:
             return entry
+    return None
+
+
+def _tree_location_error(project_path: str | Path, path: str | Path) -> str | None:
+    """核验工作树物理位置没有借 `..` 或软链接逃出项目。
+
+    S5 的删除边界不只比较字符串：若 `.claude/worktrees` 本身或任务路径中的
+    某一级是指向项目外的软链接，也必须拒绝。
+    """
+    project = Path(project_path).resolve(strict=False)
+    root = (project / WORKTREES_DIR).resolve(strict=False)
+    candidate = Path(path).resolve(strict=False)
+    try:
+        root.relative_to(project)
+    except ValueError:
+        return f"项目的 {WORKTREES_DIR.as_posix()}/ 通过软链接指到项目外，拒绝动它"
+    if candidate.parent != root:
+        return f"工作树路径不在项目的 {WORKTREES_DIR.as_posix()}/ 下，拒绝动它：{path}"
+    return None
+
+
+def _recorded_identity_error(task: dict, project_path: str | Path, status: dict) -> str | None:
+    """核验任务记录自己的路径/分支，以及同一条链各班记录的一致性。
+
+    分支名以建树时落盘的 status 为准，不能按可编辑的任务标题重新计算；否则
+    运行中改一次标题，正常的旧分支就永远无法合并或丢弃。
+    """
+    wt = status.get("worktree_path")
+    branch = status.get("branch")
+    if not wt or not branch:
+        return "这个任务没有登记工作树（还没建过树，无从合并/丢弃）"
+    location_error = _tree_location_error(project_path, wt)
+    if location_error:
+        return location_error
+    if not re.fullmatch(r"ns/[a-z0-9][a-z0-9-]{0,63}", str(branch)):
+        return f"分支不是夜班登记的安全 ns 分支：{branch}"
+    root_id = task.get("root_id") or task["id"]
+    id_tail = re.sub(r"[^a-z0-9]", "", str(root_id)[-4:].lower()) or "0000"
+    if not str(branch).startswith(f"ns/{id_tail}-"):
+        return f"分支与这条链的任务 id 不符：{branch}"
+    if Path(wt).resolve(strict=False).name != str(branch)[len("ns/"):]:
+        return f"工作树目录名与分支不符：{wt} / {branch}"
+    for member in chain_tasks(task):
+        member_status = store.read_status(member["id"])
+        member_path = member_status.get("worktree_path")
+        member_branch = member_status.get("branch")
+        if member_path and Path(member_path).resolve(strict=False) != Path(wt).resolve(strict=False):
+            return f"同一条链的工作树记录不一致：{member['id']} 指向 {member_path}"
+        if member_branch and member_branch != branch:
+            return f"同一条链的分支记录不一致：{member['id']} 记的是 {member_branch}"
     return None
 
 
@@ -220,7 +274,7 @@ def ensure_worktree(task: dict, project_path: str | Path) -> dict:
     - 只撞一半（分支在树不在 / 路径被别的东西占着 / 元数据互相矛盾）→
       抛 WorktreeError 把原因说清，绝不删东西、绝不建第二棵。
     """
-    project_path = str(project_path)
+    project_path = str(Path(project_path).resolve(strict=False))
     if not is_git_repo(project_path):
         raise WorktreeError(f"项目不是 Git 仓库，建不了工作树：{project_path}")
     task_id = task["id"]
@@ -228,12 +282,19 @@ def ensure_worktree(task: dict, project_path: str | Path) -> dict:
     status = store.read_status(task_id)
     recorded_path = status.get("worktree_path")
     recorded_branch = status.get("branch")
+    if bool(recorded_path) != bool(recorded_branch):
+        raise WorktreeError("登记的工作树元数据不完整（path / branch 只剩一个），不敢另建第二棵")
     if recorded_path and recorded_branch:
         # 后继班 / 重试：按登记的树复用（slug 属于整条链，不按本班 id 重推）
         path = Path(recorded_path)
         branch = str(recorded_branch)
         if not path.is_absolute():
             raise WorktreeError(f"登记的工作树路径不是绝对路径：{path}")
+        identity_error = _recorded_identity_error(task, project_path, status)
+        if identity_error:
+            raise WorktreeError(identity_error)
+        if not status.get("base_ref"):
+            raise WorktreeError("登记的工作树元数据缺少 base_ref，不敢拿当前分支头冒充原基准")
         if not path.exists():
             raise WorktreeError(
                 f"登记的工作树不见了：{path}（链上的树必须共用，夜班不另建第二棵）"
@@ -261,6 +322,9 @@ def ensure_worktree(task: dict, project_path: str | Path) -> dict:
     slug = slug_for(task_id, task.get("title") or "")
     branch = f"ns/{slug}"
     path = worktree_path_for(project_path, task_id, task.get("title") or "")
+    location_error = _tree_location_error(project_path, path)
+    if location_error:
+        raise WorktreeError(location_error)
 
     if path.exists():
         if not path.is_dir():
@@ -290,10 +354,10 @@ def ensure_worktree(task: dict, project_path: str | Path) -> dict:
             "请人工核对后处理，夜班不抢着删"
         )
     base_ref = head_sha(project_path)
+    ensure_exclude(project_path)
     git_out(
         project_path, "worktree", "add", str(path), "-b", branch, base_ref,
     )
-    ensure_exclude(project_path)
     return {"worktree_path": str(path), "branch": branch, "base_ref": base_ref}
 
 
@@ -465,23 +529,16 @@ def check_task_tree(
     """合并/丢弃前的双核验。返回 None = 合法；否则给人话原因。
 
     - worktree_path 必须严格位于 <project>/.claude/worktrees/ 下；
-    - branch 必须严格等于这条链记录的 ns/<slug>（slug 按链根任务 id 推，
-      后继班沿用首班分支，所以按 root_id 算）；
+    - branch 必须是与链根任务 id、目录名和各班落盘记录一致的安全 ns/<slug>；
+      标题可编辑，不拿当前标题重算旧分支；
     - 树必须在项目册上且登记分支与记录一致。
     """
-    wt = status.get("worktree_path")
-    branch = status.get("branch")
-    if not wt or not branch:
-        return "这个任务没有登记工作树（还没建过树，无从合并/丢弃）"
-    root = (Path(project_path) / WORKTREES_DIR).absolute()
-    rp = Path(wt).absolute()
-    if rp.parent != root:
-        return f"工作树路径不在项目的 {WORKTREES_DIR.as_posix()}/ 下，拒绝动它：{wt}"
-    root_id = task.get("root_id") or task["id"]
-    expected = f"ns/{slug_for(root_id, task.get('title') or '')}"
-    if branch != expected:
-        return f"分支与这条链的记录不符：登记 {branch}，按链应是 {expected}"
-    entry = registered_worktree(project_path, rp)
+    reason = _recorded_identity_error(task, project_path, status)
+    if reason:
+        return reason
+    wt = status["worktree_path"]
+    branch = status["branch"]
+    entry = registered_worktree(project_path, wt)
     if entry is None:
         return f"这个路径不是项目登记的工作树：{wt}"
     if entry.get("branch") != f"refs/heads/{branch}":
@@ -496,6 +553,11 @@ def _is_ancestor(project_path: str | Path, branch: str) -> bool:
     """分支是否已经是主线 HEAD 的祖先（= 已经合并过）。"""
     proc = _git(project_path, "merge-base", "--is-ancestor", branch, "HEAD")
     return proc.returncode == 0
+
+
+def _ref_is_ancestor(project_path: str | Path, ref: str) -> bool:
+    """一个已记录 sha/ref 是否已在主线历史中。命令失败按 False，不猜。"""
+    return _git(project_path, "merge-base", "--is-ancestor", ref, "HEAD").returncode == 0
 
 
 def _branch_exists(project_path: str | Path, branch: str) -> bool:
@@ -523,7 +585,39 @@ def _clear_tree_meta(task_id: str) -> None:
     store.modify_status(task_id, mut)
 
 
+@contextmanager
+def _operation_lock(task: dict):
+    """串行化同一任务的 merge/discard。
+
+    HTTP 是 ThreadingHTTPServer，手机双击会真的并发进两条 Git 流程；第二条
+    绝不能在第一条 merge 中途误判冲突并 abort。文件锁也覆盖同机其他进程。
+    """
+    root_id = task.get("root_id") or task["id"]
+    path = store.task_dir(root_id) / ".worktree-op.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def merge_task(
+    task: dict, project_path: str | Path, status: dict, config: dict,
+    close_windows=None,
+) -> tuple[bool, str]:
+    """串行入口；锁内重读状态，过期的第二个请求不会重复执行 Git。"""
+    with _operation_lock(task):
+        fresh_status = store.read_status(task["id"])
+        if fresh_status.get("state") == "merged":
+            return True, "已经合并进主线，工作树与分支已清理"
+        return _merge_task_locked(
+            task, project_path, fresh_status, config, close_windows=close_windows,
+        )
+
+
+def _merge_task_locked(
     task: dict, project_path: str | Path, status: dict, config: dict,
     close_windows=None,
 ) -> tuple[bool, str]:
@@ -551,8 +645,9 @@ def merge_task(
         and _is_ancestor(project_path, branch)
     )
     fully_gone = bool(
-        wt and branch
+        wt and branch and merge_sha
         and not Path(wt).exists() and not _branch_exists(project_path, branch)
+        and _ref_is_ancestor(project_path, str(merge_sha))
     )
 
     if not (already_merged or fully_gone):
@@ -568,18 +663,28 @@ def merge_task(
         proc = _git(project_path, "merge", "--no-ff", "--no-edit", branch)
         if proc.returncode != 0:
             if _merge_in_progress(project_path):
-                _git(project_path, "merge", "--abort")
-                if _merge_in_progress(project_path):
+                abort_proc = _git(project_path, "merge", "--abort")
+                if abort_proc.returncode != 0 or _merge_in_progress(project_path):
                     reason = "合并冲突，且 merge --abort 后主线仍有合并进行态，需要人工处理"
+                elif not worktree_clean(project_path):
+                    reason = "合并冲突虽已 abort，但主线仍留下未提交改动，需要人工处理"
                 else:
                     reason = f"合并冲突，已放弃合并（merge --abort），树与分支保留：{_tail(proc)}"
             else:
-                reason = f"合并失败（主线未动）：{_tail(proc)}"
+                if worktree_clean(project_path):
+                    reason = f"合并失败（主线未动）：{_tail(proc)}"
+                else:
+                    reason = f"合并失败且主线留下未提交改动，需要人工处理：{_tail(proc)}"
             return _merge_fail(task_id, reason, merge_sha)
         merge_sha = git_out(project_path, "rev-parse", "HEAD").strip()
     elif already_merged and not merge_sha:
-        # 手工合过没记账：用 merge-base 兜底，不再造第二个 merge commit
-        merge_sha = git_out(project_path, "merge-base", branch, "HEAD").strip()
+        # 手工合过没记账：记分支 tip，不再造第二个 merge commit
+        merge_sha = git_out(project_path, "rev-parse", branch).strip()
+
+    # 先把合并证据落盘再清树/删分支。这样即使进程恰在清理阶段崩溃，
+    # 下次也只会在验证该 sha 已是主线祖先后补清理，不会凭“树不见了”猜已合并。
+    if merge_sha:
+        store.update_status(task_id, merge_sha=merge_sha)
 
     # merge 成功：先关这条链自己开的窗口，再清工作树、删分支
     if close_windows is not None:
@@ -632,22 +737,46 @@ def discard_task(
     task: dict, project_path: str | Path, status: dict, config: dict,
     close_windows=None,
 ) -> tuple[bool, str]:
+    """串行入口；锁内重读状态，双击/重试不会并发拆同一棵树。"""
+    with _operation_lock(task):
+        fresh_status = store.read_status(task["id"])
+        if fresh_status.get("state") == "discarded":
+            return True, "已经丢弃：工作树与 ns 分支已删除"
+        return _discard_task_locked(
+            task, project_path, fresh_status, config, close_windows=close_windows,
+        )
+
+
+def _discard_task_locked(
+    task: dict, project_path: str | Path, status: dict, config: dict,
+    close_windows=None,
+) -> tuple[bool, str]:
     """丢弃：先关这条链自己的窗口，再 `git worktree remove --force` +
     `git branch -D`，终态 discarded。只动经过路径/分支双核验的树。"""
     task_id = task["id"]
-    reason = check_task_tree(task, project_path, status)
+    reason = _recorded_identity_error(task, project_path, status)
     if reason:
         return False, reason
     wt = status["worktree_path"]
     branch = status["branch"]
 
+    tree_exists = Path(wt).exists()
+    if tree_exists:
+        reason = check_task_tree(task, project_path, status)
+        if reason:
+            return False, reason
+
     if close_windows is not None:
         close_windows(chain_window_ids(task))
-    proc = _git(project_path, "worktree", "remove", "--force", wt)
-    if proc.returncode != 0:
-        reason = f"丢弃失败（什么都没删成，树保留）：worktree remove：{_tail(proc)}"
-        return False, reason
-    proc = _git(project_path, "branch", "-D", branch)
+    if tree_exists:
+        proc = _git(project_path, "worktree", "remove", "--force", wt)
+        if proc.returncode != 0:
+            reason = f"丢弃失败（什么都没删成，树保留）：worktree remove：{_tail(proc)}"
+            return False, reason
+    if _branch_exists(project_path, branch):
+        proc = _git(project_path, "branch", "-D", branch)
+    else:
+        proc = subprocess.CompletedProcess([], 0, "", "")
     if proc.returncode != 0:
         reason = (
             f"丢弃做了一半：工作树已删，但分支 {branch} 没删掉，需要人工 git branch -D："

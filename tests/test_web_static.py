@@ -39,6 +39,8 @@ def test_app_js_has_merge_discard_orphan_and_state_texts():
         # POST/PUT/preview 都带 worktree
         "worktree: $(\"f-worktree\").checked",
         "worktree: wt.worktree, review: wt.review",
+        # 有树时不展示必然被后端 409 的“删除”假按钮
+        "TERMINAL_STATES.indexOf(state) >= 0 && !hasTree",
     ):
         assert piece in js, piece
 

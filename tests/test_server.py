@@ -1295,3 +1295,26 @@ def test_delete_blocked_while_tree_exists(authed, ns_home, tmp_path):
     assert status == 200
     status, _, _ = authed.request("DELETE", f"/api/tasks/{task_id}")
     assert status == 200
+
+
+def test_edit_cannot_move_or_disable_an_existing_tree(authed, ns_home, tmp_path):
+    proj = _make_git_repo(tmp_path)
+    other_root = tmp_path / "other-root"
+    other_root.mkdir()
+    other = _make_git_repo(other_root)
+    cfg = store.load_config()
+    cfg["projects"] = {"demo": str(proj), "other": str(other)}
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    task_id, wt, _ = _worktree_task(authed, proj, tmp_path, state="failed")
+
+    status, _, body = authed.request(
+        "PUT", f"/api/tasks/{task_id}", {"project": "other"},
+    )
+    assert status == 409 and "不能再换项目" in body["error"]
+    status, _, body = authed.request(
+        "PUT", f"/api/tasks/{task_id}", {"worktree": False},
+    )
+    assert status == 409 and "不能切回老式模式" in body["error"]
+    task = store.load_task(task_id)
+    assert task["project"] == "demo" and task["worktree"] is True
+    assert wt.exists()

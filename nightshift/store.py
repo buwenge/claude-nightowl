@@ -99,6 +99,9 @@ _MERGE_POLICIES = ("manual", "auto")
 # 就算"已结束"（调度器与网页共用这一个定义）
 ENDED_STATES = (
     "finished",
+    "awaiting_merge",
+    "merged",
+    "discarded",
     "exited",
     "failed",
     "cancelled",

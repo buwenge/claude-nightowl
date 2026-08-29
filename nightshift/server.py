@@ -693,6 +693,16 @@ class _Handler(BaseHTTPRequestHandler):
                 msg = "这一班正在跑，只能改标题/任务内容/额度与上下文线/换班设置"
             return self._send_json(400, {"error": msg})
         task = store.load_task(task_id)
+        current_status = store.read_status(task_id)
+        if current_status.get("worktree_path"):
+            if "project" in data and data["project"] != task.get("project"):
+                return self._send_json(
+                    409, {"error": "工作树已经建好，不能再换项目；请先合并或丢弃"}
+                )
+            if "worktree" in data and data["worktree"] is not True:
+                return self._send_json(
+                    409, {"error": "工作树已经建好，不能切回老式模式；请先合并或丢弃"}
+                )
         task.update(data)
         try:
             store.validate_task(task, store.load_config(), task_id=task_id)
@@ -832,8 +842,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not store.worktree_enabled(task):
             return self._send_json(409, {"error": "老式任务没有工作树，不需要合并"})
         cfg = store.load_config()
+        project_path = (cfg.get("projects") or {}).get(task.get("project"))
+        if not project_path:
+            return self._send_json(409, {"error": "任务的项目已不在配置里，不能合并"})
         ok, note = worktree.merge_task(
-            task, cfg["projects"][task["project"]], status, cfg,
+            task, project_path, status, cfg,
             close_windows=lambda ids: launcher.close_windows(ids, cfg),
         )
         if ok:
@@ -858,8 +871,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not store.worktree_enabled(task):
             return self._send_json(409, {"error": "老式任务没有工作树，无从丢弃"})
         cfg = store.load_config()
+        project_path = (cfg.get("projects") or {}).get(task.get("project"))
+        if not project_path:
+            return self._send_json(409, {"error": "任务的项目已不在配置里，不能丢弃"})
         ok, note = worktree.discard_task(
-            task, cfg["projects"][task["project"]], status, cfg,
+            task, project_path, status, cfg,
             close_windows=lambda ids: launcher.close_windows(ids, cfg),
         )
         if ok:
@@ -874,7 +890,7 @@ class _Handler(BaseHTTPRequestHandler):
         state = status.get("state")
         # S5②：还占着工作树的任务不许直接删任务目录，避免人为制造孤儿
         # （这条先于终态判断：awaiting_merge 也不是终态，但提示该指向树）
-        if store.worktree_enabled(store.load_task(task_id)) and status.get("worktree_path"):
+        if status.get("worktree_path"):
             return self._send_json(
                 409, {"error": "这条任务的工作树还没处理：先合并进主线或丢弃，再删任务"}
             )
