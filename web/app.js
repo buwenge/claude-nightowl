@@ -14,6 +14,9 @@ var EDIT_TASK = null;      // 正在编辑的任务 {id, item, active}；null = 
 var MSG_TASK = null;       // 正在捎话的任务 {id, title}
 var screenTimer = null;
 var previewTimer = null;
+var LAST_ITEMS = [];       // 上一次 /api/tasks 的原始结果，供日期筛选本地重画用
+var SELECTED_DAY = null;   // 选中的日期 "YYYY-MM-DD"（本地时区），null = 不筛选
+var CAL_MONTH = new Date();  // 日历当前显示的月份（任意一天即可，只取年月）
 
 /* ---------- 小工具 ---------- */
 
@@ -68,6 +71,16 @@ function api(method, path, body) {
     banner("网络错误：连不上服务器");
     throw new Error("网络错误");
   });
+}
+
+// 本地时区的 "YYYY-MM-DD"，用于日历分天（跟 fmtLocal 一样按浏览器本地时区走）
+function dayKey(d) {
+  var y = d.getFullYear(), m = d.getMonth() + 1, day = d.getDate();
+  return y + "-" + (m < 10 ? "0" : "") + m + "-" + (day < 10 ? "0" : "") + day;
+}
+function dayKeyFromIso(iso) {
+  var d = new Date(iso);
+  return isNaN(d) ? null : dayKey(d);
 }
 
 function fmtLocal(iso) {
@@ -144,7 +157,7 @@ function showView(name) {
     $("view-" + v).hidden = v !== name;
     $("tab-" + v).setAttribute("aria-selected", v === name ? "true" : "false");
   });
-  if (name === "tasks") { refreshTasks(); refreshQuota(); }
+  if (name === "tasks") { refreshTasks(); refreshQuota(); window.scrollTo(0, 0); }
   if (name === "new") refreshTriggerChoices();
   if (name === "tpl") loadTemplatesView();
 }
@@ -419,14 +432,87 @@ function groupChains(items) {
   });
 }
 
+var DOW_LABELS = ["日", "一", "二", "三", "四", "五", "六"];
+var UNSTARTED_STATES = ["scheduled", "postponed"];
+
+// 哪些天"跑过任务"：按 run_at 分天，状态不在"还没起跑"里就算跑过
+function computeDayMap(items) {
+  var map = {};
+  items.forEach(function (it) {
+    if (UNSTARTED_STATES.indexOf(it.status.state) >= 0) return;
+    var key = dayKeyFromIso(it.task.run_at);
+    if (key) map[key] = true;
+  });
+  return map;
+}
+
+function renderCalendar() {
+  var dayMap = computeDayMap(LAST_ITEMS);
+  var y = CAL_MONTH.getFullYear(), m = CAL_MONTH.getMonth();
+  $("cal-title").textContent = y + " 年 " + (m + 1) + " 月";
+
+  var grid = $("cal-grid");
+  grid.textContent = "";
+  DOW_LABELS.forEach(function (label) {
+    grid.appendChild(el("div", { class: "cal-dow", text: label }));
+  });
+
+  var firstDow = new Date(y, m, 1).getDay();
+  var daysInMonth = new Date(y, m + 1, 0).getDate();
+  var today = dayKey(new Date());
+  for (var i = 0; i < firstDow; i++) {
+    grid.appendChild(el("div", { class: "cal-day pad" }));
+  }
+  for (var d = 1; d <= daysInMonth; d++) {
+    var key = dayKey(new Date(y, m, d));
+    var hasTask = !!dayMap[key];
+    var cls = "cal-day " + (hasTask ? "has-task" : "no-task");
+    if (key === today) cls += " today";
+    if (key === SELECTED_DAY) cls += " selected";
+    var attrs = { type: "button", class: cls, text: String(d) };
+    if (hasTask) {
+      attrs.onclick = (function (dayKeyClosure) {
+        return function () {
+          SELECTED_DAY = SELECTED_DAY === dayKeyClosure ? null : dayKeyClosure;
+          renderTasks(LAST_ITEMS);
+        };
+      })(key);
+    } else {
+      attrs.disabled = "disabled";
+    }
+    grid.appendChild(el("button", attrs));
+  }
+}
+
 function renderTasks(items) {
+  LAST_ITEMS = items;
+  renderCalendar();
   var list = $("task-list");
   list.textContent = "";
+  var hintBox = $("cal-filter-hint");
+  if (SELECTED_DAY) {
+    hintBox.hidden = false;
+    hintBox.textContent = "";
+    hintBox.appendChild(el("span", { text: "只看 " + SELECTED_DAY }));
+    hintBox.appendChild(el("button", {
+      type: "button", class: "ghost", text: "显示全部",
+      onclick: function () { SELECTED_DAY = null; renderTasks(LAST_ITEMS); }
+    }));
+  } else {
+    hintBox.hidden = true;
+  }
+  var shown = SELECTED_DAY
+    ? items.filter(function (it) { return dayKeyFromIso(it.task.run_at) === SELECTED_DAY; })
+    : items;
   if (!items.length) {
     list.appendChild(el("p", { class: "hint", text: "还没有任务。去「新建」页排一个夜班吧。" }));
     return;
   }
-  var chains = groupChains(items);
+  if (!shown.length) {
+    list.appendChild(el("p", { class: "hint", text: SELECTED_DAY + " 没有任务。" }));
+    return;
+  }
+  var chains = groupChains(shown);
   chains.sort(function (a, b) {
     var ga = groupOf(a.latest.status.state), gb = groupOf(b.latest.status.state);
     if (ga !== gb) return ga - gb;
@@ -1030,6 +1116,14 @@ function start() {
   });
   $("btn-refresh").addEventListener("click", function () {
     refreshTasks(); refreshQuota(); banner("已刷新");
+  });
+  $("cal-prev").addEventListener("click", function () {
+    CAL_MONTH = new Date(CAL_MONTH.getFullYear(), CAL_MONTH.getMonth() - 1, 1);
+    renderCalendar();
+  });
+  $("cal-next").addEventListener("click", function () {
+    CAL_MONTH = new Date(CAL_MONTH.getFullYear(), CAL_MONTH.getMonth() + 1, 1);
+    renderCalendar();
   });
   $("btn-requery").addEventListener("click", function () {
     var btn = $("btn-requery");

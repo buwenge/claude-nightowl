@@ -467,3 +467,67 @@ button.danger.solid { background: var(--danger); border-color: var(--danger); co
 }
 .msg-btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 .msg-btns button { flex: 1; min-width: 120px; }
+
+/* ---------- 日期栏 ---------- */
+
+.cal-box {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 10px 14px 14px;
+  margin: 12px 0;
+}
+.cal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.cal-title { font-size: 15px; font-weight: 600; }
+.cal-nav {
+  min-width: 44px;
+  min-height: 44px;
+  font-size: 18px;
+  line-height: 1;
+}
+.cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+  text-align: center;
+}
+.cal-dow { font-size: 12px; color: var(--muted); padding: 4px 0; }
+.cal-day {
+  position: relative;
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  border-radius: 10px;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  touch-action: manipulation;
+}
+.cal-day.pad { visibility: hidden; }
+.cal-day.has-task {
+  color: var(--text);
+  font-weight: 600;
+  cursor: pointer;
+}
+.cal-day.has-task:active { background: var(--accent-weak); }
+.cal-day.no-task { cursor: default; }
+.cal-day.today { outline: 1.5px solid var(--accent); outline-offset: -1.5px; }
+.cal-day.selected { background: var(--accent); color: #fff; }
+.cal-filter-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  font-size: 14px;
+  color: var(--muted);
+}
+.cal-filter-hint button { min-height: 36px; padding: 0 10px; font-size: 13px; }
