@@ -1667,6 +1667,23 @@ def test_pipeline_hold_send_failure_does_not_mark_awaiting_verdict_false(authed,
     assert "hold 控制消息投递失败" in events
 
 
+def test_pipeline_hold_build_send_failure_does_not_leave_control_kind(authed, monkeypatch):
+    """S7.4 阻断三：给 build 成员敲 hold_text 也走 `send_review_control` 的
+    pre_send_fields 模式，send 失败时要精确回滚——不能把 `build_control_kind`
+    留在 status 上，否则下一次任意一个 Stop 都会被误判成"我来看"打断、
+    强行转 held。"""
+    build_id, _ = make_review_pipeline(authed)
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(
+        launcher, "send_keys",
+        lambda wid, text: subprocess.CompletedProcess([], 1, "", "send-keys 失败"),
+    )
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/hold")
+    assert status == 200 and body["hold_requested"] is True
+    build_status = store.read_status(build_id)
+    assert "build_control_kind" not in build_status
+
+
 def test_pipeline_hold_fast_stop_before_send_returns_still_treated_as_control(
     authed, monkeypatch
 ):
@@ -1784,7 +1801,13 @@ def test_pipeline_continue_hold_mid_review_send_failure_returns_409(
     authed, monkeypatch
 ):
     """继续中途暂停的 reviewer 时 send-keys 失败：不能假装"继续"成功了，
-    要返回非 2xx，state 保持 held 不动（不悄悄改成 working）。"""
+    要返回非 2xx，state 保持 held 不动（不悄悄改成 working）。
+
+    S7.4 阻断二：以前一进 hold 分支就无条件先清 `hold_requested`，失败
+    分支返回 409 时它已经被清掉了——用户修好问题后再点一次"继续"会得到
+    "当前没有等你继续的动作"，永久卡死没法重试。这条反例扩展成：先验证
+    失败时 `hold_requested` 仍是 True，再把 send 换成成功重新点一次，
+    必须能正常恢复（不能被第一次失败误清掉的 hold_requested 卡住）。"""
     build_id, review_id = make_review_pipeline(authed, review_state="held")
     store.update_status(
         review_id, held_reason="我来看：工头要来看，已停在这里",
@@ -1800,6 +1823,103 @@ def test_pipeline_continue_hold_mid_review_send_failure_returns_409(
     assert status == 409
     review_status = store.read_status(review_id)
     assert review_status["state"] == "held"
+    assert store.read_status(build_id).get("hold_requested") is True  # 可以重试
+
+    sent = []
+    monkeypatch.setattr(
+        launcher, "send_keys",
+        lambda wid, text: (sent.append((wid, text)) or subprocess.CompletedProcess([], 0)),
+    )
+    status2, _, body2 = authed.request("POST", f"/api/tasks/{build_id}/continue")
+    assert status2 == 200 and body2["resumed"] is True
+    assert len(sent) == 1
+    review_status2 = store.read_status(review_id)
+    assert review_status2["state"] == "working"
+    assert review_status2["review_awaiting_verdict"] is True
+
+
+def test_pipeline_continue_hold_mid_build_sends_resume_and_recovers(authed, monkeypatch):
+    """S7.4 阻断三反例②：working build 被"我来看"中途打断（`held_reason`
+    不含"收工"，说明这不是"已经收工、只是起审稿前被拦住"的边界，是货真
+    价实的中途暂停）——继续必须真正 send 一句"继续"文案让它接着干活，不能
+    只拨回 idle 让旧交接状态决定命运。send 成功后 state 变 working。"""
+    build_id = make_task(authed, "中途 hold 的 build")
+    store.update_status(
+        build_id, state="held", window_id="@1", pane_pid=1,
+        held_reason="我来看：工头要来看，已停在这里", hold_requested=True,
+    )
+    sent = []
+
+    def fake_send_keys(wid, text):
+        sent.append((wid, text))
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(launcher, "send_keys", fake_send_keys)
+
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/continue")
+    assert status == 200 and body["resumed"] is True
+    assert len(sent) == 1 and sent[0][0] == "@1"
+    assert "NEXT" in sent[0][1]
+    build_status = store.read_status(build_id)
+    assert build_status["state"] == "working"
+    assert store.read_status(build_id).get("hold_requested") is not True
+
+
+def test_pipeline_continue_hold_mid_build_send_failure_returns_409_and_retryable(
+    authed, monkeypatch
+):
+    """S7.4 阻断二 + 阻断三反例：中途暂停的 build 恢复发送失败时，不能假装
+    "继续"成功了——要回非 2xx，`held`/`hold_requested` 都要保持原样，用户
+    修好问题后必须能再点一次重试（不能像 S7.3 那样在失败前就先清掉
+    hold_requested，导致第二次点击得到"当前没有等你继续的动作"）。"""
+    build_id = make_task(authed, "中途 hold 的 build（send 失败）")
+    store.update_status(
+        build_id, state="held", window_id="@1", pane_pid=1,
+        held_reason="我来看：工头要来看，已停在这里", hold_requested=True,
+    )
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(
+        launcher, "send_keys",
+        lambda wid, text: subprocess.CompletedProcess([], 1, "", "失败"),
+    )
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/continue")
+    assert status == 409
+    build_status = store.read_status(build_id)
+    assert build_status["state"] == "held"
+    assert store.read_status(build_id).get("hold_requested") is True  # 可以重试
+
+    # 换成 send 成功，第二次点击必须真的能恢复，不能因为第一次失败前误清
+    # 了 hold_requested 而在这里得到"当前没有等你继续的动作"。
+    sent = []
+    monkeypatch.setattr(
+        launcher, "send_keys",
+        lambda wid, text: (sent.append((wid, text)) or subprocess.CompletedProcess([], 0)),
+    )
+    status2, _, body2 = authed.request("POST", f"/api/tasks/{build_id}/continue")
+    assert status2 == 200 and body2["resumed"] is True
+    assert len(sent) == 1
+    assert store.read_status(build_id)["state"] == "working"
+
+
+def test_pipeline_continue_hold_build_checkpoint_boundary_still_starts_review(
+    authed,
+):
+    """S7.4 阻断三回归测试：build 已经收工、只是起审稿前被"我来看"拦住的
+    边界（`held_reason` 含"收工"字样，交接早就写好）——继续仍然安全地走
+    既有 idle 分流（`chain_checked=False` 让它重新评估），不该被这次改动
+    误伤成"中途暂停"、去发一句多余的 resume 文案。"""
+    build_id, review_id = make_review_pipeline(authed, build_state="held")
+    store.update_status(
+        build_id, held_reason="收工后本该起审稿，但工头要来看",
+        hold_requested=True,
+    )
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/continue")
+    assert status == 200 and body["resumed"] is True
+    build_status = store.read_status(build_id)
+    assert build_status["state"] == "idle"
+    assert build_status["chain_checked"] is False
+    assert store.read_status(build_id).get("hold_requested") is not True
 
 
 def test_pipeline_continue_without_hold_or_round_limit_409(authed):

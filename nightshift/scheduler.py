@@ -66,6 +66,14 @@ DEFAULT_REVIEW_HOLD_RESUME_TEXT = (
     "来自nightshift：工头看完了，继续这一轮审稿——"
     "结束时仍然只用 NEXT: done / NEXT: fix / NEXT: pending 三选一。"
 )
+# S7.4 阻断三：working build 被"我来看"中途打断（还没走到收工边界，没有
+# 完成本轮交接），"继续"要真正让它接着干活——跟 review 那句一样不能提
+# "额度"，也不能提 verdict（build 的协议是交接文件末行 NEXT: done/continue，
+# 不是 done/fix/pending）。
+DEFAULT_BUILD_HOLD_RESUME_TEXT = (
+    "来自nightshift：工头看完了，继续刚才的工作——"
+    "收工时照常写交接，末行 NEXT: done 或 NEXT: continue。"
+)
 # 交接文件末行的换班指令（设计稿 §4.4）
 _RE_NEXT_CONTINUE = re.compile(r"^NEXT:\s*continue\s*$")
 _RE_NEXT_DONE = re.compile(r"^NEXT:\s*done\s*$")

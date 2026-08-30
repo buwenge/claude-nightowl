@@ -442,6 +442,16 @@ def review_file_path(task: dict) -> Path:
     return store.task_dir(task["id"]) / f"review-{store.round_of(task)}.md"
 
 
+def _review_file_staging_path(task: dict, token: str) -> Path:
+    """某个 claim（按 token 区分）私有的暂存文件路径——S7.4 阻断一：不同
+    claim 绝不共用同一个可写路径，写文件这一步不再直接碰 canonical 路径
+    `review_file_path()`，只有锁内核验 token 通过才会把暂存文件原子替换
+    成 canonical，避免被取代的旧 claim 在恢复后把 canonical 文件覆盖成
+    自己的旧内容（S7.3 的 token 检查只保护了 status 提交，没保护文件本身）。
+    """
+    return store.task_dir(task["id"]) / f"review-{store.round_of(task)}.{token}.pending"
+
+
 def _parse_review_verdict(text: str) -> tuple[str, bool]:
     """最终回复正文最后非空行严格三选一：done=通过，fix=退回，
     pending=意见未完（不计轮数）。没写 NEXT、空消息或未知值一律保守按
@@ -585,20 +595,37 @@ def _handle_review_stop(task: dict, payload: dict, now: str) -> None:
     # 走到这里说明上面锁内 claim 已经放行了这一次（并发的第二个 Stop 在
     # claim 阶段就已经被挡成 duplicate/control，不会跑到这里跟这次撞车）。
     verdict, protocol_ok = _parse_review_verdict(text)
-    path = review_file_path(task)
+    # S7.4 阻断一：写文件这一步不再直接碰 canonical 路径——每个 claim 写
+    # 自己私有的暂存文件，只有锁内核验 token 通过才把它原子替换成
+    # canonical，跟 status 提交在同一把锁里。S7.3 的 token 检查只在提交
+    # status 这一步核验，写文件那一步任何 claim 者（不管是不是当前有效
+    # 的那个）都直接 os.replace 同一个 canonical 路径——被取代的旧 claim
+    # 恢复后仍然会把 canonical 文件覆盖成自己的旧内容，造成 status 说
+    # fix、文件正文却是 done 这类互相矛盾的结果。
+    staging_path = _review_file_staging_path(task, claim["token"])
     try:
-        store.atomic_write_text(path, text if text.strip() else "（空消息，无审稿正文）\n")
+        store.atomic_write_text(
+            staging_path, text if text.strip() else "（空消息，无审稿正文）\n"
+        )
     except OSError as exc:
-        # 文件没写成：把 claim 撤回（整个键都要 pop 掉，不能只置 None——
-        # update_status 是合并语义，传 None 会把键留在 status 里，跟"从没
-        # claim 过"不是同一份 JSON），净效果等于没变；同一轮后续 Stop 可以
-        # 重新 claim、重新尝试写文件。
-        store.modify_status(task_id, lambda status: status.pop("review_file_claim", None))
+        # 文件没写成：把 claim 撤回——只清自己的 token，如果 claim 已经被
+        # 别人接管（token 不一样了），不能把接管者的 claim 一并删掉（这是
+        # S7.3 遗留的一个真实 bug：旧 except 分支不核验 token 就直接 pop）。
+        def rollback_claim(status: dict) -> None:
+            current = status.get("review_file_claim") or {}
+            if current.get("token") == claim["token"]:
+                status.pop("review_file_claim", None)
+        store.modify_status(task_id, rollback_claim)
+        try:
+            staging_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         store.append_event(
             task_id, f"hook Stop(review) 写审稿文件失败：{exc!r}，本轮可重试"
         )
         return None
 
+    path = review_file_path(task)
     commit_result: dict = {}
 
     def do_commit(status: dict) -> None:
@@ -607,9 +634,25 @@ def _handle_review_stop(task: dict, payload: dict, now: str) -> None:
         # 又重新 claim 了一次，两边不能都以为自己是当前处理者。token 不匹配
         # 说明已经被取代，这次写文件白做了，不提交（不算错误，只是这次
         # Stop 的结果被让位给了后来者）。
+        #
+        # S7.4 阻断一：token 不匹配时绝不 os.replace canonical 文件——被
+        # 取代的 claim 连替换都不做，canonical 文件永远只能来自当前仍然
+        # 有效的那个 claim。os.replace 与 status 提交必须在同一把锁内一起
+        # 做，不给"文件已经换了、status 还没提交"或反过来的窗口。
         current_claim = status.get("review_file_claim") or {}
         if current_claim.get("token") != claim.get("token"):
             commit_result["superseded"] = True
+            return
+        try:
+            os.replace(staging_path, path)
+        except OSError as exc:
+            # S7.4 阻断一：替换 canonical 这一步本身也可能失败（磁盘问题、
+            # 目标路径类型不对等）——不能让异常带着"claim 还留着"一起
+            # 逃出去，那样会重现阻断一原本要修的那个洞（claim 永久卡住，
+            # 后续 Stop 全部被判 duplicate）。按"写文件失败"同一个口径处理：
+            # 清掉 claim，允许下一次 Stop 重新 claim、重新尝试。
+            commit_result["replace_failed"] = exc
+            status.pop("review_file_claim", None)
             return
         status["review_verdict"] = verdict
         status["review_file"] = str(path)
@@ -624,8 +667,24 @@ def _handle_review_stop(task: dict, payload: dict, now: str) -> None:
 
     updated = store.modify_status(task_id, do_commit)
     if commit_result.get("superseded"):
+        try:
+            staging_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         store.append_event(
-            task_id, f"hook Stop(review) 第 {round_} 轮 claim 已被更新的一次取代，未提交"
+            task_id,
+            f"hook Stop(review) 第 {round_} 轮 claim 已被更新的一次取代，未提交"
+            "（暂存文件已清理，canonical 文件未被碰过）",
+        )
+        return None
+    if commit_result.get("replace_failed"):
+        try:
+            staging_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        store.append_event(
+            task_id,
+            f"hook Stop(review) 写审稿文件失败：{commit_result['replace_failed']!r}，本轮可重试",
         )
         return None
     note = "" if protocol_ok else "（协议缺失：没写合法 NEXT，保守按 fix）"
@@ -733,6 +792,29 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
         # S7：审稿角色不分 Claude/Codex，Stop 一律走审稿意见文件协议
         # （落 review-<round>.md + 记 review_verdict），不进 build 那两支。
         return _handle_review_stop(task, payload, now)
+
+    elif (
+        event == "Stop"
+        and store.read_status(task_id).get("build_control_kind") == "hold"
+    ):
+        # S7.4 阻断三：working build 被"我来看"打断——这次 Stop 是控制回复
+        # 造成的，不是正常收工，不能跑存档点/换班判定/审稿流程（那会把
+        # 中途暂停误判成这一班已经收工，甚至提前起审稿）。不分 Claude/
+        # Codex，两家共用这一支：直接转 held，等"继续"用带 resume 语气的
+        # 文案真正让它接着干活（见 server._api_pipeline_continue）。
+        def consume_build_hold(status: dict) -> None:
+            status["state"] = "held"
+            status["held_since"] = now
+            status["held_reason"] = "我来看：工头要来看，已停在这里"
+            status["last_event_at"] = now
+            status["stuck"] = False
+            status.pop("auto_interrupted", None)
+            status.pop("stuck_since", None)
+            status.pop("build_control_kind", None)
+
+        store.modify_status(task_id, consume_build_hold)
+        store.append_event(task_id, "hook Stop(build) 我来看：已停在这里等工头")
+        return None
 
     elif event == "Stop" and runner == "codex":
         # Codex 的 Stop payload 没有 background_tasks/session_crons（那是

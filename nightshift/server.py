@@ -1062,8 +1062,18 @@ class _Handler(BaseHTTPRequestHandler):
                     if sent:
                         pinged.append(str(wid))
                 else:
-                    proc = launcher.send_keys(str(wid), text)
-                    if proc.returncode == 0:
+                    # S7.4 阻断三：build 也需要"落盘在 send 之前"的模式——
+                    # Stop 可能抢在 send 返回之前到达，`build_control_kind`
+                    # 必须在那之前就生效，hook.py 的 Stop 分发才能正确认出
+                    # "这次 Stop 是我来看打断的，不是正常收工"。
+                    # `send_review_control` 本身没有硬编码任何 review 专属
+                    # 逻辑（pre_send_fields/success_only_fields 都是调用方
+                    # 传的字典），直接复用，不单独另写一个同构的 helper。
+                    sent = scheduler.send_review_control(
+                        t["id"], str(wid), text, kind="hold",
+                        pre_send_fields={"build_control_kind": "hold"},
+                    )
+                    if sent:
                         pinged.append(str(wid))
             store.append_event(
                 pipeline_id,
@@ -1088,39 +1098,64 @@ class _Handler(BaseHTTPRequestHandler):
         失败要返回非 2xx，不能假装"继续"这个动作成功了。
 
         build 侧同一类风险（网页"我来看" ping 一个正在干活的 build 时，
-        build 没有 review 那套 `review_control_kind`/`awaiting_verdict`
-        状态跟踪，Stop 回来后可能被普通 build 协议误判）是已知的、类似
-        但**没有具体反例**的缺口——`_hold_blocks()` 目前只在
-        `_start_review_round`（build 已经收工、要起审稿的边界，交接早已
-        写好）与 `_check_review_idle`（review verdict 路由边界）这两处
-        调用，build 从未在"中途"被这条 scheduler 级 hold 拦截过，所以这
-        条 continue 分支对 build 目前恒安全；但 HTTP hold API 对 build 的
-        ping 是直接 `send_keys`，不会让 build 转入 `state=="held"`，也就
-        不会走到这里——这个不对称本身是留着没补的缺口，不在这次 S7.3 的
-        四个具体反例范围内，不在这里动手重写。
+        S7.4 阻断三补上了对称的控制机制——见 `_api_pipeline_hold` 的 build
+        分支与下面 `role_of(t)=="build"` 的两个子分支）。
+
+        S7.4 阻断二：以前一进 hold 分支就无条件先清 `hold_requested`，导致
+        窗口消失/send 失败时 API 虽然回 409，但 coordinator 已经不再等待
+        continue——用户处理好问题后再点一次会得到"当前没有等你继续的动作"，
+        永久卡死没法重试。改成只在每条分支**确定成功**之后才清
+        `hold_requested`，失败分支保持它是 True，可以再点一次。
         """
         pipeline_id = self._resolve_pipeline(task_id)
         if pipeline_id is None:
             return
         coordinator = store.read_status(pipeline_id)
         if coordinator.get("hold_requested"):
-            store.update_status(pipeline_id, hold_requested=False)
             blocked = None
             for item in self._pipeline_members(pipeline_id):
                 t, s = item["task"], item["status"]
                 if s.get("state") == "held" and "工头" in (s.get("held_reason") or ""):
                     blocked = (t, s)
             if blocked is None:
+                store.update_status(pipeline_id, hold_requested=False)
                 store.append_event(pipeline_id, "继续：已清\"我来看\"请求")
                 logger.info("网页继续（我来看）：%s（无阻塞班）", pipeline_id)
                 return self._send_json(200, {"ok": True, "resumed": False})
             t, s = blocked
             if store.role_of(t) == "build":
-                store.update_status(t["id"], state="idle", chain_checked=False)
+                held_reason = s.get("held_reason") or ""
+                if "收工" in held_reason:
+                    # S7.4 阻断三：已经收工、只是起审稿前被拦住的边界——
+                    # 交接早就写好了，安全走既有 idle 分流。
+                    store.update_status(t["id"], state="idle", chain_checked=False)
+                    store.update_status(pipeline_id, hold_requested=False)
+                else:
+                    # 中途被打断，没有完成交接——真正让它继续干活。
+                    window_id = s.get("window_id")
+                    cfg = store.load_config()
+                    if not (window_id and launcher.window_alive(str(window_id), cfg)):
+                        return self._send_json(
+                            409, {"error": "继续失败：施工窗口已经不在了，需要人工处理"}
+                        )
+                    text = cfg.get("build_hold_resume_text") or scheduler.DEFAULT_BUILD_HOLD_RESUME_TEXT
+                    sent = scheduler.send_review_control(
+                        t["id"], str(window_id), text, kind="resume",
+                        pre_send_fields={},
+                        success_only_fields={
+                            "state": "working", "last_event_at": store.utc_now_iso(),
+                        },
+                    )
+                    if not sent:
+                        return self._send_json(
+                            409, {"error": "继续失败：没能让施工会话恢复（send-keys 失败）"}
+                        )
+                    store.update_status(pipeline_id, hold_requested=False)
             elif store.read_status(t["id"]).get("review_verdict") is not None:
                 # 已经有 verdict，只是分流前被拦住——回 idle 重新分流既有
                 # 结果，不用发消息给模型。
                 store.update_status(t["id"], state="idle")
+                store.update_status(pipeline_id, hold_requested=False)
             else:
                 # 中途暂停，还没有 verdict——真正让它继续干活。
                 window_id = s.get("window_id")
@@ -1141,6 +1176,7 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._send_json(
                         409, {"error": "继续失败：没能让审稿会话恢复（send-keys 失败）"}
                     )
+                store.update_status(pipeline_id, hold_requested=False)
             store.append_event(t["id"], "继续：清\"我来看\"请求，重新评估这一班的下一步")
             logger.info("网页继续（我来看）：%s → %s", pipeline_id, t["id"])
             return self._send_json(200, {"ok": True, "resumed": True, "task_id": t["id"]})

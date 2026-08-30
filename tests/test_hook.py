@@ -1040,6 +1040,54 @@ def test_stop_review_stale_claim_after_write_before_commit_crash_recovers():
     assert review_path.read_text(encoding="utf-8") == text
 
 
+def test_stop_review_claim_takeover_old_writer_cannot_corrupt_canonical_file(monkeypatch):
+    """S7.4 阻断一反例（监理原话"双 writer：旧的慢、新的接管并先提交、旧的
+    随后恢复"）：A 的 Stop 先 claim、写文件这一步被拦截（模拟"写了很久"）；
+    拦截期间，B 的 Stop（时间戳晚 40 秒，跨过 30 秒过期阈值）完整跑完一遍
+    ——claim 接管、写文件、提交 NEXT: fix。A 的写文件随后才真正完成、走到
+    自己的 commit，这时它的 token 已经不是当前 claim 的 token，必须整个
+    放弃（连 canonical 文件的 os.replace 都不做），不能把 canonical 覆盖
+    回自己的旧内容。S7.3 的 token 检查只保护了 status 提交，没保护写文件
+    这一步（那一步以前直接碰 canonical），这条反例就是补这个洞：最终
+    canonical 正文、verdict、last_message 三者都必须来自 B，A 自己的暂存
+    文件不残留。"""
+    from nightshift import hook
+
+    task_id = make_review_task()
+    a_text = "旧 writer 的意见（不该生效）。\n\nNEXT: done"
+    b_text = "新 writer 接管后的意见（应该生效）。\n\nNEXT: fix"
+
+    real_atomic_write_text = store.atomic_write_text
+    state = {"intercepted": False}
+
+    def fake_atomic_write_text(path, text, mode=None):
+        if not state["intercepted"] and str(path).endswith(".pending"):
+            state["intercepted"] = True
+            future_now = (
+                datetime.now(timezone.utc) + timedelta(seconds=40)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            hook._handle_review_stop(
+                store.load_task(task_id),
+                {"last_assistant_message": b_text}, future_now,
+            )
+        return real_atomic_write_text(path, text, mode=mode)
+
+    monkeypatch.setattr(store, "atomic_write_text", fake_atomic_write_text)
+    now_a = store.utc_now_iso()
+    hook._handle_review_stop(
+        store.load_task(task_id), {"last_assistant_message": a_text}, now_a,
+    )
+
+    status = store.read_status(task_id)
+    assert status["review_verdict"] == "fix"
+    assert status["last_message"].startswith("新 writer 接管后的意见")
+    assert "review_file_claim" not in status
+    canonical = store.task_dir(task_id) / "review-1.md"
+    assert canonical.read_text(encoding="utf-8") == b_text
+    pending_files = list(store.task_dir(task_id).glob("review-1.*.pending"))
+    assert pending_files == []
+
+
 def test_stop_review_concurrent_stop_accepts_only_one_verdict():
     """S7.1 阻断二反例：两个并发 Stop（不同内容）打向同一个 review 任务
     同一轮，最终只有一个 verdict 被接受、两个进程都不抛异常、review_file
@@ -1220,6 +1268,28 @@ def test_stop_with_session_crons_is_waiting_wakeup():
     status = store.read_status(task_id)
     assert status["state"] == "waiting_wakeup"
     assert status["session_crons"][0]["id"] == "x"
+
+
+def test_stop_build_hold_control_kind_goes_held_not_normal_stop_path():
+    """S7.4 阻断三反例①：working build 被"我来看"打断（`build_control_kind`
+    已经在 send 之前落盘，见 server._api_pipeline_hold）——这次 Stop 不该
+    走正常的存档点/换班/审稿流程，必须直接转 held、清掉控制标记，且不该
+    触碰任何交接判定字段（`chain_checked`/`checkpoint_done` 保持原样，不
+    因为这次 Stop 而被误置成"已经收工"）。"""
+    task_id = make_task()
+    store.update_status(task_id, state="working", build_control_kind="hold")
+    proc = run_hook(task_id, "Stop", json.dumps({
+        "last_assistant_message": "收到，我先停下。",
+    }))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["state"] == "held"
+    assert status["held_reason"] == "我来看：工头要来看，已停在这里"
+    assert "build_control_kind" not in status
+    assert "checkpoint_done" not in status
+    assert "chain_checked" not in status
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "我来看：已停在这里等工头" in events
 
 
 def test_alarm_plan():
