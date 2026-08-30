@@ -1239,6 +1239,30 @@ def _update_coordinator(task: dict, **fields) -> dict:
     return store.update_status(_coordinator_id(task), **fields)
 
 
+def _current_build(task: dict) -> tuple[dict, dict] | None:
+    """这条流水线里，状态为 held 且 role=build 的那一个任务。
+
+    S7.1 阻断三：以前到处用 `review_task.get("parent_id")` 猜"当前 build
+    是谁"——这只在 review 是这一轮第一个审稿任务时恰好正确；pending 的
+    release 分支新建 review#2 后，review#2.parent_id 是 review#1，不是
+    build，`_review_done`/`_review_fix` 沿它找会摸到错的任务。改成按
+    pipeline_id + role=build + state=held 直接找，不依赖链上是第几步。
+
+    S5 起同一 pipeline 同一时刻理论上只应该有一个 build 处于 held（阻断四
+    的同 pipeline 互斥要到 S7.1③ 才真正强制），这里按 list_tasks() 的
+    run_at 升序取第一个匹配，找不到返回 None（build 窗口已经不在了/被
+    release 关掉了）。
+    """
+    pid = _coordinator_id(task)
+    for item in store.list_tasks():
+        t = item["task"]
+        if store.pipeline_id_of(t) != pid or store.role_of(t) != "build":
+            continue
+        if item["status"].get("state") == "held":
+            return t, item["status"]
+    return None
+
+
 def _hold_blocks(task: dict, config: dict, now: datetime, *, reason: str) -> list[str] | None:
     """流水线协调状态若 hold_requested：这一班转 held 并停在这里，不再往下
     走（不起审稿、不返工、不合并）；否则返回 None 交回调用方继续正常流程。
@@ -1282,16 +1306,23 @@ def _apply_review_no_quota_policy(review_task: dict, config: dict, now: datetime
     树上的改动已经打过存档点，不需要会话继续开着烧保活）；hold 什么都不
     做，build 继续 held、按其 runner 的保活间隔戳。只在第一次因这个原因
     处理父班时动手，避免每个 tick 都重复关同一个窗口。
+
+    S7.1 阻断三：改用 `_current_build` 按 pipeline+role+held 找真正的
+    build（而不是 `review_task.get("parent_id")`）——pending 的 release
+    分支新建的 review#2 的 parent_id 是 review#1，不是 build，旧写法在这种
+    场景下会摸到 review#1（state 早就不是 held）直接空转，on_no_quota=
+    release 的关窗策略悄悄失效。
     """
-    parent_id = review_task.get("parent_id")
-    if not parent_id:
-        return
     review_cfg = store.review_config(review_task, config)
     if (review_cfg.get("on_no_quota") or "release") != "release":
         return
-    parent_status = store.read_status(parent_id)
-    if parent_status.get("state") != "held" or parent_status.get("review_no_quota_released"):
+    current = _current_build(review_task)
+    if current is None:
         return
+    parent_task, parent_status = current
+    if parent_status.get("review_no_quota_released"):
+        return
+    parent_id = parent_task["id"]
     window_id = parent_status.get("window_id")
     if window_id:
         launcher.close_windows([window_id], config)
@@ -1401,16 +1432,20 @@ def _check_review_idle(
 def _review_done(review_task: dict, config: dict, now: datetime) -> list[str]:
     """审稿通过：叫停仍 held 着的 build 会话（若还活着），复用
     `_finalize_done` 走 merge_policy 分流（manual → awaiting_merge；
-    auto → 唯一 merge helper）。"""
+    auto → 唯一 merge helper）。
+
+    S7.1 阻断三：改用 `_current_build` 找真正 held 的 build（而不是
+    `review_task.get("parent_id")`）——review 是 pending release 出来的
+    第 2、3…个审稿任务时，parent_id 指向上一个 review，不是 build，旧写法
+    会摸错任务、build 永久 held 泄漏窗口/保活。
+    """
     task_id = review_task["id"]
-    parent_id = review_task.get("parent_id")
-    if parent_id:
-        parent_status = store.read_status(parent_id)
+    current = _current_build(review_task)
+    if current is not None:
+        parent_task, parent_status = current
+        parent_id = parent_task["id"]
         window_id = parent_status.get("window_id")
-        if (
-            parent_status.get("state") == "held" and window_id
-            and launcher.window_alive(str(window_id), config)
-        ):
+        if window_id and launcher.window_alive(str(window_id), config):
             text = config.get("review_stop_build_text") or DEFAULT_REVIEW_STOP_BUILD_TEXT
             launcher.send_keys(str(window_id), text)
             store.append_event(parent_id, "审稿已通过（NEXT: done），已敲停施工班")
@@ -1440,10 +1475,18 @@ def _review_pending(review_task: dict, config: dict, now: datetime) -> list[str]
 
     status = store.read_status(task_id)
     base_ref = status.get("base_ref") or ""
+    # S7.1 阻断三：pending 之前这一轮如果已经写了半截意见（review_file 已
+    # 落盘），传给续班看，不能让已经审过的内容白白丢掉。
+    partial_review = ""
+    partial_path = status.get("review_file")
+    if partial_path and Path(partial_path).is_file():
+        partial_text = Path(partial_path).read_text(encoding="utf-8", errors="replace")
+        if partial_text.strip():
+            partial_review = "（上一次这轮审到一半，接着看）\n\n" + partial_text
     prompt = store.render_review_prompt(
         config, review_task, base_ref=str(base_ref),
         diff_command=f"git diff {base_ref}..HEAD",
-        build_handover=None, previous_review="", round_=round_,
+        build_handover=None, previous_review=partial_review, round_=round_,
     )
     new_review_id = store.create_cross_role_successor(
         review_task, config, role="review", round_=round_,
@@ -1456,62 +1499,100 @@ def _review_pending(review_task: dict, config: dict, now: datetime) -> list[str]
 def _review_fix(review_task: dict, config: dict, now: datetime) -> list[str]:
     """审稿 NEXT: fix：记一次 fix_count，起下一轮 build 返工——若合格 held
     build 会话仍活着，直接 send-keys 完整意见继续（不新开窗口）；否则造
-    新的 build 班。两条路径都留下不覆盖的 round/checkpoint 审计。"""
+    新的 build 班。两条路径都留下不覆盖的 round/checkpoint 审计。
+
+    S7.1 阻断一：原地唤醒 held build 这条路径改成两阶段提交——send-keys
+    之前只落一个可丢弃的 `pending_fix_intent` 标记，不动 fix_count/build
+    的 round/shift/checkpoint 字段；send-keys 成功后才一次性提交这些正式
+    字段。失败时只清掉意图标记，双方状态与调用前完全一致，可以安全重试
+    （旧写法先改 fix_count/build.round 再 send-keys，失败后 round=2、
+    fix_count=1 但 build 其余字段停在第 1 轮，成了没法安全重试的半吊子
+    状态）。
+
+    S7.1 阻断一：build 被复用时也要从 `store.next_pipeline_shift` 领一个
+    新的全局单调 shift（不再只改 round）——否则 `chain_state()` 的
+    max-shift 扫描永远扫不到被复用的这一班，会长期停留在旧 review 的
+    状态上。
+
+    S7.1 阻断一：不再把 `review.successor_id` 设成 build_id——build 早在
+    `_start_review_round` 起审稿时就把 successor_id 指向了这个 review，
+    反过来再让 review.successor_id 指回 build 会形成一个两步环。原地唤醒
+    改记 `reactivated_task_id`（review 记：我唤醒了哪个 build），build 侧
+    对应记 `reactivated_from_review_id`，两个字段都只读、不参与任何
+    successor 链遍历，不会成环。
+
+    S7.1 阻断三：改用 `_current_build` 找真正 held 的 build（不再用
+    `review_task.get("parent_id")`）。
+    """
     task_id = review_task["id"]
     round_ = store.round_of(review_task)
     next_round = round_ + 1
     coordinator = _coordinator_status(review_task)
     fix_count = int(coordinator.get("fix_count") or 0) + 1
-    _update_coordinator(
-        review_task, fix_count=fix_count, pipeline_phase="build",
-        round_limit_override=False,
-    )
 
     review_file = store.read_status(task_id).get("review_file")
     review_text = ""
     if review_file and Path(review_file).is_file():
         review_text = Path(review_file).read_text(encoding="utf-8", errors="replace")
 
-    parent_id = review_task.get("parent_id")
-    parent_status = store.read_status(parent_id) if parent_id else {}
-    window_id = parent_status.get("window_id")
-    if (
-        parent_id and parent_status.get("state") == "held" and window_id
-        and launcher.window_alive(str(window_id), config)
-    ):
-        parent_task = store.load_task(parent_id)
-        parent_task["round"] = next_round
-        store.atomic_write_json(store.task_dir(parent_id) / "task.json", parent_task)
-        fix_text = store.render_review_fix_prompt(
-            config, parent_task, round_=next_round, review_text=review_text,
-        )
-        proc = launcher.send_keys(str(window_id), fix_text)
-        if proc.returncode != 0:
-            reason = "审稿退回，但把返工意见敲进施工窗口失败（send-keys 失败）"
-            store.update_status(
-                task_id, state="needs_attention", error=reason, last_event_at=to_iso(now)
+    current = _current_build(review_task)
+    if current is not None:
+        parent_task, parent_status = current
+        parent_id = parent_task["id"]
+        window_id = parent_status.get("window_id")
+        if window_id and launcher.window_alive(str(window_id), config):
+            # 阶段一：只落一个可丢弃的意图标记，不动任何正式状态字段。
+            _update_coordinator(
+                review_task,
+                pending_fix_intent={
+                    "build_id": parent_id, "review_id": task_id, "next_round": next_round,
+                },
             )
-            store.append_event(task_id, reason)
-            launcher.open_notice_window(review_task, "(需要人工)", [reason], config)
-            return [f"{task_id} 返工投递失败 → needs_attention"]
-        # 同一个 build task id 复用进下一轮：checkpoint 相关字段要归零才能
-        # 让 _checkpoint_shift/_check_idle_chain 重新跑一遍；归零前先把上一
-        # 轮的存档点归档进历史，不能覆盖丢失审计线索（不许复用 task id 后
-        # 悄悄盖掉上一轮的 checkpoint_sha）。
-        history = list(parent_status.get("checkpoint_history") or [])
-        if parent_status.get("checkpoint_sha"):
-            history.append({"round": round_, "sha": parent_status["checkpoint_sha"]})
-        store.update_status(
-            parent_id, state="working", round=next_round, last_event_at=to_iso(now),
-            chain_checked=False, checkpoint_done=False, checkpoint_sha=None,
-            checkpoint_history=history,
-        )
-        store.update_status(task_id, state="chained", successor_id=parent_id)
-        store.append_event(
-            parent_id, f"审稿退回（第 {round_} 轮），已捎话继续第 {next_round} 轮返工（同一会话）"
-        )
-        store.append_event(task_id, f"审稿退回，已捎话给仍 held 着的施工班第 {next_round} 轮")
-        return [f"{task_id} 审稿 fix → 捎话继续（第 {next_round} 轮）"]
+            fix_text = store.render_review_fix_prompt(
+                config, parent_task, round_=next_round, review_text=review_text,
+            )
+            proc = launcher.send_keys(str(window_id), fix_text)
+            if proc.returncode != 0:
+                # 失败：只清意图标记，round/fix_count/checkpoint 全部保持
+                # 调用前原样，build 仍 held，下一次可以安全重试。
+                _update_coordinator(review_task, pending_fix_intent=None)
+                reason = "审稿退回，但把返工意见敲进施工窗口失败（send-keys 失败）"
+                store.update_status(
+                    task_id, state="needs_attention", error=reason, last_event_at=to_iso(now)
+                )
+                store.append_event(task_id, reason)
+                launcher.open_notice_window(review_task, "(需要人工)", [reason], config)
+                return [f"{task_id} 返工投递失败 → needs_attention"]
+            # 阶段二：成功，一次性提交所有正式字段。
+            # 同一个 build task id 复用进下一轮：checkpoint 相关字段要归零才能
+            # 让 _checkpoint_shift/_check_idle_chain 重新跑一遍；归零前先把上一
+            # 轮的存档点归档进历史，不能覆盖丢失审计线索（不许复用 task id 后
+            # 悄悄盖掉上一轮的 checkpoint_sha）。
+            history = list(parent_status.get("checkpoint_history") or [])
+            if parent_status.get("checkpoint_sha"):
+                history.append({"round": round_, "sha": parent_status["checkpoint_sha"]})
+            new_shift = store.next_pipeline_shift(review_task)
+            parent_task["round"] = next_round
+            parent_task["shift"] = new_shift
+            store.atomic_write_json(store.task_dir(parent_id) / "task.json", parent_task)
+            store.update_status(
+                parent_id, state="working", round=next_round, shift=new_shift,
+                last_event_at=to_iso(now), chain_checked=False, checkpoint_done=False,
+                checkpoint_sha=None, checkpoint_history=history,
+                reactivated_from_review_id=task_id,
+            )
+            store.update_status(
+                task_id, state="chained", reactivated_task_id=parent_id,
+            )
+            _update_coordinator(
+                review_task, fix_count=fix_count, pipeline_phase="build",
+                round_limit_override=False, pending_fix_intent=None,
+            )
+            store.append_event(
+                parent_id, f"审稿退回（第 {round_} 轮），已捎话继续第 {next_round} 轮返工（同一会话）"
+            )
+            store.append_event(task_id, f"审稿退回，已捎话给仍 held 着的施工班第 {next_round} 轮")
+            return [f"{task_id} 审稿 fix → 捎话继续（第 {next_round} 轮）"]
 
     prompt = store.render_review_fix_prompt(
         config, review_task, round_=next_round, review_text=review_text,
@@ -1519,6 +1600,10 @@ def _review_fix(review_task: dict, config: dict, now: datetime) -> list[str]:
     build_id = store.create_cross_role_successor(
         review_task, config, role="build", round_=next_round,
         prompt_final=prompt, parent_next_state="chained",
+    )
+    _update_coordinator(
+        review_task, fix_count=fix_count, pipeline_phase="build",
+        round_limit_override=False,
     )
     store.append_event(task_id, f"审稿退回 → 新起第 {next_round} 轮返工班 {build_id}")
     return [f"{task_id} 审稿 fix → 新起返工班 {build_id}"]

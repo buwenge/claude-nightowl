@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 import secrets
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,6 +48,7 @@ __all__ = [
     "load_task",
     "modify_status",
     "new_task_id",
+    "next_pipeline_shift",
     "pipeline_id_of",
     "read_status",
     "render",
@@ -195,7 +197,9 @@ def atomic_write_text(path: str | os.PathLike, text: str, mode: int | None = Non
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    # S7.1 阻断二：单用 pid 命名在同进程内并发调用（多线程/hook 竞态测试）
+    # 会撞同一个临时文件名，加 uuid nonce 保证每次调用独占自己的临时文件。
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
     try:
         if mode is not None:
             f = os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), "w", encoding="utf-8")
@@ -567,6 +571,27 @@ def chain_state(task_id: str) -> str:
     return read_status(latest["id"]).get("state") or ""
 
 
+def next_pipeline_shift(task: dict) -> int:
+    """从 pipeline coordinator（pipeline_id_of 对应的任务）原子领取下一个
+    全局单调、唯一的 shift 号。
+
+    S7.1 阻断一：以前各处本地算 `parent.shift + 1`——`_review_fix` 原地
+    复用 held build 时不走这条路，只改 round 不改 shift，导致新一轮返工
+    跟上一轮 review 撞了同一个 shift，`chain_state()` 的"扫最大 shift"
+    猜错、成环。任何"这条流水线产生了新的当前班"的操作（造后继任务、或
+    原地复用 held 任务开始新一轮）都必须从这里领号，不能再各自本地加一。
+    这一步在 coordinator 的 status.json 锁内完成（modify_status），并发
+    领号也不会撞号。
+    """
+    coordinator_id = pipeline_id_of(task)
+
+    def bump(status: dict) -> None:
+        status["pipeline_shift_seq"] = int(status.get("pipeline_shift_seq") or 1) + 1
+
+    status = modify_status(coordinator_id, bump)
+    return status["pipeline_shift_seq"]
+
+
 # create_successor 里交接缺席时的兜底文案（与开工令一致）
 NO_HANDOVER_TEXT = (
     "上一班没留交接。先看 git log / git status / 项目里的验收单或 reports "
@@ -634,7 +659,7 @@ def create_same_role_successor(
       （task/title/project_path/context_limit）再加 shift/handover。
     """
     parent_id = parent_task["id"]
-    shift = int(parent_task.get("shift") or 1) + 1
+    shift = next_pipeline_shift(parent_task)
     handover = handover_text if handover_text else NO_HANDOVER_TEXT
     task = _copy_common_fields(parent_task)
     task.update({
@@ -691,7 +716,7 @@ def create_cross_role_successor(
     （如返工上限内的正常交接）才可能是 chained；本 helper 不揣测、不默认。
     """
     parent_id = parent_task["id"]
-    shift = int(parent_task.get("shift") or 1) + 1
+    shift = next_pipeline_shift(parent_task)
     task = _copy_common_fields(parent_task)
     task.update({
         "run_at": utc_now_iso(),

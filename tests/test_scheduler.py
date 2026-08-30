@@ -2423,6 +2423,14 @@ def test_review_fix_send_keys_failure_is_fail_closed(tmp_path, monkeypatch):
     scheduler.tick(cfg, NOW)
     review_id = store.read_status(tid)["successor_id"]
 
+    # S7.1 阻断一反例：记下 send-keys 之前的完整状态，失败后要能逐字段
+    # 对比"调用前后完全一致，可以安全重试"——旧 bug 是先改 fix_count/
+    # build.round 再 send-keys，失败后 round 已经变了、fix_count 已经加了、
+    # checkpoint 字段却还停在上一轮，成了没法安全重试的半吊子状态。
+    before_task = store.load_task(tid)
+    before_status = store.read_status(tid)
+    before_coordinator = store.read_status(tid)  # tid 本身就是这条流水线的 coordinator
+
     monkeypatch.setattr(
         launcher, "send_keys",
         lambda w, t: subprocess.CompletedProcess([], 1, "", "send-keys 失败"),
@@ -2438,4 +2446,147 @@ def test_review_fix_send_keys_failure_is_fail_closed(tmp_path, monkeypatch):
     assert "失败" in review_status["error"]
     assert len(fakes.notice_calls) == 1
     # build 那边没被悄悄标成继续
-    assert store.read_status(tid)["state"] == "held"
+    after_task = store.load_task(tid)
+    after_status = store.read_status(tid)
+    assert after_status["state"] == "held"
+    assert after_task["round"] == before_task["round"]
+    assert after_task["shift"] == before_task["shift"]
+    assert after_status.get("checkpoint_sha") == before_status.get("checkpoint_sha")
+    assert after_status.get("checkpoint_done") == before_status.get("checkpoint_done")
+    assert after_status.get("checkpoint_history") == before_status.get("checkpoint_history")
+    assert after_status.get("chain_checked") == before_status.get("chain_checked")
+    assert after_status.get("fix_count") == before_coordinator.get("fix_count")  # 没有真的计数
+    assert after_status.get("pending_fix_intent") is None  # 失败后意图标记已清干净
+
+
+def test_review_fix_reuse_success_advances_shift_no_cycle(tmp_path, monkeypatch):
+    """S7.1 阻断一反例：held build 原地复用两轮返工后——
+    - shift 全局单调递增、不撞号（旧 bug：复用只改 round 不改 shift，
+      两轮返工后两个 review 会撞到同一个 shift）；
+    - chain_state() 对 build/两个 review 三方都能扫到真正最新一班的状态
+      （旧 bug：max-shift 撞号时 chain_state 猜错，"当前班"卡在旧状态）；
+    - review 复用 build 时不再写成环的 successor_id（旧 bug：
+      review.successor_id 被设回它复用的 build id，跟 build 早先指向它的
+      successor_id 形成两步环），改记只读的 reactivated_task_id /
+      reactivated_from_review_id，且沿这条流水线所有 successor_id 边走
+      不出现环。
+    """
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _review_config_for(proj)
+    tid = make_review_task()
+    wt = _register_tree(proj, tid, "审稿流水线任务")
+    build1_shift = store.load_task(tid)["shift"]
+    assert build1_shift == 1
+
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "第一轮。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    review1_id = store.read_status(tid)["successor_id"]
+    review1_shift = store.load_task(review1_id)["shift"]
+    assert review1_shift > build1_shift
+
+    _go_idle(review1_id, window_id="@2")
+    rf1 = store.task_dir(review1_id) / "review-1.md"
+    rf1.write_text("退回。\n\nNEXT: fix", encoding="utf-8")
+    store.update_status(review1_id, review_verdict="fix", review_file=str(rf1),
+                        review_recorded_round=1)
+    scheduler.tick(cfg, NOW)
+
+    build_reused_shift = store.load_task(tid)["shift"]
+    assert build_reused_shift > review1_shift  # 原地复用也领了新号，不是停在旧值
+    review1_status = store.read_status(review1_id)
+    assert review1_status["state"] == "chained"
+    assert review1_status.get("reactivated_task_id") == tid
+    assert review1_status.get("successor_id") is None  # 不再写成环的 successor_id
+    build_status_after_reuse = store.read_status(tid)
+    assert build_status_after_reuse.get("reactivated_from_review_id") == review1_id
+
+    # 第二轮返工完成，起真正的第二个 review task
+    (wt / "canary.txt").write_text("r1\nr2\n", encoding="utf-8")
+    _go_idle(tid, window_id="@1")
+    _write_handover(tid, "第二轮。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    review2_id = store.read_status(tid)["successor_id"]
+    review2_shift = store.load_task(review2_id)["shift"]
+    assert review2_shift > build_reused_shift
+
+    shifts = [build1_shift, review1_shift, build_reused_shift, review2_shift]
+    assert len(set(shifts)) == 4 and shifts == sorted(shifts)  # 各不相同且单调递增
+
+    review2_state = store.read_status(review2_id)["state"]
+    assert review2_state == "scheduled"
+    assert store.chain_state(tid) == review2_state
+    assert store.chain_state(review1_id) == review2_state
+    assert store.chain_state(review2_id) == review2_state
+
+    # successor_id 是唯一该被当"流水线走向"遍历的字段（reactivated_task_id /
+    # reactivated_from_review_id 是只读的历史标记，故意不参与遍历）——对
+    # 这条流水线里所有任务的 successor_id 边做环检测，一步都不能兜回来。
+    pipeline_tasks = [
+        item["task"]["id"] for item in store.list_tasks()
+        if store.pipeline_id_of(item["task"]) == tid
+    ]
+    assert set(pipeline_tasks) == {tid, review1_id, review2_id}
+    edges = {t: store.read_status(t).get("successor_id") for t in pipeline_tasks}
+    for start in pipeline_tasks:
+        seen: set[str] = set()
+        node = start
+        while node:
+            assert node not in seen, f"successor_id 链从 {start} 出发成环：{seen}"
+            seen.add(node)
+            node = edges.get(node)
+
+
+def test_review_pipeline_pending_release_carries_partial_review_text(tmp_path, monkeypatch):
+    """S7.1 阻断三反例：pending（release）另起同轮审稿时，如果这一轮已经
+    写了半截意见（review_file 已落盘），续班的 review 提示词里要能看到这
+    半截内容，不能像旧写法一样传空串把已经审过的部分白白丢掉。"""
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _review_config_for(proj)
+    tid = make_review_task()
+    wt = _register_tree(proj, tid, "审稿流水线任务")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "写完了。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    review_id = store.read_status(tid)["successor_id"]
+
+    _go_idle(review_id, window_id="@2")
+    rf = store.task_dir(review_id) / "review-1.md"
+    rf.write_text("已经看了一半，这部分没问题。\n\nNEXT: pending", encoding="utf-8")
+    store.update_status(review_id, review_verdict="pending", review_file=str(rf),
+                        review_recorded_round=1)
+    scheduler.tick(cfg, NOW)
+    new_review_id = store.read_status(review_id)["successor_id"]
+    new_review = store.load_task(new_review_id)
+    assert "已经看了一半，这部分没问题" in new_review["prompt_final"]
+
+
+def test_atomic_write_text_concurrent_calls_do_not_collide(tmp_path):
+    """S7.1 阻断二子问题：atomic_write_text 的临时文件名只用 pid 命名时，
+    同进程内并发调用会撞同一个临时文件名；加 uuid nonce 后多线程并发写
+    同一路径不再互相踩脚，每次调用都各自独立完成。"""
+    import threading
+
+    target = tmp_path / "concurrent.txt"
+    errors: list[BaseException] = []
+
+    def writer(i: int) -> None:
+        try:
+            for _ in range(20):
+                store.atomic_write_text(target, f"来自线程 {i}\n")
+        except BaseException as exc:  # noqa: BLE001 - 就是要抓所有异常
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert target.is_file()
+    assert target.read_text(encoding="utf-8").startswith("来自线程 ")
