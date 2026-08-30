@@ -467,17 +467,47 @@ def test_render_review_prompts_fall_back_when_config_missing_template_keys():
     且渲染出的正文要能看到任务标题（证明确实走了兜底模板而不是空字符串）。"""
     task = make_task(title="没有模板键也要能审")
     prompt = store.render_review_prompt(
-        CONFIG, task, base_ref="abc123", diff_command="git diff abc123..HEAD",
+        CONFIG, task, workdir="/home/user/projects/demo/.claude/worktrees/x",
+        base_ref="abc123", diff_command="git diff abc123..HEAD",
         build_handover="交接内容", previous_review="", round_=1,
     )
     assert "没有模板键也要能审" in prompt
     assert "NEXT: done" in prompt
 
     fix_prompt = store.render_review_fix_prompt(
-        CONFIG, task, round_=2, review_text="退回：改一下命名",
+        CONFIG, task, workdir="/home/user/projects/demo/.claude/worktrees/x",
+        round_=2, review_text="退回：改一下命名",
     )
     assert "没有模板键也要能审" in fix_prompt
     assert "退回：改一下命名" in fix_prompt
+
+
+def test_render_review_prompts_use_workdir_not_main_project_dir():
+    """S7.5 阻断回归锁：真机 smoke 抓到审稿提示词把 {project_path} 填成了
+    config.projects 里的**主项目根目录**（未修的旧代码），不是施工班实际
+    干活的工作树——审稿人因此 cd 到主目录（信任根外，被拒）或读到旧代码，
+    永远判 fix，五轮都合并不了。这条锁工作树路径与主目录是两个不相交的
+    字符串（不是主目录的子路径），避免子串误判；在打 S7.5 补丁之前，两个
+    函数没有 workdir 形参、只会用 CONFIG["projects"]["demo"]，本测试传
+    workdir 关键字参数会直接 TypeError 失败，打完补丁后应正常通过且正文
+    只含工作树路径、不含主项目目录。"""
+    main_dir = CONFIG["projects"]["demo"]
+    workdir = "/var/ns-worktrees/demo-task123"
+    task = make_task(title="工作树回归锁任务")
+
+    prompt = store.render_review_prompt(
+        CONFIG, task, workdir=workdir, base_ref="abc123",
+        diff_command="git diff abc123..HEAD",
+        build_handover=None, previous_review="", round_=1,
+    )
+    assert workdir in prompt
+    assert main_dir not in prompt
+
+    fix_prompt = store.render_review_fix_prompt(
+        CONFIG, task, workdir=workdir, round_=2, review_text="退回：改一下命名",
+    )
+    assert workdir in fix_prompt
+    assert main_dir not in fix_prompt
 
 
 def test_effective_runner_model_effort_by_role():

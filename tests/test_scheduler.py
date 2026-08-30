@@ -1511,8 +1511,13 @@ def test_codex_review_over_session_line_uses_review_text_and_stays_working(monke
                   "week_all_pct": 1, "per_model": {}},
         "fetched_at": scheduler.to_iso(NOW), "error": None,
     })
+    # S7.5：审稿流水线要求 worktree_path 元数据（真实场景下 review.enabled=true
+    # 早已强制 worktree=true，build 阶段就已经建好树）；这条测试只关心
+    # Codex 五小时线协议，不走真 git 工作树，补一个占位路径满足前置条件。
     store.update_status(tid, state="working", window_id="@1", pane_pid=1,
-                        last_event_at=scheduler.to_iso(NOW))
+                        last_event_at=scheduler.to_iso(NOW),
+                        worktree_path="/tmp/ns-codex-review-worktree",
+                        branch="ns/codex-review", base_ref="deadbeef")
     sched.tick(CODEX_CONFIG, NOW)
     status = store.read_status(tid)
     assert status["state"] == "working"  # 不转 build 专属的 waiting_wakeup
@@ -3441,6 +3446,87 @@ def test_review_pipeline_pending_release_carries_partial_review_text(tmp_path, m
     new_review_id = store.read_status(review_id)["successor_id"]
     new_review = store.load_task(new_review_id)
     assert "已经看了一半，这部分没问题" in new_review["prompt_final"]
+
+
+def test_review_prompts_pass_worktree_not_main_project_dir(tmp_path, monkeypatch):
+    """S7.5 阻断回归锁：真机 smoke 抓到审稿提示词把 {project_path} 填成了
+    config.projects 里的主签出目录（未修的旧代码），不是施工班实际干活的
+    工作树——审稿会话的 cwd/信任根是工作树，指错目录会让审稿人读到旧代码、
+    永远判 fix，五轮都合并不了（死循环）。
+
+    这条锁盯两处调用点：`_start_review_round`（build 收工起第 1 轮审稿）
+    与 `_review_pending` 的 release 分支（额度到线另起同轮审稿）——spy 记录
+    每次 store.render_review_prompt 实际收到的 workdir 关键字参数，断言
+    等于登记在 status 里的 worktree_path、且不等于 config 主目录。
+
+    在打 S7.5 补丁之前，`render_review_prompt` 没有 `workdir` 形参，这个
+    spy（透传 workdir 给真实实现）会在两次调用处直接 TypeError，证明这条
+    测试确实锁住了旧代码的缺陷，不是摆设。"""
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _review_config_for(proj)
+    calls: list[str] = []
+    real_render = store.render_review_prompt
+
+    def spy(config, task, *, workdir, **kw):
+        calls.append(workdir)
+        return real_render(config, task, workdir=workdir, **kw)
+
+    monkeypatch.setattr(store, "render_review_prompt", spy)
+
+    tid = make_review_task()
+    wt = _register_tree(proj, tid, "审稿流水线任务")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "写完了。\nNEXT: done")
+    scheduler.tick(cfg, NOW)  # _start_review_round 起第 1 轮审稿
+    assert len(calls) == 1
+    assert calls[0] == str(wt)
+    assert calls[0] != str(proj)
+
+    review_id = store.read_status(tid)["successor_id"]
+    _go_idle(review_id, window_id="@2")
+    rf = store.task_dir(review_id) / "review-1.md"
+    rf.write_text("看到一半，先记着。\n\nNEXT: pending", encoding="utf-8")
+    store.update_status(review_id, review_verdict="pending", review_file=str(rf),
+                        review_recorded_round=1)
+    scheduler.tick(cfg, NOW)  # _review_pending release 分支另起同轮审稿
+    assert len(calls) == 2
+    assert calls[1] == str(wt)
+    assert calls[1] != str(proj)
+
+
+def test_review_pending_release_needs_attention_when_worktree_metadata_missing(
+    tmp_path, monkeypatch,
+):
+    """S7.5 阻断附带守卫：pending release 分支读不到 worktree_path 时必须
+    fail-closed 到 needs_attention，不能像旧写法一样悄悄用主项目目录顶替
+    ——同 `_start_review_round` 已有的"工作树元数据缺失"口径对齐。走一遍
+    真实流水线起好第 1 轮审稿后，模拟崩溃恢复现场把 worktree_path 清掉
+    （元数据本该跟着 review 走一份，这里故意抹掉这一份来触发缺失分支）。"""
+    Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _review_config_for(proj)
+    tid = make_review_task()
+    wt = _register_tree(proj, tid, "审稿流水线任务")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "写完了。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    review_id = store.read_status(tid)["successor_id"]
+    assert store.read_status(review_id).get("worktree_path")  # 正常路径下应已继承
+
+    store.update_status(review_id, worktree_path=None)  # 模拟元数据缺失现场
+    _go_idle(review_id, window_id="@2")
+    rf = store.task_dir(review_id) / "review-1.md"
+    rf.write_text("看到一半。\n\nNEXT: pending", encoding="utf-8")
+    store.update_status(review_id, review_verdict="pending", review_file=str(rf),
+                        review_recorded_round=1)
+    actions = scheduler.tick(cfg, NOW)
+    status = store.read_status(review_id)
+    assert status["state"] == "needs_attention"
+    assert "worktree_path" in status.get("error", "")
+    assert any("元数据缺失" in a for a in actions)
 
 
 def test_atomic_write_text_concurrent_calls_do_not_collide(tmp_path):

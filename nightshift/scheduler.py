@@ -1634,8 +1634,9 @@ def _start_review_round(task: dict, config: dict, now: datetime) -> list[str]:
     handover_text = _read_handover(_handover_file(task, status))
     prompt = store.render_review_prompt(
         config, task,
+        workdir=str(wt),
         base_ref=str(base_ref),
-        diff_command=f"git diff {base_ref}..HEAD",
+        diff_command=f"git -C {wt} diff {base_ref}..HEAD",
         build_handover=handover_text,
         previous_review=_previous_review_text(task, round_),
         round_=round_,
@@ -1822,6 +1823,17 @@ def _review_pending(review_task: dict, config: dict, now: datetime) -> list[str]
         return [f"{task_id} 审稿 pending → held"]
 
     status = store.read_status(task_id)
+    # S7.5 阻断：review 继承同一棵工作树，元数据缺失时 fail-closed 到
+    # needs_attention，不静默退回主项目目录（同 _start_review_round 的口径）。
+    wt = status.get("worktree_path")
+    if not wt:
+        reason = "审稿流水线要求工作树元数据（worktree_path），但这一班缺失"
+        store.update_status(
+            task_id, state="needs_attention", error=reason, last_event_at=to_iso(now)
+        )
+        store.append_event(task_id, reason)
+        launcher.open_notice_window(review_task, "(需要人工)", [reason], config)
+        return [f"{task_id} 审稿流水线元数据缺失 → needs_attention"]
     base_ref = status.get("base_ref") or ""
     # S7.1 阻断三：pending 之前这一轮如果已经写了半截意见（review_file 已
     # 落盘），传给续班看，不能让已经审过的内容白白丢掉。
@@ -1832,8 +1844,8 @@ def _review_pending(review_task: dict, config: dict, now: datetime) -> list[str]
         if partial_text.strip():
             partial_review = "（上一次这轮审到一半，接着看）\n\n" + partial_text
     prompt = store.render_review_prompt(
-        config, review_task, base_ref=str(base_ref),
-        diff_command=f"git diff {base_ref}..HEAD",
+        config, review_task, workdir=str(wt), base_ref=str(base_ref),
+        diff_command=f"git -C {wt} diff {base_ref}..HEAD",
         build_handover=None, previous_review=partial_review, round_=round_,
     )
     new_review_id = store.create_cross_role_successor(
@@ -1932,7 +1944,8 @@ def _review_fix(review_task: dict, config: dict, now: datetime) -> tuple[list[st
     coordinator = _coordinator_status(review_task)
     fix_count = int(coordinator.get("fix_count") or 0) + 1
 
-    review_file = store.read_status(task_id).get("review_file")
+    review_status = store.read_status(task_id)
+    review_file = review_status.get("review_file")
     review_text = ""
     if review_file and Path(review_file).is_file():
         review_text = Path(review_file).read_text(encoding="utf-8", errors="replace")
@@ -1950,8 +1963,12 @@ def _review_fix(review_task: dict, config: dict, now: datetime) -> tuple[list[st
                     "build_id": parent_id, "review_id": task_id, "next_round": next_round,
                 },
             )
+            # S7.5 阻断：workdir 用 build 自己登记的工作树（parent_status），
+            # 不是 config 主目录——返工班永远在工作树里干活。
             fix_text = store.render_review_fix_prompt(
-                config, parent_task, round_=next_round, review_text=review_text,
+                config, parent_task,
+                workdir=str(parent_status.get("worktree_path") or ""),
+                round_=next_round, review_text=review_text,
             )
             proc = launcher.send_keys(str(window_id), fix_text)
             if proc.returncode != 0:
@@ -2005,8 +2022,13 @@ def _review_fix(review_task: dict, config: dict, now: datetime) -> tuple[list[st
             store.append_event(task_id, f"审稿退回，已捎话给仍 held 着的施工班第 {next_round} 轮")
             return [f"{task_id} 审稿 fix → 捎话继续（第 {next_round} 轮）"], True
 
+    # S7.5 阻断：held build 已不在（窗口没了），新起返工班——workdir 用
+    # review 自己继承的工作树（review 创建时从 build 拷贝而来，整条流水线
+    # 只有一棵树），不是 config 主目录。
     prompt = store.render_review_fix_prompt(
-        config, review_task, round_=next_round, review_text=review_text,
+        config, review_task,
+        workdir=str(review_status.get("worktree_path") or ""),
+        round_=next_round, review_text=review_text,
     )
     build_id = store.create_cross_role_successor(
         review_task, config, role="build", round_=next_round,

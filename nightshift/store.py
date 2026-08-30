@@ -916,7 +916,7 @@ DEFAULT_REVIEW_FIX_TEMPLATE = (
 
 
 def render_review_prompt(
-    config: dict, task: dict, *, base_ref: str, diff_command: str,
+    config: dict, task: dict, *, workdir: str, base_ref: str, diff_command: str,
     build_handover: str | None, previous_review: str, round_: int,
     stop_build_hint: str = "",
 ) -> str:
@@ -924,6 +924,11 @@ def render_review_prompt(
 
     只给固定参数数组语义的 git diff 命令（{diff_command}），不把整份 diff
     塞进提示词——审稿班自己在只读工具面里跑这条命令看改动。
+
+    S7.5 阻断：`{project_path}` 必须是调用方传入的**施工班工作树绝对路径**
+    （`status["worktree_path"]`），不能在这里从 `config["projects"][task["project"]]`
+    推导——那是主签出目录，审稿会话的 cwd/信任根其实是工作树，指错目录会让
+    审稿人读到未修的旧代码、永远判 fix（真机 smoke 抓到的死循环）。
     """
     review = review_config(task, config)
     criteria = review.get("criteria_text") or config.get("review_criteria_text") or ""
@@ -931,7 +936,7 @@ def render_review_prompt(
         config.get("review_template") or DEFAULT_REVIEW_TEMPLATE,
         task=task["task_text"],
         title=task["title"],
-        project_path=config["projects"][task["project"]],
+        project_path=workdir,
         base_ref=base_ref,
         diff_command=diff_command,
         build_handover=build_handover if build_handover else NO_HANDOVER_TEXT,
@@ -943,15 +948,19 @@ def render_review_prompt(
 
 
 def render_review_fix_prompt(
-    config: dict, task: dict, *, round_: int, review_text: str,
+    config: dict, task: dict, *, workdir: str, round_: int, review_text: str,
 ) -> str:
     """渲染返工班的提示词（config.review_fix_template）：原任务书 + 第几轮
-    返工 + 完整审稿意见 + 工作树安全前言（返工班永远是工作树任务）。"""
+    返工 + 完整审稿意见 + 工作树安全前言（返工班永远是工作树任务）。
+
+    S7.5 阻断：`workdir` 同 `render_review_prompt`——调用方传施工班自己的
+    工作树路径，不在这里推导主目录。
+    """
     return render(
         config.get("review_fix_template") or DEFAULT_REVIEW_FIX_TEMPLATE,
         task=task["task_text"],
         title=task["title"],
-        project_path=config["projects"][task["project"]],
+        project_path=workdir,
         round=round_,
         review=review_text,
         context_limit=_context_limit_text(
