@@ -78,6 +78,46 @@ def run_hook(task_id: str, event: str, payload: str):
     )
 
 
+def run_codex_hook(task_id: str, event: str, payload: str):
+    """Codex 的调用形状：task id 走 NIGHTOWL_TASK_ID 环境变量，不是位置参数。"""
+    env = dict(os.environ)
+    env["NIGHTSHIFT_HOME"] = os.environ["NIGHTSHIFT_HOME"]
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    env["NIGHTOWL_TASK_ID"] = task_id
+    return subprocess.run(
+        [sys.executable, "-m", "nightshift.hook", "--codex", event],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+
+
+def make_task_codex(**over) -> str:
+    task = {
+        "title": "codex hook 测试任务",
+        "project": "demo",
+        "runner": "codex",
+        "model": "gpt-5.6-luna",
+        "effort": "high",
+        "run_at": "2026-08-27T18:00:00Z",
+        "task_text": "正文",
+        "prompt_final": "完整提示词",
+    }
+    task.update(over)
+    codex_config = {
+        **CONFIG,
+        "runners": {
+            "claude": {"models": CONFIG["models"], "efforts": CONFIG["efforts"]},
+            "codex": {"models": {"gpt-5.6-luna": {"context_limit": None}},
+                      "efforts": ["low", "medium", "high", "xhigh"]},
+        },
+    }
+    store.atomic_write_json(store.home() / "config.json", codex_config)
+    return store.create_task(task, codex_config)
+
+
 def fixture(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
 
@@ -781,3 +821,95 @@ def test_hook_events_clear_stuck_cycle():
     store.update_status(task_id, **stale_cycle)
     run_hook(task_id, "Stop", fixture("hook_stop_idle.json"))
     assert_recovered()
+
+
+# ---------- S6：Codex hook（--codex 调用形状，NIGHTOWL_TASK_ID 路由）----------
+
+
+def test_codex_hook_no_task_id_env_is_noop():
+    proc = subprocess.run(
+        [sys.executable, "-m", "nightshift.hook", "--codex", "Stop"],
+        input="{}", capture_output=True, text=True,
+        env={**os.environ, "NIGHTSHIFT_HOME": os.environ["NIGHTSHIFT_HOME"],
+             "PYTHONPATH": str(REPO_ROOT)},
+        timeout=30,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout == ""  # 没有 NIGHTOWL_TASK_ID：静默退出，不炸
+
+
+def test_codex_hook_full_event_sequence():
+    task_id = make_task_codex()
+
+    proc = run_codex_hook(task_id, "SessionStart", fixture("codex_hook_sessionstart.json"))
+    assert proc.returncode == 0 and proc.stdout == ""
+    status = store.read_status(task_id)
+    assert status["thread_id"] == "01a05206-e86e-7c80-8540-1b92468c92a1"
+    assert status["session_id"] == status["thread_id"]
+    assert status["quota_source"] == "codex"
+    assert status["permission_mode"] == "bypassPermissions"
+
+    proc = run_codex_hook(task_id, "UserPromptSubmit", fixture("codex_hook_userpromptsubmit.json"))
+    assert proc.returncode == 0 and proc.stdout == ""
+    status = store.read_status(task_id)
+    assert status["state"] == "working"
+    assert status["turns"] == 1
+
+    # PostToolUse：只记账，不算上下文、不回注（Codex 一律 send-keys，不用 stdout）
+    proc = run_codex_hook(task_id, "PostToolUse", fixture("codex_hook_posttooluse.json"))
+    assert proc.returncode == 0 and proc.stdout == ""
+    status = store.read_status(task_id)
+    assert status["tool_calls"] == 1
+    assert status["context_tokens"] is None
+
+    proc = run_codex_hook(task_id, "Stop", fixture("codex_hook_stop.json"))
+    assert proc.returncode == 0 and proc.stdout == ""
+    status = store.read_status(task_id)
+    assert status["state"] == "idle"  # S6：无登记后台时 idle（F12 的登记簿是 S6④ 才有）
+    assert status["over_warn_line"] is False
+    assert "canary.txt" in status["last_message"]
+    assert status["context_tokens"] is None  # Codex 没有稳定上下文水位来源
+
+    proc = run_codex_hook(task_id, "SessionEnd", fixture("codex_hook_sessionend.json"))
+    assert proc.returncode == 0 and proc.stdout == ""
+    status = store.read_status(task_id)
+    assert status["state"] == "exited"
+    assert status["exit_reason"] == "other"
+
+
+def test_codex_hook_stop_waiting_wakeup_when_quota_paused():
+    task_id = make_task_codex()
+    store.update_status(task_id, quota_paused_until="2099-01-01T00:00:00Z")
+    proc = run_codex_hook(task_id, "Stop", fixture("codex_hook_stop.json"))
+    assert proc.returncode == 0
+    assert store.read_status(task_id)["state"] == "waiting_wakeup"
+
+
+def test_codex_hook_subagent_events():
+    task_id = make_task_codex()
+    proc = run_codex_hook(task_id, "SubagentStart", fixture("codex_hook_subagentstart.json"))
+    assert proc.returncode == 0
+    assert store.read_status(task_id)["subagents_running"] == 1
+    proc = run_codex_hook(task_id, "SubagentStop", fixture("codex_hook_subagentstop.json"))
+    assert proc.returncode == 0
+    assert store.read_status(task_id)["subagents_running"] == 0
+
+
+def test_claude_session_start_is_ignored_not_crash():
+    """Claude 不挂 SessionStart，但万一收到（比如手滑用了 --codex 之外的调用）
+    也不能崩，只记一笔忽略。"""
+    task_id = make_task()
+    proc = run_hook(task_id, "SessionStart", "{}")
+    assert proc.returncode == 0 and proc.stdout == ""
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "SessionStart" in events
+
+
+def test_codex_hook_never_prints_stdout_injection():
+    """设计决定：Codex 一律 send-keys，不用 hook stdout 回注——PostToolUse
+    多打几次也不该有任何 stdout 输出（跟 Claude 每 20 次会回注形成对照）。"""
+    task_id = make_task_codex()
+    for _ in range(25):
+        proc = run_codex_hook(task_id, "PostToolUse", fixture("codex_hook_posttooluse.json"))
+        assert proc.stdout == ""
+    assert store.read_status(task_id)["tool_calls"] == 25

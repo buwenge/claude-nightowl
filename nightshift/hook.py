@@ -1,19 +1,22 @@
-"""Claude Code hook 接收端：`python3 -m nightshift.hook <task_id> <event>`。
+"""Claude/Codex hook 接收端：`python3 -m nightshift.hook <task_id> <event>`
+（Claude）或 `python3 -m nightshift.hook --codex <event>`（Codex）。
 
 规矩：
-- stdin 收 CC 给的 JSON（空/坏 JSON 一律当 {}）；
+- stdin 收 CC/Codex 给的 JSON（空/坏 JSON 一律当 {}）；
 - 任务目录不存在 → 静默退出；
 - 任何异常都吞掉、记 events.log 后退出码 0；
 - stdout 只在回注时打印且只打印一个 hookSpecificOutput JSON 对象
   （additionalContext 会作为系统侧上下文塞进本轮工具结果后面给模型看；
-  8/27 实测的协议）。其余时候、其余事件一律沉默——CC 会把 stdout 当
-  hook 结果解析，Stop 等事件的 stdout 语义不同，不许碰；
+  8/27 实测的协议，只对 Claude 成立）。其余时候、其余事件一律沉默——CC
+  会把 stdout 当 hook 结果解析，Stop 等事件的 stdout 语义不同，不许碰；
+  Codex 一律不打印任何东西，守卫文案改由调度器 tmux send-keys 投递；
 - 整个进程 100 ms 量级完成，不 import 重东西。
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -204,10 +207,17 @@ def _refresh_context(task: dict, payload: dict, fields: dict) -> None:
 
     算上限失败（config 缺/坏）只记 events.log，不拖垮整个事件：
     context_tokens 照常写，context_pct 留空。
+
+    S6：Codex 没有稳定的上下文水位来源（官方明说 rollout 格式非稳定接口，
+    开工令据此把 config.runners.codex.models.context_limit 定死成 null）——
+    恒定置 None，不去解析 Codex 的 rollout jsonl（那是另一套格式，
+    read_context_tokens 认的是 Claude transcript 的 assistant usage 记录）。
     """
-    transcript_path = payload.get("transcript_path")
     fields["context_tokens"] = None
     fields["context_pct"] = None
+    if (task.get("runner") or "claude") == "codex":
+        return
+    transcript_path = payload.get("transcript_path")
     if not transcript_path:
         return
     tokens = read_context_tokens(transcript_path)
@@ -324,6 +334,29 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
     """
     task = store.load_task(task_id)
     now = store.utc_now_iso()
+    runner = task.get("runner") or "claude"
+
+    if event == "SessionStart":
+        # Claude 不挂这个事件（launcher 起跑前已用 --session-id 预先分配好，
+        # 提前落过 status），只有 Codex 靠它才第一次知道自己的 session/thread id。
+        if runner != "codex":
+            store.append_event(task_id, "hook SessionStart（非 codex，忽略）")
+            return None
+
+        def set_codex_session(status: dict) -> None:
+            status["thread_id"] = payload.get("session_id")
+            status["session_id"] = payload.get("session_id")
+            status["transcript_path"] = payload.get("transcript_path")
+            status["quota_source"] = "codex"
+            if payload.get("permission_mode"):
+                status["permission_mode"] = payload["permission_mode"]
+            status["last_event_at"] = now
+
+        store.modify_status(task_id, set_codex_session)
+        store.append_event(
+            task_id, f"hook SessionStart(codex) → thread_id={payload.get('session_id')}"
+        )
+        return None
 
     if event == "UserPromptSubmit":
 
@@ -383,6 +416,30 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             task_id, f"hook {event} subagents={status['subagents_running']}"
         )
 
+    elif event == "Stop" and runner == "codex":
+        # Codex 的 Stop payload 没有 background_tasks/session_crons（那是
+        # Claude 概念）；后台完成登记（F12）是夜班自己的登记簿，S6④ 才落地，
+        # 由 scheduler 在那之后核对登记簿，必要时把 idle 拦回
+        # waiting_background——这里只按已知事实（额度缓存闹钟）落 idle/
+        # waiting_wakeup，不猜后台状态。
+        status_now = store.read_status(task_id)
+        fields = {
+            "last_message": (payload.get("last_assistant_message") or "")[:2000],
+            "stuck": False,
+            "last_event_at": now,
+            "over_warn_line": False,  # Codex 没有上下文水位来源，恒定不过线
+        }
+        fields["state"] = "waiting_wakeup" if status_now.get("quota_paused_until") else "idle"
+
+        def clear_stuck_cycle_codex(status: dict) -> None:
+            status.update(fields)
+            status.pop("auto_interrupted", None)
+            status.pop("stuck_since", None)
+
+        store.modify_status(task_id, clear_stuck_cycle_codex)
+        store.append_event(task_id, f"hook Stop(codex) → {fields['state']}")
+        return None
+
     elif event == "Stop":
         background_tasks = payload.get("background_tasks") or []
         fields = {
@@ -413,6 +470,19 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
 
         store.modify_status(task_id, clear_stuck_cycle)
         store.append_event(task_id, f"hook Stop → {fields['state']}")
+        return None
+
+    elif event == "PostToolUse" and runner == "codex":
+        # Codex 一律靠调度器 tmux send-keys 投递守卫文案（设计稿 §5.2），
+        # 不依赖 hook stdout 回注——这里只记账，不算上下文、不查额度、不回注。
+        def bump_tool_calls_codex(status: dict) -> None:
+            status["tool_calls"] = int(status.get("tool_calls") or 0) + 1
+            status["stuck"] = False
+            status.pop("auto_interrupted", None)
+            status.pop("stuck_since", None)
+            status["last_event_at"] = now
+
+        store.modify_status(task_id, bump_tool_calls_codex)
         return None
 
     elif event == "PostToolUse":
@@ -463,10 +533,26 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """`python3 -m nightshift.hook <task_id> <event>`（Claude：per-task settings.json，
+    task id 直接写进命令行）或 `python3 -m nightshift.hook --codex <event>`
+    （Codex：固定的 nightowl profile，同一份 hooks.json 服务所有任务，
+    task id 从 run.sh export 的 NIGHTOWL_TASK_ID 环境变量读——profile 内容
+    不能随任务变，否则每个任务都要重新走一次 hook 信任）。
+    """
     argv = list(sys.argv[1:] if argv is None else argv)
-    if len(argv) < 2:
+    if not argv:
         return 0
-    task_id, event = argv[0], argv[1]
+    if argv[0] == "--codex":
+        if len(argv) < 2:
+            return 0
+        event = argv[1]
+        task_id = os.environ.get("NIGHTOWL_TASK_ID") or ""
+        if not task_id:
+            return 0
+    else:
+        if len(argv) < 2:
+            return 0
+        task_id, event = argv[0], argv[1]
 
     try:
         raw = sys.stdin.read()

@@ -143,6 +143,118 @@ def test_claude_bin_env_override(tmp_path, monkeypatch):
     assert launcher.claude_bin(CONFIG) == CONFIG["claude_bin"]
 
 
+# ---------- S6：Codex 工人 ----------
+
+CODEX_CONFIG = {
+    **CONFIG,
+    "chain_template": "{task} 第 {shift} 班 {handover}",
+    "runners": {
+        "claude": {"bin": "claude", "models": CONFIG["models"], "efforts": CONFIG["efforts"]},
+        "codex": {
+            "bin": "codex", "profile": "nightowl",
+            "models": {"gpt-5.6-luna": {"context_limit": None}},
+            "efforts": ["low", "medium", "high", "xhigh"],
+        },
+    },
+}
+
+
+def test_codex_bin_env_override(tmp_path, monkeypatch):
+    monkeypatch.delenv("NIGHTSHIFT_CODEX_BIN", raising=False)
+    assert launcher.codex_bin(CODEX_CONFIG) == "codex"
+    monkeypatch.setenv("NIGHTSHIFT_CODEX_BIN", str(tmp_path / "fake.sh"))
+    assert launcher.codex_bin(CODEX_CONFIG) == str(tmp_path / "fake.sh")
+
+
+def test_codex_resume_thread_id_cases(tmp_path):
+    task_id, config = make_task_codex(project_path=str(tmp_path / "proj"))
+    task = store.load_task(task_id)
+    assert launcher.codex_resume_thread_id(task) is None  # 首班没有 parent_id
+
+    task["parent_id"] = "nonexistent-parent"
+    assert launcher.codex_resume_thread_id(task) is None  # 父班没登记 thread_id
+
+    store.update_status("nonexistent-parent", thread_id="thread-abc")
+    assert launcher.codex_resume_thread_id(task) == "thread-abc"
+
+
+def make_task_codex(project_path: str | None = None, **over):
+    config = dict(CODEX_CONFIG)
+    if project_path:
+        config["projects"] = {"demo": project_path}
+        store.atomic_write_json(store.home() / "config.json", config)
+    task = {
+        "title": "Codex集成测试任务",
+        "project": "demo",
+        "runner": "codex",
+        "model": "gpt-5.6-luna",
+        "effort": "high",
+        "run_at": "2026-08-27T18:00:00Z",
+        "task_text": "正文",
+        "prompt_final": "完整提示词",
+    }
+    task.update(over)
+    return store.create_task(task, config), config
+
+
+def test_run_sh_text_codex_new_session_command():
+    task_id, config = make_task_codex(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    store.update_status(task_id, worktree_path="/home/user/projects/demo")
+    run_sh = launcher.run_sh_text(task, config, None)
+    assert f"export NIGHTOWL_TASK_ID='{task_id}'" in run_sh
+    assert "export NIGHTOWL_RUNNER='codex'" in run_sh
+    cmd_line = next(line for line in run_sh.splitlines() if line.startswith("'codex'"))
+    assert cmd_line == (
+        "'codex' -C '/home/user/projects/demo' --sandbox workspace-write "
+        "--ask-for-approval never -m 'gpt-5.6-luna' "
+        '-c \'model_reasoning_effort="high"\' '
+        '-c \'projects."/home/user/projects/demo".trust_level="trusted"\' '
+        "--profile 'nightowl' "
+        f"\"$(cat '{store.task_dir(task_id) / 'prompt.txt'}')\""
+    )
+    assert "codex 已退出" in run_sh
+    assert "--session-id" not in run_sh  # Codex 没有这个概念
+    assert "resume" not in cmd_line  # 新会话不 resume
+
+
+def test_run_sh_text_codex_resume_command():
+    task_id, config = make_task_codex(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    run_sh = launcher.run_sh_text(task, config, "thread-xyz", resume_thread_id="thread-xyz")
+    cmd_line = next(line for line in run_sh.splitlines() if line.startswith("'codex'"))
+    assert cmd_line.startswith("'codex' resume 'thread-xyz' -C ")
+
+
+def test_write_task_files_codex_skips_settings_json(tmp_path):
+    task_id, config = make_task_codex(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    store.update_status(task_id, worktree_path="/home/user/projects/demo")
+    launcher.write_task_files(task, config, None)
+    d = store.task_dir(task_id)
+    assert not (d / "settings.json").exists()
+    assert (d / "run.sh").is_file()
+    assert (d / "prompt.txt").is_file()
+
+
+def test_launch_codex_resume_fail_closed_without_parent_thread_id(tmp_path, monkeypatch):
+    """S6：Codex 续班找不到父班 thread_id，宁可判失败也不悄悄开新会话。"""
+    proj = tmp_path / "proj"
+    init_git_repo(proj)
+    task_id, config = make_task_codex(project_path=str(proj))
+    task = store.load_task(task_id)
+    task["parent_id"] = "some-parent-without-thread"
+    store.atomic_write_json(store.task_dir(task_id) / "task.json", task)
+    # 判失败仍会走既有的失败提醒窗口流程（碰 tmux 开个通知窗），这里只假它
+    monkeypatch.setattr(
+        launcher, "_tmux",
+        lambda *a: subprocess.CompletedProcess(a, 0, "", ""),
+    )
+    status = launcher.launch(task_id, config)
+    assert status["state"] == "failed"
+    assert "thread_id" in status["error"]
+
+
 def test_is_trusted_three_cases(tmp_path, monkeypatch):
     claude_json = tmp_path / "claude.json"
     monkeypatch.setenv("NIGHTSHIFT_CLAUDE_JSON", str(claude_json))
@@ -484,3 +596,82 @@ def test_launch_clears_stale_error(tmp_path, monkeypatch):
     status = launcher.launch(task_id, config)
     assert status["state"] == "launching"
     assert status["error"] is None and status["postpone_reason"] is None
+
+
+# ---------- Codex tmux 集成部分（假 codex）----------
+
+FAKE_CODEX = FIXTURES.parent / "fake_codex.sh"
+
+
+@pytest.fixture
+def codex_env(tmux_session, tmp_path, monkeypatch):
+    """假 codex + 参数日志，都指到 tmp。Codex 不吃 ~/.claude.json 那份信任
+    记录，不需要伪造它。"""
+    proj = tmp_path / "proj"
+    init_git_repo(proj)
+    os.chmod(FAKE_CODEX, 0o755)
+    monkeypatch.setenv("NIGHTSHIFT_CODEX_BIN", str(FAKE_CODEX))
+    fake_log = tmp_path / "fake_codex_args.log"
+    monkeypatch.setenv("NIGHTSHIFT_FAKE_LOG", str(fake_log))
+    subprocess.run(
+        ["tmux", "set-environment", "-t", tmux_session,
+         "NIGHTSHIFT_FAKE_LOG", str(fake_log)],
+        capture_output=True,
+    )
+    return {"proj": proj, "fake_log": fake_log}
+
+
+def test_launch_codex_full_cycle_new_session(tmux_session, codex_env, tmp_path):
+    task_id, config = make_task_codex(project_path=str(codex_env["proj"]))
+    status = launcher.launch(task_id, config)
+
+    assert re.fullmatch(r"@\d+", status["window_id"])
+    assert launcher.pid_alive(status["pane_pid"])
+    assert status["state"] == "launching"
+    assert status["session_id"] is None  # 新会话：还不知道，等 SessionStart
+
+    status, seen = wait_for_state(task_id)
+    assert status["state"] == "exited", f"15 秒没等到 exited，见过 {seen}"
+    assert "working" in seen, f"中途没见过 working：{seen}"
+    assert "idle" in seen, f"中途没见过 idle：{seen}"
+    # 假 codex 的 SessionStart 夹具把 thread_id 坐实回了 status
+    assert status["thread_id"] == "01a05206-e86e-7c80-8540-1b92468c92a1"
+    assert status["session_id"] == status["thread_id"]
+    assert status["quota_source"] == "codex"
+
+    fake_log = codex_env["fake_log"].read_text(encoding="utf-8")
+    assert "--sandbox" in fake_log and "workspace-write" in fake_log
+    assert "--ask-for-approval" in fake_log and "never" in fake_log
+    assert "resume" not in fake_log  # 新会话不该出现 resume 参数
+    assert "--session-id" not in fake_log
+
+
+def test_launch_codex_resume_uses_parent_thread_id(tmux_session, codex_env):
+    parent_id, config = make_task_codex(project_path=str(codex_env["proj"]))
+    launcher.launch(parent_id, config)
+    wait_for_state(parent_id)  # 等首班坐实 thread_id
+
+    parent_task = store.load_task(parent_id)
+    succ_id = store.create_successor(parent_task, "交接", config)
+    succ_status = launcher.launch(succ_id, config)
+    assert succ_status["state"] == "launching"
+    assert succ_status["session_id"] == "01a05206-e86e-7c80-8540-1b92468c92a1"
+    assert succ_status["thread_id"] == "01a05206-e86e-7c80-8540-1b92468c92a1"
+
+    status, seen = wait_for_state(succ_id)
+    assert status["state"] == "exited", f"没等到 exited，见过 {seen}"
+    # resume 场景假 codex 跳过 SessionStart，thread_id 是 launch() 提前坐实的，
+    # 后续事件不该把它改掉
+    assert status["thread_id"] == "01a05206-e86e-7c80-8540-1b92468c92a1"
+
+    fake_log = (codex_env["fake_log"]).read_text(encoding="utf-8")
+    assert "resume" in fake_log
+    assert "01a05206-e86e-7c80-8540-1b92468c92a1" in fake_log
+
+
+def test_launch_codex_untrusted_claude_json_does_not_block(tmux_session, codex_env, monkeypatch):
+    """S6：Codex 任务不看 ~/.claude.json，哪怕那份文件完全没信任过也照跑。"""
+    monkeypatch.setenv("NIGHTSHIFT_CLAUDE_JSON", "/nonexistent/claude.json")
+    task_id, config = make_task_codex(project_path=str(codex_env["proj"]))
+    status = launcher.launch(task_id, config)
+    assert status["state"] == "launching"

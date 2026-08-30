@@ -16,6 +16,8 @@ __all__ = [
     "capture_pane",
     "claude_bin",
     "close_windows",
+    "codex_bin",
+    "codex_resume_thread_id",
     "ensure_tmux_session",
     "hook_settings",
     "is_trusted",
@@ -33,7 +35,9 @@ __all__ = [
 # 窗口 id 只认 tmux 的 @N 形状：杜绝任何模糊目标（会话名/窗口名通配）
 _WINDOW_ID_RE = re.compile(r"^@\d+$")
 
-# hook 挂的七个事件（设计稿 §4.1）
+# Claude hook 挂的七个事件（设计稿 §4.1）；Codex 的七件套固定写在
+# codex_profile.py 生成的 nightowl profile 里，不经这张表（那份 profile
+# 内容不能随任务变，见 codex_profile.py 顶部说明）
 _HOOK_EVENTS = (
     "UserPromptSubmit",
     "SubagentStart",
@@ -48,6 +52,23 @@ _HOOK_EVENTS = (
 def claude_bin(config: dict) -> str:
     """要用的 claude 可执行文件；环境变量 NIGHTSHIFT_CLAUDE_BIN 优先（测试用）。"""
     return os.environ.get("NIGHTSHIFT_CLAUDE_BIN") or config["claude_bin"]
+
+
+def codex_bin(config: dict) -> str:
+    """要用的 codex 可执行文件；环境变量 NIGHTSHIFT_CODEX_BIN 优先（测试用）。"""
+    rc = store.runner_config(config).get("codex") or {}
+    return os.environ.get("NIGHTSHIFT_CODEX_BIN") or rc.get("bin", "codex")
+
+
+def codex_resume_thread_id(task: dict) -> str | None:
+    """同角色续班要不要 resume 同一个 Codex thread：只有这一班是某个父班的
+    后继（task.parent_id 存在）时才查；父班没登记 thread_id（没起过、
+    Claude 父班、或还没等到 SessionStart）一律返回 None，调用方据此
+    fail-closed，不能悄悄开一个没有上下文的新会话。"""
+    parent_id = task.get("parent_id")
+    if not parent_id:
+        return None
+    return store.read_status(parent_id).get("thread_id") or None
 
 
 def is_trusted(project_path: str) -> bool:
@@ -102,16 +123,69 @@ def workdir_for(task: dict, config: dict) -> str:
     return str(config["projects"][task["project"]])
 
 
-def run_sh_text(task: dict, config: dict, session_id: str) -> str:
-    """run.sh 的内容（模板见开工令）：环境、cgroup 内存围栏、起 claude、留窗。"""
+def _claude_command(task: dict, config: dict, session_id: str) -> str:
+    """Claude Code 的命令行，字节级保持一期以来的样子（S6 不许动）。"""
+    d = store.task_dir(task["id"])
+    return " ".join([
+        _sq(claude_bin(config)),
+        f"--model {_sq(task['model'])}",
+        f"--effort {_sq(task['effort'])}",
+        "--permission-mode auto",
+        f"--name {_sq(config['window_prefix'] + task['title'])}",
+        f"--session-id {_sq(session_id)}",
+        f"--settings {_sq(d / 'settings.json')}",
+        # 提示词必须整体包在双引号里：裸 $(cat …) 会被 shell 按空白切词、
+        # 展开 $ 与通配符，多行任务内容会打散成一堆参数。
+        f"\"$(cat {_sq(d / 'prompt.txt')})\"",
+    ])
+
+
+def _codex_command(task: dict, config: dict, workdir: str, resume_thread_id: str | None) -> str:
+    """Codex 的命令行（开工令 S6②样例）：resume_thread_id 给了就 resume
+    同一个 thread（同角色续班），否则起一个全新会话。"""
+    d = store.task_dir(task["id"])
+    rc = store.runner_config(config).get("codex") or {}
+    profile = rc.get("profile", "nightowl")
+    trust_override = f'projects."{workdir}".trust_level="trusted"'
+    effort_override = f'model_reasoning_effort="{task["effort"]}"'
+    parts = [_sq(codex_bin(config))]
+    if resume_thread_id:
+        parts += ["resume", _sq(resume_thread_id)]
+    parts += [
+        f"-C {_sq(workdir)}",
+        "--sandbox workspace-write",
+        "--ask-for-approval never",
+        f"-m {_sq(task['model'])}",
+        f"-c {_sq(effort_override)}",
+        f"-c {_sq(trust_override)}",
+        f"--profile {_sq(profile)}",
+        f"\"$(cat {_sq(d / 'prompt.txt')})\"",
+    ]
+    return " ".join(parts)
+
+
+def run_sh_text(
+    task: dict, config: dict, session_id: str | None,
+    *, resume_thread_id: str | None = None,
+) -> str:
+    """run.sh 的内容（模板见开工令）：环境、cgroup 内存围栏、起工人、留窗。
+
+    session_id 的语义按 runner 分叉：
+    - claude：launcher 起跑前预先分配的 UUID，透传 --session-id（不变）；
+    - codex：还不知道（要等 SessionStart hook 报），这里恒定不用它，
+      resume 与否单独由 resume_thread_id 决定。
+    """
     d = store.task_dir(task["id"])
     workdir = workdir_for(task, config)
     repo_root = Path(__file__).resolve().parent.parent
+    runner = task.get("runner") or "claude"
     lines = [
         "#!/bin/bash",
         f"# nightshift 任务 {task['id']}：{task['title']}",
         f"export NIGHTSHIFT_HOME={_sq(store.home())}",
         f"export PYTHONPATH={_sq(repo_root)}",
+        f"export NIGHTOWL_TASK_ID={_sq(task['id'])}",
+        f"export NIGHTOWL_RUNNER={_sq(runner)}",
         "unset CLAUDECODE",
         f"cd {_sq(workdir)} || {{ echo \"[nightshift] 进不了施工目录\"; read; exit 1; }}",
         f"CGROUP=\"/sys/fs/cgroup/nightshift-{task['id']}\"",
@@ -119,22 +193,18 @@ def run_sh_text(task: dict, config: dict, session_id: str) -> str:
         f"    echo {config['memory_max_bytes']} > \"$CGROUP/memory.max\" 2>/dev/null",
         '    echo $$ > "$CGROUP/cgroup.procs" 2>/dev/null',
         "fi",
-        " ".join([
-            _sq(claude_bin(config)),
-            f"--model {_sq(task['model'])}",
-            f"--effort {_sq(task['effort'])}",
-            "--permission-mode auto",
-            f"--name {_sq(config['window_prefix'] + task['title'])}",
-            f"--session-id {_sq(session_id)}",
-            f"--settings {_sq(d / 'settings.json')}",
-            # 提示词必须整体包在双引号里：裸 $(cat …) 会被 shell 按空白切词、
-            # 展开 $ 与通配符，多行任务内容会打散成一堆参数。
-            f"\"$(cat {_sq(d / 'prompt.txt')})\"",
-        ]),
+    ]
+    if runner == "codex":
+        lines.append(_codex_command(task, config, workdir, resume_thread_id))
+        exit_label = "codex"
+    else:
+        lines.append(_claude_command(task, config, str(session_id)))
+        exit_label = "claude"
+    lines += [
         "code=$?",
-        # claude 死透的铁证：调度器靠它识破"read 留窗"的假活（宽限期内也能重试）
+        # 工人死透的铁证：调度器靠它识破"read 留窗"的假活（宽限期内也能重试）
         f'echo "$code" > {_sq(d / "exit_code")}',
-        'echo "[nightshift] claude 已退出（退出码 $code）。窗口保留，按回车关闭。"',
+        f'echo "[nightshift] {exit_label} 已退出（退出码 $code）。窗口保留，按回车关闭。"',
         "read",
     ]
     return "\n".join(lines) + "\n"
@@ -153,16 +223,27 @@ def _prompt_text(task: dict) -> str:
     return text
 
 
-def write_task_files(task: dict, config: dict, session_id: str) -> None:
-    """写 prompt.txt / settings.json / run.sh（0o700）。"""
+def write_task_files(
+    task: dict, config: dict, session_id: str | None,
+    *, resume_thread_id: str | None = None,
+) -> None:
+    """写 prompt.txt / settings.json / run.sh（0o700）。
+
+    settings.json（Claude Code 的 per-task hook 配置）只有 Claude 任务才写：
+    Codex 走固定的 nightowl profile（codex_profile.py），不需要这份文件，
+    写了反而误导人以为 Codex 也在用它。
+    """
     d = store.task_dir(task["id"])
     d.mkdir(parents=True, exist_ok=True)
-    # 上一轮窗口留下的 exit_code 先删：那是旧 claude 的死讯，不能拿来误判新窗口
+    # 上一轮窗口留下的 exit_code 先删：那是旧工人的死讯，不能拿来误判新窗口
     (d / "exit_code").unlink(missing_ok=True)
-    store.atomic_write_json(d / "settings.json", hook_settings(task["id"]))
+    if (task.get("runner") or "claude") != "codex":
+        store.atomic_write_json(d / "settings.json", hook_settings(task["id"]))
     store.atomic_write_text(d / "prompt.txt", _prompt_text(task))
     run_sh = d / "run.sh"
-    store.atomic_write_text(run_sh, run_sh_text(task, config, session_id))
+    store.atomic_write_text(
+        run_sh, run_sh_text(task, config, session_id, resume_thread_id=resume_thread_id)
+    )
     os.chmod(run_sh, 0o700)
 
 
@@ -202,10 +283,14 @@ def launch(task_id: str, config: dict) -> dict:
     """
     task = store.load_task(task_id)
     project_path = config["projects"][task["project"]]
+    runner = task.get("runner") or "claude"
 
     # ① 目录没信任过，交互式 claude 会卡在信任问答 → 直接判失败。
-    # 只查主项目路径：信任预检不要求工作树单独出现在 ~/.claude.json 里
-    if not is_trusted(project_path):
+    # 只查主项目路径：信任预检不要求工作树单独出现在 ~/.claude.json 里。
+    # Codex 不吃这份文件（它自己的信任状态在 ~/.codex/config.toml），信任
+    # 覆盖每次都显式带在命令行上（_codex_command 的 trust_override），
+    # 这里对 codex 任务不做这个检查。
+    if runner == "claude" and not is_trusted(project_path):
         reason = f"目录未信任，请先手动在该目录开一次 claude：{project_path}"
         store.append_event(task_id, f"启动被拦：{reason}")
         status = store.update_status(
@@ -230,18 +315,49 @@ def launch(task_id: str, config: dict) -> dict:
             return status
         store.update_status(task_id, **meta)
 
-    # ② 预定 session_id 与 transcript 路径（--session-id 决定文件名，设计稿 F4）。
-    # 编码路径必须按实际 cwd 算：工作树任务在 <项目>/.claude/worktrees/<slug> 里跑
-    session_id = str(uuid.uuid4())
-    encoded = workdir_for(task, config).replace("/", "-").replace(".", "-")
-    expected_transcript = str(
-        Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
-    )
+    # ①'' S6：Codex 同角色续班要 resume 父班的 thread；父班没留下 thread_id
+    # 就 fail-closed（不能悄悄开一个没有上下文的新会话）。
+    resume_thread_id = None
+    if runner == "codex" and task.get("parent_id"):
+        resume_thread_id = codex_resume_thread_id(task)
+        if not resume_thread_id:
+            reason = (
+                "Codex 续班找不到父班登记的 thread_id，"
+                "拒绝悄悄开一个没有上下文的新会话"
+            )
+            store.append_event(task_id, f"启动被拦：{reason}")
+            status = store.update_status(
+                task_id, state="failed", error=reason,
+                last_event_at=store.utc_now_iso(),
+            )
+            open_failure_window(task, reason, config)
+            return status
+
+    # ② 预定 session_id 与 transcript 路径。
+    # Claude：--session-id 决定文件名（设计稿 F4），编码路径按实际 cwd 算
+    #   （工作树任务在 <项目>/.claude/worktrees/<slug> 里跑）；
+    # Codex：新会话时它自己起 thread id，起跑前不知道，session_id/transcript
+    #   留空等 SessionStart hook 报；resume 时 session_id 就是 resume_thread_id。
+    if runner == "codex":
+        session_id = resume_thread_id
+        expected_transcript = None
+    else:
+        session_id = str(uuid.uuid4())
+        encoded = workdir_for(task, config).replace("/", "-").replace(".", "-")
+        expected_transcript = str(
+            Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
+        )
 
     # ③ 任务三件套落盘
-    write_task_files(task, config, session_id)
+    write_task_files(task, config, session_id, resume_thread_id=resume_thread_id)
 
     # ④ 先落盘 launching（含预订的 session/transcript），再去碰 tmux
+    extra_fields = {}
+    if runner == "codex":
+        # resume 时提前把 thread_id 坐实（SessionStart 不会重新触发，见靶测
+        # 记录第 6 项）；新会话先置 None，等 SessionStart hook 报了再补
+        extra_fields["thread_id"] = session_id
+        extra_fields["quota_source"] = "codex"
     store.update_status(
         task_id,
         state="launching",
@@ -253,6 +369,7 @@ def launch(task_id: str, config: dict) -> dict:
         error=None,            # 上一次失败/推迟的原因到此作废，别在卡片上赖着（8/27 工头看见旧红字）
         postpone_reason=None,
         last_event_at=store.utc_now_iso(),
+        **extra_fields,
     )
 
     # ⑤ tmux 会话兜底（服务器重启后没有会话）
