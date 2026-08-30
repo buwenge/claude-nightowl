@@ -1642,7 +1642,29 @@ def test_pipeline_hold_marks_review_member_awaiting_verdict_false(authed, monkey
     status, _, body = authed.request("POST", f"/api/tasks/{review_id}/hold")
     assert status == 200 and body["hold_requested"] is True
     assert store.read_status(review_id)["review_awaiting_verdict"] is False
+    assert store.read_status(review_id)["review_control_kind"] == "hold"
     assert "review_awaiting_verdict" not in store.read_status(build_id)
+
+
+def test_pipeline_hold_send_failure_does_not_mark_awaiting_verdict_false(authed, monkeypatch):
+    """S7.2 阻断五.2/阻断八：给 review 成员敲 hold_text 的 send-keys 失败时，
+    不能照样落 review_awaiting_verdict=False/review_control_kind——那样会让
+    一次真实的 verdict Stop 被误判成"控制 turn"直接吞掉。失败的窗口也不该
+    计进 pinged。"""
+    build_id, review_id = make_review_pipeline(authed)
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(
+        launcher, "send_keys",
+        lambda wid, text: subprocess.CompletedProcess([], 1, "", "send-keys 失败"),
+    )
+
+    status, _, body = authed.request("POST", f"/api/tasks/{review_id}/hold")
+    assert status == 200 and body["hold_requested"] is True
+    review_status = store.read_status(review_id)
+    assert "review_awaiting_verdict" not in review_status
+    assert "review_control_kind" not in review_status
+    events = (store.task_dir(review_id) / "events.log").read_text(encoding="utf-8")
+    assert "hold 控制消息投递失败" in events
 
 
 def test_pipeline_hold_blocks_next_review_verdict_routing(authed, monkeypatch):

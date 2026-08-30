@@ -613,11 +613,28 @@ def next_pipeline_shift(task: dict) -> int:
     原地复用 held 任务开始新一轮）都必须从这里领号，不能再各自本地加一。
     这一步在 coordinator 的 status.json 锁内完成（modify_status），并发
     领号也不会撞号。
+
+    S7.2 阻断一：第一次领号（coordinator 还没有 `pipeline_shift_seq`）不能
+    固定从 1 开始——S7 上线前（S1-S6 时代）就可能已经有 scheduled/postponed/
+    idle/chained 的旧任务落在这条 root_id/pipeline_id 链上，shift 早就推进
+    到了某个更大的值。固定从 1+1=2 起会比这条链已有的最大 shift 还小，
+    `chain_state()` 的 max-shift 扫描会继续认那个旧任务是"最新班"，新造的
+    后继反而被判定成旧的。第一次领号时先在同一把锁内扫一遍这条 pipeline
+    现存所有任务的最大 shift 当 bootstrap 起点，之后就是纯 `+1`，不用每次
+    都扫（`list_tasks()`/`read_status()` 只读文件不加锁，在这把锁内调用不会
+    死锁）。
     """
     coordinator_id = pipeline_id_of(task)
+    pid = pipeline_id_of(task)
 
     def bump(status: dict) -> None:
-        status["pipeline_shift_seq"] = int(status.get("pipeline_shift_seq") or 1) + 1
+        if "pipeline_shift_seq" not in status:
+            existing_max = 1
+            for item in list_tasks():
+                if pipeline_id_of(item["task"]) == pid:
+                    existing_max = max(existing_max, int(item["task"].get("shift") or 1))
+            status["pipeline_shift_seq"] = existing_max
+        status["pipeline_shift_seq"] = int(status["pipeline_shift_seq"]) + 1
 
     status = modify_status(coordinator_id, bump)
     return status["pipeline_shift_seq"]

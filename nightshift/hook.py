@@ -478,72 +478,112 @@ def _handle_review_stop(task: dict, payload: dict, now: str) -> None:
       就当已确认"向下兼容。）
     - 控制 turn 隔离：`review_awaiting_verdict` 为 False 时，说明这次
       Stop 是保活/我来看之类"不要求正式 verdict"的回复，只清运行期字段
-      （stuck/auto_interrupted/last_event_at），**不改 state、不碰
-      review_verdict/review_recorded_round**——控制 turn 发生时这一班本
-      来就已经 held/waiting_background 着（发保活/hold_text 之前调用方
-      自己会把它落在这两个状态之一），瞎猜一个"复原后的 state"反而可能把
-      它错误地拽出 held（比如提前把仍在等额度刷新的 review 判成
-      idle，让 `_check_review_idle` 在额度真正刷新之前就重新分流一遍
-      pending verdict）；保持 state 原样，交给真正的恢复路径（额度到点/
-      "继续"）显式改。不会把一句"收到，我等着"误判成协议缺失、保守转成
-      fix。
+      （stuck/auto_interrupted/last_event_at），**不碰 review_verdict/
+      review_recorded_round**。
+
+      S7.2 阻断五.1：state 不再一律"保持原样不动"——按 `review_control_kind`
+      分流：`"hold"` 一律转 `held`（不管发送前是 working/idle/held 哪一种，
+      "我来看"打进去、这一班真的停下来之后，账面结果都该是"停在这里等
+      工头"，不能停留在 working 误导调度器继续按活跃任务处理）；
+      `"keepalive"` 或缺省/未知 kind 保持原样不动（keepalive 本来就只会
+      戳 held/waiting_background 两种状态，收到控制回复不该变；缺省是
+      向后兼容旧数据的防御性默认）。
+
+    S7.2 阻断四：verdict 不再先于 review 文件落盘。旧写法在同一次
+    `modify_status` 里既判断"是否放行"又直接把 verdict/final 钉死，锁外
+    才写文件——文件写失败时 verdict 已经不可逆，之后同一轮任何 Stop 都会
+    被当 duplicate 挡住，永远没机会补文件。改成三段：锁内 claim（只标记
+    "这一轮我在处理"，不写 verdict）→ 锁外写文件 → 写成功后再锁内一次性
+    commit verdict/file/final。文件写失败时把 claim 撤回，status 净效果
+    等于没变，同一轮后续 Stop（含 CC 的静默重试）可以重新 claim、重新
+    尝试。两个并发 Stop 的安全性没有丢：claim 阶段已经把"谁在处理这一轮"
+    钉住，第二个并发 Stop 在 claim 阶段就会被判 duplicate，不会跑到写
+    文件那步跟第一个撞车。
     """
     task_id = task["id"]
     round_ = store.round_of(task)
     text = payload.get("last_assistant_message") or ""
 
-    decision: dict = {}
+    claim: dict = {}
 
-    def decide(status: dict) -> None:
+    def do_claim(status: dict) -> None:
         if not status.get("review_awaiting_verdict", True):
-            decision["kind"] = "control"
+            claim["kind"] = "control"
+            control_kind = status.get("review_control_kind")
+            claim["control_kind"] = control_kind
             status["last_event_at"] = now
             status["stuck"] = False
             status.pop("auto_interrupted", None)
             status.pop("stuck_since", None)
+            status.pop("review_control_kind", None)
+            if control_kind == "hold":
+                status["state"] = "held"
+                status["held_since"] = now
+                status["held_reason"] = "我来看：工头要来看，已停在这里"
             return
         verdict_final = status.get("review_verdict_final")
         if verdict_final is None:  # 旧数据兼容：没这个字段就按 verdict 本身推断
             verdict_final = status.get("review_verdict") not in (None, "pending")
         if status.get("review_recorded_round") == round_ and verdict_final:
-            decision["kind"] = "duplicate"
+            claim["kind"] = "duplicate"
             return
-        decision["kind"] = "verdict"
-        verdict, protocol_ok = _parse_review_verdict(text)
-        decision["verdict"] = verdict
-        decision["protocol_ok"] = protocol_ok
-        status["last_message"] = text[:2000]
-        status["stuck"] = False
-        status["last_event_at"] = now
+        if status.get("review_file_claim_round") == round_:
+            # 已经有别的 Stop 在写这一轮的文件、还没提交完——当重复处理，
+            # 不并发写两份内容可能不同的文件（atomic_write_text 的 nonce
+            # 只保证不撞文件名，不保证两份内容谁该赢）。
+            claim["kind"] = "duplicate"
+            return
+        claim["kind"] = "claimed"
+        status["review_file_claim_round"] = round_
+
+    store.modify_status(task_id, do_claim)
+
+    if claim["kind"] == "control":
+        note = f"（{claim['control_kind']}）" if claim.get("control_kind") else ""
+        store.append_event(
+            task_id, f"hook Stop(review) 控制 turn{note}，未解析 verdict"
+        )
+        return None
+    if claim["kind"] == "duplicate":
+        store.append_event(
+            task_id, f"hook Stop(review) 第 {round_} 轮已记过/正在处理 verdict，忽略重复 Stop"
+        )
+        return None
+
+    # 走到这里说明上面锁内 claim 已经放行了这一次（并发的第二个 Stop 在
+    # claim 阶段就已经被挡成 duplicate/control，不会跑到这里跟这次撞车）。
+    verdict, protocol_ok = _parse_review_verdict(text)
+    path = review_file_path(task)
+    try:
+        store.atomic_write_text(path, text if text.strip() else "（空消息，无审稿正文）\n")
+    except OSError as exc:
+        # 文件没写成：把 claim 撤回（整个键都要 pop 掉，不能只置 None——
+        # update_status 是合并语义，传 None 会把键留在 status 里，跟"从没
+        # claim 过"不是同一份 JSON），净效果等于没变；同一轮后续 Stop 可以
+        # 重新 claim、重新尝试写文件。
+        store.modify_status(task_id, lambda status: status.pop("review_file_claim_round", None))
+        store.append_event(
+            task_id, f"hook Stop(review) 写审稿文件失败：{exc!r}，本轮可重试"
+        )
+        return None
+
+    def do_commit(status: dict) -> None:
         status["review_verdict"] = verdict
+        status["review_file"] = str(path)
         status["review_recorded_round"] = round_
         status["review_verdict_final"] = verdict != "pending"
         status["state"] = "idle"
+        status["last_message"] = text[:2000]
+        status["last_event_at"] = now
+        status.pop("review_file_claim_round", None)
         status.pop("auto_interrupted", None)
         status.pop("stuck_since", None)
 
-    store.modify_status(task_id, decide)
-
-    if decision["kind"] == "control":
-        store.append_event(
-            task_id, "hook Stop(review) 控制 turn（保活/我来看/额度恢复），未解析 verdict"
-        )
-        return None
-    if decision["kind"] == "duplicate":
-        store.append_event(
-            task_id, f"hook Stop(review) 第 {round_} 轮已记过 verdict，忽略重复 Stop"
-        )
-        return None
-
-    # 走到这里说明上面锁内判断已经放行了这一次（并发的第二个 Stop 在锁内
-    # 判断阶段就已经被挡成 duplicate/control，不会跑到这里跟这次撞车）。
-    path = review_file_path(task)
-    store.atomic_write_text(path, text if text.strip() else "（空消息，无审稿正文）\n")
-    updated = store.update_status(task_id, review_file=str(path))
-    note = "" if decision["protocol_ok"] else "（协议缺失：没写合法 NEXT，保守按 fix）"
+    updated = store.modify_status(task_id, do_commit)
+    note = "" if protocol_ok else "（协议缺失：没写合法 NEXT，保守按 fix）"
     store.append_event(
         task_id,
-        f"hook Stop(review) 第 {round_} 轮 → verdict={decision['verdict']}{note}，"
+        f"hook Stop(review) 第 {round_} 轮 → verdict={verdict}{note}，"
         f"state={updated['state']}",
     )
     return None

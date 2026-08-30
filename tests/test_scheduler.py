@@ -2102,7 +2102,66 @@ def test_review_keepalive_marks_control_turn_before_poking(monkeypatch):
     assert len(fakes.send_keys_calls) == 1
     status = store.read_status(tid)
     assert status["review_awaiting_verdict"] is False
+    assert status["review_control_kind"] == "keepalive"
     assert status["state"] == "held"  # 保活不改流程状态
+
+
+def test_review_keepalive_send_failure_does_not_pollute_control_state(monkeypatch):
+    """S7.2 阻断五.2反例：保活探针 send-keys 失败时，不能照样落
+    review_awaiting_verdict=False/review_control_kind/计数字段——那样会让
+    接下来一次真实的 verdict Stop 被误判成"控制 turn"直接吞掉，且
+    keepalive_count 会在什么都没发出去的情况下虚增。"""
+    fakes = Fakes(monkeypatch)
+    monkeypatch.setattr(
+        launcher, "send_keys",
+        lambda w, t: subprocess.CompletedProcess([], 1, "", "send-keys 失败"),
+    )
+    tid = make_review_task()
+    data = store.load_task(tid)
+    data["role"] = "review"
+    store.atomic_write_json(store.task_dir(tid) / "task.json", data)
+    stale = scheduler.to_iso(NOW - timedelta(minutes=51))
+    store.update_status(
+        tid, state="held", window_id="@5", pane_pid=NO_PID,
+        last_event_at=stale, review_awaiting_verdict=True,
+    )
+    before = dict(store.read_status(tid))
+    scheduler.tick(REVIEW_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["review_awaiting_verdict"] is True  # 没被污染成 False
+    assert "review_control_kind" not in status
+    assert status.get("keepalive_count") == before.get("keepalive_count")  # 没有虚增
+    assert status.get("last_keepalive_at") == before.get("last_keepalive_at")
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "keepalive 控制消息投递失败" in events
+
+
+def test_review_quota_resume_send_failure_does_not_pollute_awaiting_verdict(monkeypatch):
+    """S7.2 阻断五.3反例：额度刷新恢复时 send-keys 失败，不能照样先落
+    review_awaiting_verdict=True——那样在真正叫醒它之前，任何一次意外的
+    控制回复（比如误触发的保活）都会被当成正式 verdict 尝试解析。"""
+    fakes = Fakes(monkeypatch)
+    monkeypatch.setattr(
+        launcher, "send_keys",
+        lambda w, t: subprocess.CompletedProcess([], 1, "", "send-keys 失败"),
+    )
+    tid = make_review_task()
+    data = store.load_task(tid)
+    data["role"] = "review"
+    store.atomic_write_json(store.task_dir(tid) / "task.json", data)
+    store.update_status(
+        tid, state="held", window_id="@5", pane_pid=NO_PID,
+        review_awaiting_verdict=False,
+        quota_paused_until=scheduler.to_iso(NOW - timedelta(minutes=1)),
+        quota_resume_sent=False,
+    )
+    scheduler.tick(REVIEW_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["review_awaiting_verdict"] is False  # 没被提前污染成 True
+    assert status.get("quota_resume_sent") is not True
+    assert status["state"] == "held"  # 没被悄悄摁成 working
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "resume 控制消息投递失败" in events
 
 
 def test_review_pipeline_fix_then_done_reuses_held_session(tmp_path, monkeypatch):
@@ -2779,6 +2838,211 @@ def test_review_fix_reuse_success_advances_shift_no_cycle(tmp_path, monkeypatch)
             assert node not in seen, f"successor_id 链从 {start} 出发成环：{seen}"
             seen.add(node)
             node = edges.get(node)
+
+
+def test_review_fix_reuse_clears_stale_round_bookkeeping_so_old_handover_is_ignored(
+    tmp_path, monkeypatch
+):
+    """S7.2 阻断三反例：held build 原地复用成功推进 shift/round，但如果不清
+    掉上一轮的运行期收尾标记（handover_path/context_warned_at/…），新一轮
+    只要发生一次普通 Stop、还没来得及写新交接文件，调度器就会重新读到
+    status.handover_path 指向的上一轮旧文件（写着 NEXT:done），把中间停顿
+    误判成这一轮已经收工。"""
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _review_config_for(proj)
+    tid = make_review_task()
+    wt = _register_tree(proj, tid, "审稿流水线任务")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "第一轮。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    review1_id = store.read_status(tid)["successor_id"]
+
+    # 模拟第一轮 build 在收工前曾经被上下文/额度提醒过一次——status 上会
+    # 留下 handover_path（指向 round1 那份写着 NEXT:done 的旧交接文件）与
+    # 一堆"这一轮已经被提醒过什么"的标记。
+    old_handover = store.task_dir(tid) / "handover-1.md"
+    assert old_handover.is_file()
+    old_handover_text = old_handover.read_text(encoding="utf-8")
+    assert "NEXT: done" in old_handover_text
+    store.update_status(
+        tid, handover_path=str(old_handover), context_warned_at="2026-08-30T10:00:00Z",
+        quota_warned_at="2026-08-30T10:00:00Z", context_warn_count=2, quota_warn_count=1,
+        mode_warned=True, other_model_warned=["opus"],
+    )
+
+    _go_idle(review1_id, window_id="@2")
+    rf1 = store.task_dir(review1_id) / "review-1.md"
+    rf1.write_text("退回。\n\nNEXT: fix", encoding="utf-8")
+    store.update_status(
+        review1_id, review_verdict="fix", review_file=str(rf1), review_recorded_round=1
+    )
+    scheduler.tick(cfg, NOW)  # 原地复用成功：build 转 working，进入第 2 轮
+
+    build_status = store.read_status(tid)
+    assert build_status["state"] == "working"
+    assert build_status["round"] == 2
+    # 上一轮的运行期收尾标记必须被显式清空，不能因为合并语义悄悄留着。
+    assert build_status.get("handover_path") is None
+    assert build_status.get("context_warned_at") is None
+    assert build_status.get("quota_warned_at") is None
+    assert build_status.get("context_warn_count") == 0
+    assert build_status.get("quota_warn_count") == 0
+    assert build_status.get("mode_warned") is False
+    assert build_status.get("other_model_warned") == []
+
+    # 新一轮还没写任何新交接文件（handover-<新shift>.md 不存在）；
+    # _handover_file() 清掉 handover_path 后退回按当前 shift 计算的默认
+    # 路径，_read_handover 读不到文件应该返回 None——不会误读 round1 那份
+    # 写着 NEXT:done 的旧交接（旧 bug 恰恰是这里：status.handover_path 一直
+    # 指着 round1 的文件，_read_handover 读到的是真实存在的 "NEXT: done"
+    # 文本，被当成"这一轮也已经收工"直接触发 _finalize_done）。
+    from nightshift import scheduler as sched_mod
+
+    task = store.load_task(tid)
+    status = store.read_status(tid)
+    hpath = sched_mod._handover_file(task, status)
+    assert not hpath.is_file()
+    assert sched_mod._read_handover(hpath) is None
+
+    # 更明确的行为反例：模拟第 2 轮自己也被提醒过一次（新落的
+    # context_warned_at），但还没来得及写新交接就去 idle——正确行为是走
+    # "被提醒过没交接 → chain.on_no_handover=continue"续班分支（state 变
+    # chained，交接兜底文案），而不是（旧 bug 会发生的）把 status 上残留的
+    # round1 旧文件当成本轮真交接、直接 NEXT:done 触发 _finalize_done 起
+    # 第 2 轮审稿——那样会把"第 2 轮其实还没做完"悄悄当成"第 2 轮已经审过了"。
+    store.update_status(tid, context_warned_at=scheduler.to_iso(NOW))
+    _go_idle(tid, window_id="@1")
+    scheduler.tick(cfg, NOW)
+    after = store.read_status(tid)
+    assert after["state"] == "chained"  # 走 on_no_handover=continue，不是误判收工
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "on_no_handover=continue" in events
+
+
+def _setup_fix_intent_pipeline(tmp_path, monkeypatch):
+    """给 5 个崩溃恢复反例共用的基础状态：held build（round=1）+ review 已
+    经拿到 NEXT:fix verdict、还没被 _review_fix 处理（review_routed_round
+    未设）。返回 (fakes, cfg, tid, review_id)。"""
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _review_config_for(proj)
+    tid = make_review_task()
+    _register_tree(proj, tid, "审稿流水线任务")
+    _go_idle(tid, window_id="@1")
+    _write_handover(tid, "第一轮。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    review_id = store.read_status(tid)["successor_id"]
+    _go_idle(review_id, window_id="@2")
+    rf = store.task_dir(review_id) / "review-1.md"
+    rf.write_text("退回。\n\nNEXT: fix", encoding="utf-8")
+    store.update_status(
+        review_id, review_verdict="fix", review_verdict_final=True,
+        review_file=str(rf), review_recorded_round=1,
+    )
+    return fakes, cfg, tid, review_id
+
+
+def _assert_fix_intent_reconciled_safely(fakes, cfg, tid, review_id, before_send_keys_count):
+    """5 个切点共用的断言：这一 tick 不重发/不新起返工，且第二次 tick 不
+    重复告警（只在第一次发现时开一次提醒窗）。"""
+    review_before = dict(store.read_status(review_id))
+    build_before = dict(store.read_status(tid))
+    scheduler.tick(cfg, NOW)
+    assert len(fakes.send_keys_calls) == before_send_keys_count  # 没有任何新的投递
+    notice_count_after_first = len(fakes.notice_calls)
+    assert notice_count_after_first >= 1  # 至少有一边被开了提醒窗
+    assert (
+        store.read_status(tid).get("state") == "needs_attention"
+        or store.read_status(review_id).get("state") == "needs_attention"
+    )
+    # 再跑一轮：不重复开提醒窗、不重复重发。
+    scheduler.tick(cfg, NOW)
+    assert len(fakes.send_keys_calls) == before_send_keys_count
+    assert len(fakes.notice_calls) == notice_count_after_first
+    # 除了这次 reconcile 自己写的 state/error/needs_attention 相关字段，
+    # 其余字段跟"死掉那一刻"完全一致，没有被瞎猜"修好"或悄悄推进。
+    review_after = store.read_status(review_id)
+    build_after = store.read_status(tid)
+    for key in ("review_verdict", "review_recorded_round", "review_file", "successor_id"):
+        assert review_after.get(key) == review_before.get(key), key
+    for key in ("round", "shift", "checkpoint_sha", "checkpoint_history"):
+        assert build_after.get(key) == build_before.get(key), key
+
+
+def test_pending_fix_intent_crash_recovery_checkpoint_1_and_2_intent_before_and_after_send(
+    tmp_path, monkeypatch,
+):
+    """S7.2 阻断二切点①②：intent 落盘之后、send-keys 之前 / send-keys 成功
+    之后、next_pipeline_shift 之前——这两个切点在磁盘状态上无法区分（send
+    本身不产生任何落盘副作用），合并成一条反例：coordinator 上只有
+    pending_fix_intent，build/review 的其余字段都停在"最开始"。"""
+    fakes, cfg, tid, review_id = _setup_fix_intent_pipeline(tmp_path, monkeypatch)
+    before_send_keys_count = len(fakes.send_keys_calls)
+    store.update_status(
+        tid, pending_fix_intent={"build_id": tid, "review_id": review_id, "next_round": 2},
+    )
+    _assert_fix_intent_reconciled_safely(fakes, cfg, tid, review_id, before_send_keys_count)
+
+
+def test_pending_fix_intent_crash_recovery_checkpoint_3_shift_taken_before_task_json(
+    tmp_path, monkeypatch,
+):
+    """切点③：领完 shift（pipeline_shift_seq 已经被 next_pipeline_shift 推
+    进）之后、写 build task.json 之前——build 自己的 round/shift 字段还没变，
+    但 coordinator 的领号序列已经往前走了一格。"""
+    fakes, cfg, tid, review_id = _setup_fix_intent_pipeline(tmp_path, monkeypatch)
+    before_send_keys_count = len(fakes.send_keys_calls)
+    build_task = store.load_task(tid)
+    store.update_status(
+        tid, pending_fix_intent={"build_id": tid, "review_id": review_id, "next_round": 2},
+        pipeline_shift_seq=int(build_task.get("shift") or 1) + 1,
+    )
+    _assert_fix_intent_reconciled_safely(fakes, cfg, tid, review_id, before_send_keys_count)
+
+
+def test_pending_fix_intent_crash_recovery_checkpoint_4_task_json_written_before_status(
+    tmp_path, monkeypatch,
+):
+    """切点④：build task.json 已经写成新一轮（round/shift 已推进），但
+    build 自己的 status.json 还没跟着改——账面 state 仍是 held、round 停在
+    旧值，跟 task.json 已经不一致。"""
+    fakes, cfg, tid, review_id = _setup_fix_intent_pipeline(tmp_path, monkeypatch)
+    before_send_keys_count = len(fakes.send_keys_calls)
+    build_task = store.load_task(tid)
+    new_shift = int(build_task.get("shift") or 1) + 1
+    build_task["round"] = 2
+    build_task["shift"] = new_shift
+    store.atomic_write_json(store.task_dir(tid) / "task.json", build_task)
+    store.update_status(
+        tid, pending_fix_intent={"build_id": tid, "review_id": review_id, "next_round": 2},
+        pipeline_shift_seq=new_shift,
+    )
+    _assert_fix_intent_reconciled_safely(fakes, cfg, tid, review_id, before_send_keys_count)
+
+
+def test_pending_fix_intent_crash_recovery_checkpoint_5_build_status_written_before_review(
+    tmp_path, monkeypatch,
+):
+    """切点⑤：build 自己的 status 已经改成 working/第 2 轮，但 review 侧
+    （chained + reactivated_task_id）与 coordinator 的 fix_count 还没提交
+    ——review 仍停在 idle/verdict=fix 未消费的状态，build 却已经在"working"
+    这个活跃状态，两边对不上。"""
+    fakes, cfg, tid, review_id = _setup_fix_intent_pipeline(tmp_path, monkeypatch)
+    before_send_keys_count = len(fakes.send_keys_calls)
+    build_task = store.load_task(tid)
+    new_shift = int(build_task.get("shift") or 1) + 1
+    build_task["round"] = 2
+    build_task["shift"] = new_shift
+    store.atomic_write_json(store.task_dir(tid) / "task.json", build_task)
+    store.update_status(
+        tid, pending_fix_intent={"build_id": tid, "review_id": review_id, "next_round": 2},
+        pipeline_shift_seq=new_shift, state="working", round=2, shift=new_shift,
+        chain_checked=False, checkpoint_done=False, checkpoint_sha=None,
+        checkpoint_history=[], reactivated_from_review_id=review_id,
+    )
+    _assert_fix_intent_reconciled_safely(fakes, cfg, tid, review_id, before_send_keys_count)
 
 
 def test_review_pipeline_pending_release_carries_partial_review_text(tmp_path, monkeypatch):

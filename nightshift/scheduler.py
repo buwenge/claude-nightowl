@@ -765,6 +765,16 @@ def _check_running(
         and bool(pane_pid)
         and launcher.pid_alive(int(pane_pid))
     )
+
+    # S7.2 阻断二：这条流水线的 coordinator 上如果留着一份没收口的
+    # pending_fix_intent（上一次原地返工在写盘中途被打断），这一班（不管是
+    # 卡住的 review 还是被摸不清进度的 build）都不该继续往下走正常流程——
+    # fail-closed 到 needs_attention，等人工核对清楚。放在存活判断之后、
+    # 任何角色分支之前，确保不管当前是哪个角色、哪个状态都逃不过这道关卡。
+    stale_intent = _reconcile_stale_fix_intent(task, config, now)
+    if stale_intent is not None:
+        return stale_intent
+
     # S7：这一班自己的有效工人（review 角色可能跟顶层 build runner 不同）。
     runner = store.effective_runner(task)
 
@@ -935,21 +945,23 @@ def _check_running(
         if now < parse_iso(paused_until):
             return []
         text = config.get("review_resume_text") or DEFAULT_REVIEW_RESUME_TEXT
-        # 发之前重新要求 verdict——这是一次真正的恢复，不是控制 turn，接下来
-        # 的 Stop 要能被正常解析成 done/fix/pending。
-        store.update_status(task_id, review_awaiting_verdict=True)
-        proc = launcher.send_keys(str(window_id), text)
-        if proc.returncode != 0:
-            store.append_event(
-                task_id,
-                f"审稿额度刷新时间已到但 send-keys 失败（returncode={proc.returncode}），"
-                "未能让它继续",
-            )
-            return [f"{task_id} 审稿额度刷新但叫醒失败"]
-        store.update_status(
-            task_id, quota_resume_sent=True, quota_paused_until=None,
-            state="working", last_event_at=to_iso(now),
+        # S7.2 阻断五.3：resume 不是控制 turn（接下来期待一份真正的
+        # verdict），success_fields 把 review_awaiting_verdict=True 跟
+        # quota_resume_sent/state 一起放进"成功才落盘"的那组字段——以前
+        # 是先落 awaiting_verdict=True 再 send，send 失败时这个字段已经被
+        # 污染，导致失败期间任何一次控制回复（比如误触发的保活）都会被
+        # 当成正式 verdict 尝试解析。
+        sent = send_review_control(
+            task_id, str(window_id), text, kind="resume",
+            success_fields={
+                "review_awaiting_verdict": True, "quota_resume_sent": True,
+                "quota_paused_until": None, "state": "working",
+                "last_event_at": to_iso(now),
+            },
+            failure_note="，未能叫醒它继续",
         )
+        if not sent:
+            return [f"{task_id} 审稿额度刷新但叫醒失败"]
         store.append_event(task_id, "审稿额度刷新时间已到，已 send-keys 让它继续（等待新一轮 verdict）")
         return [f"{task_id} 审稿额度刷新，敲它继续"]
 
@@ -994,16 +1006,29 @@ def _check_running(
         "keepalive_count": int(status.get("keepalive_count") or 0) + 1,
     }
     if store.role_of(task) == "review":
-        # S7.1 阻断二：保活探针不是要求正式 verdict 的回复，发之前先落
-        # review_awaiting_verdict=False，让接下来的 Stop 走控制 turn 分支，
-        # 不会被 _parse_review_verdict 判协议缺失、误记成 fix。
+        # S7.1 阻断二：保活探针不是要求正式 verdict 的回复——发送成功后落
+        # review_awaiting_verdict=False + review_control_kind="keepalive"，
+        # 让接下来的 Stop 走控制 turn 分支，不会被 _parse_review_verdict
+        # 判协议缺失、误记成 fix；kind 供 _handle_review_stop 决定 Stop
+        # 之后要不要改 state（keepalive 保持原样不动）。
         keepalive_fields["review_awaiting_verdict"] = False
-    launcher.send_keys(str(window_id), text)
-    store.update_status(task_id, **keepalive_fields)
-    store.append_event(
-        task_id, f"保活戳：{status.get('state')} 静默超时，已 send-keys 探针"
+        keepalive_fields["review_control_kind"] = "keepalive"
+    # S7.2 阻断五.2：以前先 send-keys、不检查返回值就照样落
+    # last_keepalive_at/keepalive_count（build 与 review 都受影响）；review
+    # 还会额外把 review_awaiting_verdict 提前置 False——send 真失败时状态
+    # 已经被污染（build：计数虚增；review：下一次真实 Stop 会被误当控制
+    # turn 吞掉）。统一走 send_review_control：只有确认送达才落盘计数/标记。
+    sent = send_review_control(
+        task_id, str(window_id), text, kind="keepalive",
+        success_fields=keepalive_fields,
+        failure_note="（计数/控制标记均未落盘，下一 tick 会重试）",
     )
-    return [f"{task_id} 保活戳"]
+    if sent:
+        store.append_event(
+            task_id, f"保活戳：{status.get('state')} 静默超时，已 send-keys 探针"
+        )
+        return [f"{task_id} 保活戳"]
+    return [f"{task_id} 保活戳投递失败"]
 
 
 # ---------- 换班：交接判定与后继任务（设计稿 §4.4） ----------
@@ -1306,6 +1331,31 @@ def _finalize_done(
 DEFAULT_REVIEW_STOP_BUILD_TEXT = (
     "来自nightshift：审稿已经通过（NEXT: done），这条流水线收尾了，请停下不要再继续动代码。"
 )
+
+
+def send_review_control(
+    task_id: str, window_id: str, text: str, *, kind: str,
+    success_fields: dict, failure_note: str = "",
+) -> bool:
+    """review 控制消息统一投递：先 send-keys，成功了才把 `success_fields`
+    一次性落盘；失败时什么持久状态都不碰，只记 events。
+
+    S7.2 阻断五.2/5.3：keepalive/hold/resume 三处以前都是"先落状态字段
+    （awaiting_verdict/control_kind/计数器），再 send-keys"——send 失败时
+    状态已经被污染（keepalive 计数虚增却什么都没发出去；resume 把
+    awaiting_verdict 提前置 True，没回滚，导致下一次任何控制回复都可能被
+    误解析成正式 verdict）。统一收进这一个 helper，倒转顺序：只有确认
+    送达才提交状态，失败保持"这次投递等于没发生"，下一 tick 自然会重试。
+    """
+    proc = launcher.send_keys(str(window_id), text)
+    if proc.returncode != 0:
+        store.append_event(
+            task_id,
+            f"{kind} 控制消息投递失败（returncode={proc.returncode}）{failure_note}",
+        )
+        return False
+    store.update_status(task_id, **success_fields)
+    return True
 
 
 def _coordinator_id(task: dict) -> str:
@@ -1636,6 +1686,44 @@ def _review_pending(review_task: dict, config: dict, now: datetime) -> list[str]
     return [f"{task_id} 审稿 pending → 另起 {new_review_id}"]
 
 
+def _reconcile_stale_fix_intent(task: dict, config: dict, now: datetime) -> list[str] | None:
+    """崩溃恢复：coordinator 上如果还留着非空 `pending_fix_intent`，说明上
+    一次 `_review_fix` 的"原地唤醒 held build"分支在 send-keys 成功之后、
+    五步正式提交（领 shift/写 build task.json/写 build status/写 review
+    status/写 coordinator）走完之前，进程被打断了。
+
+    S7.2 阻断二：消息可能已经真的送达 build 会话——不能假装没发生过去
+    重新走一遍正常流程，也不能自动重发（会造成双份返工提示，同一条意见
+    在窗口里出现两次）。一律 fail-closed 到 needs_attention，把 intent
+    原样留在 coordinator 上当审计证据，人工核对 build 实际进度（看它的
+    tmux 面板/round 是否已经推进）后手动清理再继续。只在第一次发现时
+    落盘、开提醒窗，后续 tick 安静跳过，不重复刷屏。
+
+    只查真存在的 coordinator（`_coordinator_status` 内部就是
+    `store.read_status`，coordinator 不存在时返回空 dict，`get` 拿不到
+    intent，天然不会误判）；没有 intent 时返回 None，调用方按正常流程继续。
+    """
+    coordinator = _coordinator_status(task)
+    intent = coordinator.get("pending_fix_intent")
+    if not intent:
+        return None
+    task_id = task["id"]
+    if coordinator.get("pending_fix_intent_noted"):
+        return []  # 已经告警过，安静等人处理
+    reason = (
+        f"上一次返工投递在写盘中途被打断（{intent!r}），消息可能已经送达施工"
+        "会话，不自动重发——请人工核对 build 实际进度（tmux 面板/round 是否"
+        "已推进），确认后手动清掉这份 pending_fix_intent 再继续"
+    )
+    store.update_status(
+        task_id, state="needs_attention", error=reason, last_event_at=to_iso(now)
+    )
+    store.append_event(task_id, reason)
+    launcher.open_notice_window(task, "(需要人工)", [reason], config)
+    _update_coordinator(task, pending_fix_intent_noted=True)
+    return [f"{task_id} 上一次返工投递中断，未收口 → needs_attention（不自动重发）"]
+
+
 def _review_fix(review_task: dict, config: dict, now: datetime) -> tuple[list[str], bool]:
     """审稿 NEXT: fix：记一次 fix_count，起下一轮 build 返工——若合格 held
     build 会话仍活着，直接 send-keys 完整意见继续（不新开窗口）；否则造
@@ -1726,6 +1814,15 @@ def _review_fix(review_task: dict, config: dict, now: datetime) -> tuple[list[st
                 last_event_at=to_iso(now), chain_checked=False, checkpoint_done=False,
                 checkpoint_sha=None, checkpoint_history=history,
                 reactivated_from_review_id=task_id,
+                # S7.2 阻断三：显式清掉上一轮的运行期收尾标记——update_status
+                # 是合并语义，不传等于不清除。handover_path 一旦被上一轮的
+                # 提醒逻辑写过就会一直覆盖 _handover_file() 按 shift 计算的
+                # 默认路径；不清掉的话，新一轮如果只发生一次普通 Stop、还没
+                # 来得及写新交接文件，调度器会重新读到上一轮那份写着
+                # NEXT:done 的旧交接，把中间停顿误判成这一轮已经收工。
+                handover_path=None, context_warned_at=None, quota_warned_at=None,
+                context_warn_count=0, quota_warn_count=0, mode_warned=False,
+                other_model_warned=[],
             )
             store.update_status(
                 task_id, state="chained", reactivated_task_id=parent_id,

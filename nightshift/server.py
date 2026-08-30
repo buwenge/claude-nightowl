@@ -1042,12 +1042,25 @@ class _Handler(BaseHTTPRequestHandler):
             for item in members:
                 t, s = item["task"], item["status"] or {}
                 wid = s.get("window_id")
-                if wid and launcher.window_alive(str(wid), cfg):
-                    if store.role_of(t) == "review":
-                        # S7.1 阻断二：hold_text 不要求正式 verdict，发之前
-                        # 先落 review_awaiting_verdict=False，接下来的 Stop
-                        # 按控制 turn 处理，不会被误记成协议缺失→fix。
-                        store.update_status(t["id"], review_awaiting_verdict=False)
+                if not (wid and launcher.window_alive(str(wid), cfg)):
+                    continue
+                if store.role_of(t) == "review":
+                    # S7.2 阻断五.2/阻断八：hold_text 不要求正式 verdict，
+                    # 统一走 send_review_control——只有 send 真的成功才落
+                    # review_awaiting_verdict=False + review_control_kind=
+                    # "hold"（供 Stop 之后正确恢复成 held，见阻断五.1）；
+                    # 以前是先落 False 再 send，send 失败时状态已经被污染
+                    # （真实 verdict 的 Stop 也会被误当控制 turn 吞掉）。
+                    sent = scheduler.send_review_control(
+                        t["id"], str(wid), text, kind="hold",
+                        success_fields={
+                            "review_awaiting_verdict": False,
+                            "review_control_kind": "hold",
+                        },
+                    )
+                    if sent:
+                        pinged.append(str(wid))
+                else:
                     proc = launcher.send_keys(str(wid), text)
                     if proc.returncode == 0:
                         pinged.append(str(wid))

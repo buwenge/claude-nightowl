@@ -906,6 +906,70 @@ def test_stop_review_control_turn_after_verdict_does_not_overwrite():
     assert status["review_recorded_round"] == 1
 
 
+def test_stop_review_control_turn_hold_restores_held_even_when_working():
+    """S7.2 阻断五.1：hold 打进一个 working 的 reviewer 后，Stop 回来账面
+    不该继续停在 working——`review_control_kind="hold"` 要求控制 turn 分支
+    把 state 显式转成 held，不管发送前是 working/idle 哪一种。"""
+    task_id = make_review_task()
+    store.update_status(
+        task_id, review_awaiting_verdict=False, review_control_kind="hold",
+        state="working",
+    )
+    text = "收到，我在等，先不动。"  # 没有 NEXT 行的普通控制回复
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["state"] == "held"
+    assert status.get("held_reason")
+    assert "review_verdict" not in status  # 仍然只是控制 turn，不解析 verdict
+    assert "review_control_kind" not in status  # 消费后清掉，不留残影
+
+
+def test_stop_review_control_turn_keepalive_kind_keeps_state_unchanged():
+    """对照：control_kind="keepalive" 时状态保持原样不动（keepalive 本来
+    只会戳 held/waiting_background，收到控制回复不该变）。"""
+    task_id = make_review_task()
+    store.update_status(
+        task_id, review_awaiting_verdict=False, review_control_kind="keepalive",
+        state="waiting_background",
+    )
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": "还在"}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["state"] == "waiting_background"
+    assert "review_control_kind" not in status
+
+
+def test_stop_review_file_write_failure_leaves_verdict_unset_and_retryable():
+    """S7.2 阻断四反例：review 文件写失败（这里用"目标路径已经是个目录"
+    制造一个不依赖 root 权限也一定失败的 OSError）时，verdict/final 不能
+    被提前钉死——status 除了一个会被清掉的"正在处理"标记之外没有任何
+    字段被改过；同一轮后续 Stop（含 CC 的静默重试）应该能重新尝试并
+    正常写入。"""
+    task_id = make_review_task()
+    review_path = store.task_dir(task_id) / "review-1.md"
+    review_path.mkdir()  # 让 os.replace(tmp, path) 必然因为类型不对而失败
+    text = "看过了，改动都对。\n\nNEXT: done"
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc.returncode == 0  # hook 自己吞掉异常，不炸整个进程
+    status = store.read_status(task_id)
+    assert "review_verdict" not in status
+    assert "review_verdict_final" not in status
+    assert "review_recorded_round" not in status
+    assert "review_file_claim_round" not in status  # 失败后 claim 标记已清掉
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "写审稿文件失败" in events
+    assert "本轮可重试" in events
+
+    review_path.rmdir()  # 排除写入障碍，模拟"重试成功"
+    proc2 = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc2.returncode == 0
+    status2 = store.read_status(task_id)
+    assert status2["review_verdict"] == "done"
+    assert status2["review_verdict_final"] is True
+    assert Path(status2["review_file"]).read_text(encoding="utf-8") == text
+
+
 def test_stop_review_concurrent_stop_accepts_only_one_verdict():
     """S7.1 阻断二反例：两个并发 Stop（不同内容）打向同一个 review 任务
     同一轮，最终只有一个 verdict 被接受、两个进程都不抛异常、review_file

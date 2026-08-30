@@ -729,6 +729,80 @@ def test_create_successor_copies_runner():
     assert succ2["runner"] == "claude"
 
 
+def test_next_pipeline_shift_bootstraps_from_existing_max_shift_on_old_chain():
+    """S7.2 阻断一反例：coordinator 第一次领号（没有 pipeline_shift_seq）
+    时不能固定从 1 开始——S7 上线前（S1-S6 时代）这条链上可能已经有一个
+    shift=3 的旧任务落盘（scheduled/postponed/idle/chained 都算），固定从
+    1+1=2 起会比现存最大 shift 还小，chain_state() 的 max-shift 扫描会继续
+    认那个旧任务是"最新班"。第一次领号必须先扫一遍这条 pipeline 现存所有
+    任务的最大 shift，从它开始 bootstrap。"""
+    old = make_task()
+    old["id"] = "20260101-000000-aaaa"
+    old["created_at"] = "2026-01-01T00:00:00Z"
+    old["shift"] = 3  # 模拟滚动升级前就已经推进了三班的旧任务
+    d = store.task_dir(old["id"])
+    d.mkdir(parents=True, exist_ok=True)
+    store.atomic_write_json(d / "task.json", old)
+    # 这条旧任务自己就是它自己的 coordinator（没有 pipeline_id/root_id 字段），
+    # 所以 coordinator 的 status.json 上此刻也还没有 pipeline_shift_seq。
+    assert "pipeline_shift_seq" not in store.read_status(old["id"])
+
+    got = store.next_pipeline_shift(old)
+    assert got == 4  # 不是 2——bootstrap 自现存最大 shift=3，而不是固定从 1 起
+    got2 = store.next_pipeline_shift(old)
+    assert got2 == 5  # 之后就是纯 +1，不用每次都重新扫
+
+
+def test_next_pipeline_shift_bootstraps_from_root_when_task_is_a_successor():
+    """同上，但旧任务是通过 pipeline_id 关联到另一个 coordinator（模拟旧
+    Codex 续班链）：bootstrap 要扫的是整条 pipeline，不是只看被传进来的
+    这一个任务自己的 shift。"""
+    root_id = "20260101-000000-bbbb"
+    root = make_task()
+    root["id"] = root_id
+    root["created_at"] = "2026-01-01T00:00:00Z"
+    root["shift"] = 1
+    store.atomic_write_json(store.task_dir(root_id) / "task.json", root)
+
+    old_successor = make_task()
+    old_successor["id"] = "20260102-000000-cccc"
+    old_successor["created_at"] = "2026-01-02T00:00:00Z"
+    old_successor["root_id"] = root_id
+    old_successor["shift"] = 3
+    store.atomic_write_json(store.task_dir(old_successor["id"]) / "task.json", old_successor)
+
+    got = store.next_pipeline_shift(old_successor)
+    assert got == 4  # 扫的是整条 root_id 链的最大 shift（3），不是自己
+
+
+def test_next_pipeline_shift_concurrent_calls_do_not_collide():
+    """并发两次领号（线程模拟）不撞号——bootstrap 与递增都在同一把
+    modify_status 锁内完成。"""
+    import threading
+
+    task = make_task()
+    task["id"] = "20260101-000000-dddd"
+    task["created_at"] = "2026-01-01T00:00:00Z"
+    task["shift"] = 2
+    store.atomic_write_json(store.task_dir(task["id"]) / "task.json", task)
+
+    results: list[int] = []
+    lock = threading.Lock()
+
+    def worker():
+        got = store.next_pipeline_shift(task)
+        with lock:
+            results.append(got)
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(results) == [3, 4, 5, 6, 7, 8]  # bootstrap 自 2，六次各自 +1，互不撞号
+
+
 def test_create_successor_codex_context_limit_placeholder_is_human_text():
     """S6.1 B3：Codex 续班渲染 {context_limit} 时也要按 runner 的模型表查、
     查不到写人话，不能是字面 "None" 或悄悄借用 Claude 的 default。"""
