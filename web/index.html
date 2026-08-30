@@ -28,7 +28,7 @@
       <div class="quota-head">
         <h2 style="margin:0">额度（剩余）</h2>
         <span class="quota-btns">
-          <button type="button" id="btn-requery" class="ghost">重新查额度</button>
+          <button type="button" id="btn-requery" class="ghost">都刷新</button>
         </span>
       </div>
       <div id="quota-body"><p class="hint">加载中…</p></div>
@@ -68,6 +68,12 @@
       <div id="only-create">
         <label for="f-project"><b>项目</b></label>
         <select id="f-project" required></select>
+
+        <label><b>用谁施工</b></label>
+        <div class="choice-row" id="runner-radios">
+          <label class="inline"><input type="radio" name="f-runner" value="claude" checked> Claude Code</label>
+          <label class="inline"><input type="radio" name="f-runner" value="codex"> Codex</label>
+        </div>
 
         <label for="f-model"><b>模型</b></label>
         <select id="f-model"></select>

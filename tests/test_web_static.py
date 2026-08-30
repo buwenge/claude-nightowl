@@ -54,3 +54,49 @@ def test_css_has_touch_affordance_and_new_state_chips():
         "orphan-box", "wt-branch",
     ):
         assert piece in css, piece
+
+
+# ---------- S6⑤：选 Codex 工人 + 双额度展示 ----------
+
+
+def test_index_has_runner_radios_and_two_runner_quota_box():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    for piece in (
+        'name="f-runner"',
+        'value="claude"',
+        'value="codex"',
+        "用谁施工",
+        'id="btn-requery"',
+    ):
+        assert piece in html, piece
+
+
+def test_app_js_has_runner_selection_and_dual_quota_rendering():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    for piece in (
+        # 新建/编辑：runner 决定模型/档位下拉的取值来源
+        "function runnerModelsEfforts(runner)",
+        "function currentRunner()",
+        "function populateModelEffortForRunner(runner)",
+        "CFG.runners && CFG.runners[runner]",
+        # 提交时带 runner；编辑旧任务缺字段按 claude 解释
+        "runner: currentRunner()",
+        'var runner = task.runner || "claude";',
+        # 双额度：两家各自独立渲染，一家失败不牵连另一家
+        "function renderQuotaRunner(box, label, entry)",
+        'renderQuotaRunner(box, "Claude Code", data.claude);',
+        'renderQuotaRunner(box, "Codex", data.codex);',
+        # 卡片头部施工标签 + 有 thread_id 只展示短后缀
+        '"施工：" + runnerLabel',
+        "String(status.thread_id).slice(-8)",
+        # Codex 额度到线等刷新的具体时间点；后台任务运行中/待读取摘要
+        "等 Codex 额度刷新，",
+        "后台任务：",
+    ):
+        assert piece in js, piece
+
+
+def test_css_has_runner_chip_and_quota_runner_block():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    for piece in ("runner-chip", "quota-runner"):
+        assert piece in css, piece

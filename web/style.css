@@ -347,6 +347,14 @@ fieldset.box summary { cursor: pointer; min-height: 44px; line-height: 44px; fon
 .bar-block { margin-bottom: 8px; }
 .bar-resets { font-size: 12px; color: var(--muted); margin-top: 3px; }
 
+/* S6⑤：额度卡两家（Claude/Codex）各一块 */
+.quota-runner { margin-bottom: 14px; }
+.quota-runner:last-child { margin-bottom: 0; }
+.quota-runner h3 { margin: 0 0 6px; font-size: 14px; color: var(--muted); font-weight: 600; }
+
+/* S6⑤：卡片头部"施工：Codex · 模型" */
+.runner-chip { background: var(--chip-sched); }
+
 .warmup-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line, #8884); }
 .warmup-row label.inline { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
 .warmup-row input[type="time"] { padding: 0 8px; }

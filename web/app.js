@@ -252,33 +252,50 @@ function barRow(label, pct) {
   ]);
 }
 
-function renderQuota(data) {
-  var box = $("quota-body");
-  box.textContent = "";
-  if (!data || (!data.usage && !data.error)) {
-    box.appendChild(el("p", { class: "hint", text: "还没查过（有任务跑起来才查）" }));
+// S6⑤：一家的额度块（Claude 或 Codex）——数据未知就写"查不到/未提供"，
+// 绝不画成 0%；一家失败不牵连另一家（各自独立调用，见 renderQuota）。
+function renderQuotaRunner(box, label, entry) {
+  var section = el("div", { class: "quota-runner" }, [el("h3", { text: label })]);
+  entry = entry || {};
+  if (!entry.usage && !entry.error) {
+    section.appendChild(el("p", { class: "hint", text: "还没查过（有任务跑起来才查）" }));
+    box.appendChild(section);
     return;
   }
-  if (data.error) {
-    box.appendChild(el("p", { class: "warn-reason", text: "上次查询失败：" + data.error }));
+  if (entry.error) {
+    section.appendChild(el("p", { class: "warn-reason", text: "上次查询失败：" + entry.error }));
+    box.appendChild(section);
     return;
   }
-  var usage = data.usage;
-  if (typeof usage.session_pct === "number") box.appendChild(remainRow("五小时", usage.session_pct, usage.session_resets));
-  if (typeof usage.week_all_pct === "number") box.appendChild(remainRow("七日（全部模型）", usage.week_all_pct, usage.week_all_resets));
+  var usage = entry.usage;
+  if (typeof usage.session_pct === "number") section.appendChild(remainRow("五小时", usage.session_pct, usage.session_resets));
+  if (typeof usage.week_all_pct === "number") section.appendChild(remainRow("七日（全部模型）", usage.week_all_pct, usage.week_all_resets));
   var per = usage.per_model || {};
   var perResets = usage.per_model_resets || {};
   Object.keys(per).forEach(function (name) {
-    box.appendChild(remainRow("七日（" + name + "）", per[name], perResets[name]));
+    section.appendChild(remainRow("七日（" + name + "）", per[name], perResets[name]));
   });
-  var agoText = "";
-  if (typeof data.age_seconds === "number") {
-    var minutes = Math.max(0, Math.round(data.age_seconds / 60));
-    agoText = minutes === 0 ? "刚刚查的" : minutes + " 分钟前查的";
-  } else if (data.fetched_at) {
-    agoText = "查询时间 " + fmtLocal(data.fetched_at);
+  if (typeof usage.reset_credits_available === "number") {
+    section.appendChild(el("p", { class: "quota-line",
+      text: "免费重置券：" + usage.reset_credits_available + " 张（不自动兑换）" }));
   }
-  box.appendChild(el("p", { class: "quota-line", text: agoText }));
+  var agoText = "";
+  if (typeof entry.age_seconds === "number") {
+    var minutes = Math.max(0, Math.round(entry.age_seconds / 60));
+    agoText = minutes === 0 ? "刚刚查的" : minutes + " 分钟前查的";
+  } else if (entry.fetched_at) {
+    agoText = "查询时间 " + fmtLocal(entry.fetched_at);
+  }
+  if (agoText) section.appendChild(el("p", { class: "quota-line", text: agoText }));
+  box.appendChild(section);
+}
+
+function renderQuota(data) {
+  var box = $("quota-body");
+  box.textContent = "";
+  data = data || {};
+  renderQuotaRunner(box, "Claude Code", data.claude);
+  renderQuotaRunner(box, "Codex", data.codex);
 }
 
 var WARMUP_DIRTY = false;  // 用户动过预热控件、还没保存成功：轮询不许覆盖
@@ -548,10 +565,13 @@ function chainCard(chain, now) {
 function taskCard(item, now, chainIds) {
   var task = item.task, status = item.status;
   var state = status.state || "-";
+  var runner = task.runner || "claude";
+  var runnerLabel = runner === "codex" ? "Codex" : "Claude Code";
   var card = el("article", { class: "card" + (task.id === HIGHLIGHT_ID ? " flash" : "") });
 
   var headKids = [
     el("span", { class: "chip st-" + state, text: STATE_TEXT[state] || state }),
+    el("span", { class: "chip runner-chip", text: "施工：" + runnerLabel + " · " + task.model }),
     el("span", { class: "task-title", text: task.title }),
     el("span", { class: "task-id", text: task.id })
   ];
@@ -561,9 +581,32 @@ function taskCard(item, now, chainIds) {
     headKids.push(el("span", { class: "chip stuck-chip", text: "疑似卡住 " + mins + " 分钟" }));
   }
   card.appendChild(el("div", { class: "task-head" }, headKids));
-  card.appendChild(el("div", { class: "task-meta", text:
-    "项目 " + task.project + " · 模型 " + task.model + " · 档位 " + task.effort +
-    (chainIds && chainIds.length > 1 ? " · 共 " + chainIds.length + " 班" : "") }));
+  var metaText = "项目 " + task.project + " · 模型 " + task.model + " · 档位 " + task.effort +
+    (chainIds && chainIds.length > 1 ? " · 共 " + chainIds.length + " 班" : "");
+  // 有 thread_id 只展示短后缀，不把本机 rollout 路径/完整会话 id 露给网页
+  if (runner === "codex" && status.thread_id) {
+    metaText += " · 会话 …" + String(status.thread_id).slice(-8);
+  }
+  card.appendChild(el("div", { class: "task-meta", text: metaText }));
+
+  // S6⑤：Codex 额度到线等刷新的具体时间点；waiting_wakeup 对 Claude 走
+  // ScheduleWakeup（会话自己缓存闹钟），不落 quota_paused_until，这条只对
+  // 设了这个字段的 Codex 任务显示
+  if (state === "waiting_wakeup" && status.quota_paused_until) {
+    card.appendChild(el("div", { class: "quota-line",
+      text: "等 Codex 额度刷新，" + fmtLocal(status.quota_paused_until) + " 自动叫醒" }));
+  }
+
+  // S6⑤：F12 后台任务摘要——运行中 / 已完成待读取的数量
+  if (item.background_summary) {
+    var bs = item.background_summary;
+    var bgParts = [];
+    if (bs.running) bgParts.push(bs.running + " 个运行中");
+    if (bs.finished_pending) bgParts.push(bs.finished_pending + " 个已完成待读取");
+    if (bgParts.length) {
+      card.appendChild(el("div", { class: "quota-line", text: "后台任务：" + bgParts.join("，") }));
+    }
+  }
 
   // S5③：工作树任务的分支与施工目录（分支可点复制）
   if (status.worktree_path || status.branch) {
@@ -802,6 +845,8 @@ function enterCreate() {
   setTriggerMode("time");
   unmarkPromptEdited();
   WARN_EDITED = false;
+  document.querySelector('input[name="f-runner"][value="claude"]').checked = true;
+  populateModelEffortForRunner("claude");
   $("f-worktree").checked = true;   // 新建默认建树
   $("f-mergepolicy").value = "manual";
   syncWorktreeUI();
@@ -813,8 +858,13 @@ function enterEdit(item) {
   EDIT_TASK = { id: task.id, item: item, active: ACTIVE_STATES.indexOf(status.state) >= 0 };
   $("f-title").value = task.title || "";
   if (task.project) $("f-project").value = task.project;
+  var runner = task.runner || "claude";
+  var runnerRadio = document.querySelector('input[name="f-runner"][value="' + runner + '"]');
+  if (runnerRadio) runnerRadio.checked = true;
+  populateModelEffortForRunner(runner);
+  var rc = runnerModelsEfforts(runner);
   var modelSel = $("f-model");
-  if (CFG.models && CFG.models[task.model]) {
+  if (rc.models && rc.models[task.model]) {
     modelSel.value = task.model;
     $("f-model-custom").hidden = true;
   } else {
@@ -822,7 +872,7 @@ function enterEdit(item) {
     $("f-model-custom").hidden = false;
     $("f-model-custom").value = task.model || "";
   }
-  if ((CFG.efforts || []).indexOf(task.effort) >= 0) $("f-effort").value = task.effort;
+  if ((rc.efforts || []).indexOf(task.effort) >= 0) $("f-effort").value = task.effort;
 
   var trigger = task.trigger || { type: "time" };
   if (trigger.type === "after") $("f-after-when").value = trigger.when || "finished";
@@ -954,24 +1004,43 @@ function deleteDraft() {
     .catch(function () {});
 }
 
+// S6⑤：runner 决定这次能选哪些模型/档位——CFG.runners 是 commit①/S6 新键，
+// 旧后端没有这个键时只有 claude 能用（退回旧顶层 CFG.models/CFG.efforts）。
+function runnerModelsEfforts(runner) {
+  if (CFG.runners && CFG.runners[runner]) return CFG.runners[runner];
+  return runner === "claude" ?
+    { models: CFG.models || {}, efforts: CFG.efforts || [] } :
+    { models: {}, efforts: [] };
+}
+
+function currentRunner() {
+  var r = document.querySelector('input[name="f-runner"]:checked');
+  return r ? r.value : "claude";
+}
+
+function populateModelEffortForRunner(runner) {
+  var rc = runnerModelsEfforts(runner);
+  var model = $("f-model");
+  model.textContent = "";
+  Object.keys(rc.models || {}).forEach(function (name) {
+    model.appendChild(el("option", { value: name, text: name }));
+  });
+  model.appendChild(el("option", { value: "__custom__", text: "自定义…" }));
+  var effort = $("f-effort");
+  effort.textContent = "";
+  (rc.efforts || []).forEach(function (name) {
+    effort.appendChild(el("option", { value: name, text: name }));
+  });
+  if ((rc.efforts || []).indexOf("high") >= 0) effort.value = "high";
+}
+
 function populateNewForm() {
   var project = $("f-project");
   project.textContent = "";
   Object.keys(CFG.projects).forEach(function (name) {
     project.appendChild(el("option", { value: name, text: name }));
   });
-  var model = $("f-model");
-  model.textContent = "";
-  Object.keys(CFG.models).forEach(function (name) {
-    model.appendChild(el("option", { value: name, text: name }));
-  });
-  model.appendChild(el("option", { value: "__custom__", text: "自定义…" }));
-  var effort = $("f-effort");
-  effort.textContent = "";
-  (CFG.efforts || []).forEach(function (name) {
-    effort.appendChild(el("option", { value: name, text: name }));
-  });
-  if ((CFG.efforts || []).indexOf("high") >= 0) effort.value = "high";
+  populateModelEffortForRunner(currentRunner());
   $("f-warntext").value = CFG.context_warn_text || "";
   if (CFG.guards) {
     if (typeof CFG.guards.session_pct_max === "number") $("f-sessionleft").value = 100 - CFG.guards.session_pct_max;
@@ -1032,7 +1101,7 @@ function submitNewForm(ev) {
              trigger: trigger || { type: "time" } };
   } else {
     body = {
-      title: title, project: project, model: model, effort: effort,
+      title: title, project: project, runner: currentRunner(), model: model, effort: effort,
       task_text: text, prompt_final: prompt, guards: guards, chain: chain,
       trigger: trigger || { type: "time" },
       worktree: wt.worktree, review: wt.review
@@ -1163,6 +1232,13 @@ function start() {
   $("f-worktree").addEventListener("change", syncWorktreeUI);
   $("f-title").addEventListener("input", schedulePreview);
   $("f-project").addEventListener("change", schedulePreview);
+  Array.prototype.forEach.call(document.querySelectorAll('input[name="f-runner"]'), function (r) {
+    r.addEventListener("change", function () {
+      populateModelEffortForRunner(currentRunner());
+      recalcWarnDefault();
+      schedulePreview();
+    });
+  });
   $("f-model").addEventListener("change", function () {
     $("f-model-custom").hidden = $("f-model").value !== "__custom__";
     recalcWarnDefault();
