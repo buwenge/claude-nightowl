@@ -2323,3 +2323,119 @@ def test_apply_review_no_quota_policy_release_closes_build_window(monkeypatch):
     assert fakes.close_calls == [["@1"]]
     assert store.read_status(tid)["review_no_quota_released"] is True
     assert store.read_status(review_id)["state"] == "postponed"
+
+
+REVIEW_CODEX_CONFIG = {**REVIEW_CONFIG, "runners": CODEX_CONFIG["runners"]}
+
+
+def test_review_pipeline_mixed_cc_build_codex_review(tmp_path, monkeypatch):
+    """施工=Claude、审稿=Codex：审稿班的有效工人/额度来源正确按 review
+    自己的 runner 走，不被顶层 build runner 污染。"""
+    fakes = Fakes(monkeypatch)
+    monkeypatch.setattr(quota, "fetch_usage_codex", lambda config, timeout=15.0: dict(fakes.usage))
+    proj = _make_repo(tmp_path)
+    cfg = dict(REVIEW_CODEX_CONFIG)
+    cfg["projects"] = {"demo": str(proj), "other": str(proj / "nope")}
+    tid = store.create_task({
+        "title": "混合流水线", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": scheduler.to_iso(NOW), "task_text": "正文",
+        "prompt_final": "提示词",
+        "review": {"enabled": True, "runner": "codex", "model": "gpt-5.6-luna", "effort": "high"},
+    }, cfg)
+    wt = _register_tree(proj, tid, "混合流水线")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "写完了。\nNEXT: done")
+
+    scheduler.tick(cfg, NOW)
+    build_status = store.read_status(tid)
+    assert build_status["state"] == "held"
+    review_id = build_status["successor_id"]
+    review_task = store.load_task(review_id)
+    assert review_task["role"] == "review"
+    assert review_task["runner"] == "claude"  # 顶层仍是这条流水线的建造配方
+    assert store.effective_runner(review_task) == "codex"  # 但这一班真正用 codex
+    assert store.effective_model(review_task) == "gpt-5.6-luna"
+    # create_cross_role_successor 的 run_at 是真实墙钟时间，跟测试的固定
+    # NOW 无关；这里手动拨回，只为了让下一次 tick 判定"到点"
+    review_task["run_at"] = scheduler.to_iso(NOW)
+    store.atomic_write_json(store.task_dir(review_id) / "task.json", review_task)
+
+    scheduler.tick(cfg, NOW)  # 审稿班起跑：quota 走 codex 分支
+    review_status = store.read_status(review_id)
+    assert review_status["state"] == "launching"
+    assert review_status["quota_at_launch"]["quota_source"] == "codex"
+    quota_file = json.loads((store.home() / "quota.json").read_text(encoding="utf-8"))
+    assert quota_file["codex"]["usage"]  # 查过 codex
+    assert fakes.launch_calls == [review_id]  # build 是 held，没有被再次 launch
+
+    # 审稿给出 fix：下一轮 build 仍是 Claude（build 顶层配方不受 review runner 影响）
+    _go_idle(review_id, window_id="@2")
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("退回。\n\nNEXT: fix", encoding="utf-8")
+    store.update_status(review_id, review_verdict="fix", review_file=str(review_file),
+                        review_recorded_round=1)
+    scheduler.tick(cfg, NOW)
+    build_status2 = store.read_status(tid)
+    assert build_status2["state"] == "working"
+    assert store.load_task(tid)["round"] == 2
+    assert store.effective_runner(store.load_task(tid)) == "claude"
+
+
+def test_held_keepalive_paused_skips_and_interval_by_runner(tmp_path, monkeypatch):
+    """held 状态也走保活；keepalive_paused 时不戳；按 runner 的间隔（claude
+    50 分钟）判断是否到点，不是一律戳。"""
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _review_config_for(proj)
+    tid = make_review_task()
+    _register_tree(proj, tid, "审稿流水线任务")
+    store.update_status(
+        tid, state="held", window_id="@1", pane_pid=1,
+        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=10)),
+        keepalive_paused=True,
+    )
+    scheduler.tick(cfg, NOW)
+    assert fakes.send_keys_calls == []  # 暂停中，不该戳
+
+    store.update_status(tid, keepalive_paused=False,
+                        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=10)))
+    scheduler.tick(cfg, NOW)
+    assert fakes.send_keys_calls == []  # 恢复了，但还没到 50 分钟
+
+    store.update_status(tid, last_event_at=scheduler.to_iso(NOW - timedelta(minutes=51)))
+    scheduler.tick(cfg, NOW)
+    assert len(fakes.send_keys_calls) == 1  # 到点了，戳一次
+    assert store.read_status(tid)["last_keepalive_at"]
+
+
+def test_review_fix_send_keys_failure_is_fail_closed(tmp_path, monkeypatch):
+    """held build 会话还活着，但把返工意见敲进去失败：不能假装已经继续了，
+    必须 needs_attention 留痕，不能悄悄丢掉这条返工意见。"""
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _review_config_for(proj)
+    tid = make_review_task()
+    wt = _register_tree(proj, tid, "审稿流水线任务")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "写完了。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    review_id = store.read_status(tid)["successor_id"]
+
+    monkeypatch.setattr(
+        launcher, "send_keys",
+        lambda w, t: subprocess.CompletedProcess([], 1, "", "send-keys 失败"),
+    )
+    _go_idle(review_id, window_id="@2")
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("退回。\n\nNEXT: fix", encoding="utf-8")
+    store.update_status(review_id, review_verdict="fix", review_file=str(review_file),
+                        review_recorded_round=1)
+    scheduler.tick(cfg, NOW)
+    review_status = store.read_status(review_id)
+    assert review_status["state"] == "needs_attention"
+    assert "失败" in review_status["error"]
+    assert len(fakes.notice_calls) == 1
+    # build 那边没被悄悄标成继续
+    assert store.read_status(tid)["state"] == "held"
