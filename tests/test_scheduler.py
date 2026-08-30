@@ -102,7 +102,7 @@ class Fakes:
         monkeypatch.setattr(launcher, "open_notice_window", self._notice)
         monkeypatch.setattr(launcher, "open_failure_window", self._failure)
         monkeypatch.setattr(launcher, "close_windows", self._close_windows)
-        monkeypatch.setattr(quota, "fetch_usage", self._fetch)
+        monkeypatch.setattr(quota, "fetch_usage_claude", self._fetch)
 
     def _launch(self, task_id, config):
         self.launch_calls.append(task_id)
@@ -1244,13 +1244,14 @@ def test_quota_refreshed_only_when_active_and_stale(monkeypatch):
     assert fakes.fetch_calls == []
     assert not (store.home() / "quota.json").exists()
 
-    # 有活跃任务 → 刷，写盘 fetched_at == now
+    # 有活跃任务 → 刷，写盘 fetched_at == now（S6：claude 分片）
     store.update_status(tid, state="working", window_id="@6", pane_pid=NO_PID)
     scheduler.tick(CONFIG, NOW)
     assert len(fakes.fetch_calls) == 1
     data = json.loads((store.home() / "quota.json").read_text(encoding="utf-8"))
-    assert data["fetched_at"] == scheduler.to_iso(NOW)
-    assert data["usage"]["session_pct"] == 13
+    assert data["claude"]["fetched_at"] == scheduler.to_iso(NOW)
+    assert data["claude"]["usage"]["session_pct"] == 13
+    assert data["codex"] == {}  # 没有活跃的 codex 任务，不碰它那份
 
     # 刚刷过（5 分钟 < 30 分钟）→ 不刷
     scheduler.tick(CONFIG, NOW + timedelta(minutes=5))
@@ -1268,8 +1269,8 @@ def test_quota_refresh_error_written_to_file(monkeypatch):
     store.update_status(tid, state="working", window_id="@6", pane_pid=NO_PID)
     scheduler.tick(CONFIG, NOW)
     data = json.loads((store.home() / "quota.json").read_text(encoding="utf-8"))
-    assert "error" in data and "坏了" in data["error"]
-    assert data["fetched_at"] == scheduler.to_iso(NOW)
+    assert "坏了" in data["claude"]["error"]
+    assert data["claude"]["fetched_at"] == scheduler.to_iso(NOW)
 
 
 # ---------- run_forever：单轮异常吞掉并记日志 ----------
@@ -1313,6 +1314,173 @@ def test_waiting_wakeup_not_finished_nor_poked(monkeypatch):
     assert st["quota_resume_sent"] and st["quota_paused_until"] is None
     sched.tick(CONFIG, later)
     assert len(sent) == 1
+
+
+# ---------- S6③：Codex 额度、按 runner 预检、缓存唤醒、保活分家 ----------
+
+CODEX_CONFIG = {
+    **CONFIG,
+    "runners": {
+        "claude": {"bin": "claude", "models": CONFIG["models"], "efforts": CONFIG["efforts"],
+                   "keepalive_idle_minutes": 50},
+        "codex": {"bin": "codex", "profile": "nightowl",
+                  "models": {"gpt-5.6-luna": {"context_limit": None}},
+                  "efforts": ["low", "medium", "high", "xhigh"],
+                  "keepalive_idle_minutes": 25},
+    },
+}
+
+
+def make_task_codex(**over):
+    task = {
+        "title": "Codex 夜间重构",
+        "project": "demo",
+        "runner": "codex",
+        "model": "gpt-5.6-luna",
+        "effort": "high",
+        "run_at": scheduler.to_iso(NOW),
+        "task_text": "正文",
+        "prompt_final": "提示词",
+    }
+    task.update(over)
+    return store.create_task(task, CODEX_CONFIG)
+
+
+def test_try_launch_codex_skips_claude_trust_check(monkeypatch):
+    """Codex 任务不查 ~/.claude.json；哪怕它整个不存在也照跑预检。"""
+    fakes = Fakes(monkeypatch, trusted=False)  # is_trusted 恒定 False
+    monkeypatch.setattr(quota, "fetch_usage_codex", lambda config, timeout=15.0: dict(fakes.usage))
+    tid = make_task_codex()
+    scheduler.tick(CODEX_CONFIG, NOW)
+    assert store.read_status(tid)["state"] == "launching"
+    assert fakes.failure_calls == []
+
+
+def test_claude_quota_bad_does_not_block_codex_launch(monkeypatch):
+    """一家额度坏了不能拦另一家起跑：Claude 查不到额度时 Codex 照样能起跑。"""
+    fakes = Fakes(monkeypatch)
+    fakes.usage_exc = quota.UsageUnavailable("claude 额度查不到")
+    monkeypatch.setattr(quota, "fetch_usage_codex", lambda config, timeout=15.0: dict(fakes.usage))
+    codex_tid = make_task_codex()
+    claude_tid = make_task(project="other")  # 不同目录，不撞同目录锁
+    scheduler.tick(CODEX_CONFIG, NOW)
+    assert store.read_status(codex_tid)["state"] == "launching"
+    assert store.read_status(claude_tid)["state"] == "postponed"
+
+
+def test_try_launch_codex_writes_quota_source_and_codex_slice(monkeypatch):
+    fakes = Fakes(monkeypatch)
+    codex_usage = {**usage_fixture(), "session_pct": 5}
+    monkeypatch.setattr(quota, "fetch_usage_codex", lambda config, timeout=15.0: dict(codex_usage))
+    tid = make_task_codex()
+    scheduler.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["quota_at_launch"]["quota_source"] == "codex"
+    data = json.loads((store.home() / "quota.json").read_text(encoding="utf-8"))
+    assert data["codex"]["usage"]["session_pct"] == 5
+    assert data["claude"] == {}  # 只查了这一班自己的 runner
+
+
+def test_maybe_refresh_quota_independent_per_runner(monkeypatch):
+    claude_calls = []
+    codex_calls = []
+    monkeypatch.setattr(
+        quota, "fetch_usage_claude",
+        lambda config, timeout=120: claude_calls.append(1) or usage_fixture(),
+    )
+    monkeypatch.setattr(
+        quota, "fetch_usage_codex",
+        lambda config, timeout=15.0: codex_calls.append(1) or {**usage_fixture(), "session_pct": 7},
+    )
+    actions: list[str] = []
+    scheduler._maybe_refresh_quota(CODEX_CONFIG, NOW, actions, runners={"claude"})
+    assert len(claude_calls) == 1 and len(codex_calls) == 0
+    scheduler._maybe_refresh_quota(CODEX_CONFIG, NOW, actions, runners={"codex"})
+    assert len(claude_calls) == 1 and len(codex_calls) == 1
+    # claude 那份还新鲜（0 分钟前），再刷不会重复调用；codex 同理
+    scheduler._maybe_refresh_quota(CODEX_CONFIG, NOW, actions, runners={"claude", "codex"})
+    assert len(claude_calls) == 1 and len(codex_calls) == 1
+    data = json.loads((store.home() / "quota.json").read_text(encoding="utf-8"))
+    assert data["claude"]["usage"]["session_pct"] == 13
+    assert data["codex"]["usage"]["session_pct"] == 7
+
+
+def test_codex_working_over_session_line_sends_pause_and_waits(monkeypatch):
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t))
+    tid = make_task_codex(guards={"session_pct_max": 80, "weekly_pct_max": 95})
+    quota.write_quota_runner("codex", {
+        "usage": {"session_pct": 85, "session_resets": "2026-08-27T20:00:00Z",
+                  "week_all_pct": 1, "per_model": {}},
+        "fetched_at": scheduler.to_iso(NOW), "error": None,
+    })
+    store.update_status(tid, state="working", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "waiting_wakeup"
+    assert status["quota_paused_until"] == "2026-08-27T20:00:00Z"
+    assert len(sent) == 1 and "五小时额度" in sent[0]
+    # 已经停下了，同一轮/下一轮不该重复敲
+    sched.tick(CODEX_CONFIG, NOW)
+    assert len(sent) == 1
+
+
+def test_codex_waiting_wakeup_actively_woken_unlike_claude(monkeypatch):
+    """S6③ 核心行为差异：Claude 的 waiting_wakeup 等它自己醒（不敲）；
+    Codex 没有这个能力，到点必须调度器主动敲，只敲一次。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t))
+    tid = make_task_codex()
+    store.update_status(
+        tid, state="waiting_wakeup", window_id="@1", pane_pid=1,
+        last_event_at=scheduler.to_iso(NOW - timedelta(hours=1)),
+        quota_paused_until="2026-08-27T19:00:00Z",
+    )
+    before = NOW  # 18:00，还没到刷新时间
+    sched.tick(CODEX_CONFIG, before)
+    assert sent == [] and store.read_status(tid)["state"] == "waiting_wakeup"
+
+    after = datetime(2026, 8, 27, 19, 5, tzinfo=timezone.utc)
+    sched.tick(CODEX_CONFIG, after)
+    assert len(sent) == 1 and "继续" in sent[0]
+    status = store.read_status(tid)
+    assert status["quota_resume_sent"] is True
+    assert status["quota_paused_until"] is None
+    sched.tick(CODEX_CONFIG, after)
+    assert len(sent) == 1  # 只敲一次
+
+
+def test_keepalive_codex_25_minutes_claude_50_minutes(monkeypatch):
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t))
+
+    codex_tid = make_task_codex()
+    store.update_status(codex_tid, state="waiting_background", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+    claude_tid = make_task(project="other")
+    store.update_status(claude_tid, state="waiting_background", window_id="@2", pane_pid=2,
+                        last_event_at=scheduler.to_iso(NOW))
+
+    at_26 = NOW + timedelta(minutes=26)
+    sched.tick(CODEX_CONFIG, at_26)
+    # Codex 25 分钟到线该戳了；Claude 50 分钟还没到
+    assert len(sent) == 1
+    assert store.read_status(codex_tid)["keepalive_count"] == 1
+    assert "keepalive_count" not in store.read_status(claude_tid)
+
+    at_51 = NOW + timedelta(minutes=51)
+    sched.tick(CODEX_CONFIG, at_51)
+    assert store.read_status(claude_tid)["keepalive_count"] == 1
 
 
 def test_run_forever_reloads_config_each_tick(tmp_path, monkeypatch):

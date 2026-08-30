@@ -935,40 +935,66 @@ class _Handler(BaseHTTPRequestHandler):
         return self._send_json(200, {"text": text})
 
     def _api_quota_refresh(self) -> None:
-        """用户手动现查一次 /usage（约 10 秒、一次 haiku 无头调用），写 quota.json 后原样返回。"""
-        cfg = store.load_config()
-        try:
-            usage = quota.fetch_usage(cfg)
-        except (quota.UsageUnavailable, quota.UsageParseError) as exc:
-            logger.warning("手动查额度失败：%s", exc)
-            return self._send_json(502, {"error": f"额度查不到：{str(exc)[:200]}"})
-        store.atomic_write_json(
-            store.home() / "quota.json",
-            {"usage": usage, "fetched_at": store.utc_now_iso()},
-        )
-        logger.info("网页手动刷新额度")
-        return self._api_quota()
+        """用户手动现查一次额度，写 quota.json 对应分片后原样返回整份。
 
-    def _api_quota(self) -> None:
-        path = store.home() / "quota.json"
-        if not path.is_file():
-            return self._send_json(200, {})
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            return self._send_json(200, {})
-        if not isinstance(data, dict):
-            return self._send_json(200, {})
-        out = dict(data)
-        out["age_seconds"] = None
-        fetched = data.get("fetched_at")
-        if isinstance(fetched, str):
+        `?runner=claude|codex` 只刷那一家（保留一期"单家失败就 502"的直给
+        契约，方便前端单独重试）；不给 runner 就两家都刷——各自独立，一家
+        失败绝不清空/覆盖另一家的好数据，失败原因进返回体的 `errors`。
+        """
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        runner = (query.get("runner") or [None])[0]
+        if runner is not None and runner not in store.RUNNERS:
+            return self._send_json(
+                400, {"error": f"runner 只认 {'/'.join(store.RUNNERS)}：{runner}"}
+            )
+        targets = [runner] if runner else list(store.RUNNERS)
+        cfg = store.load_config()
+        errors: dict[str, str] = {}
+        for r in targets:
             try:
-                age = datetime.now(timezone.utc) - scheduler.parse_iso(fetched)
-                out["age_seconds"] = int(age.total_seconds())
-            except ValueError:
-                pass
+                usage = (
+                    quota.fetch_usage_codex(cfg) if r == "codex"
+                    else quota.fetch_usage_claude(cfg)
+                )
+            except (quota.UsageUnavailable, quota.UsageParseError) as exc:
+                logger.warning("手动查额度失败（%s）：%s", r, exc)
+                quota.write_quota_runner(
+                    r, {"usage": None, "fetched_at": store.utc_now_iso(), "error": str(exc)}
+                )
+                errors[r] = str(exc)[:200]
+                continue
+            quota.write_quota_runner(
+                r, {"usage": usage, "fetched_at": store.utc_now_iso(), "error": None}
+            )
+        logger.info("网页手动刷新额度：%s", "、".join(targets))
+        if runner and runner in errors:
+            # 明确只刷一家且失败：保留一期契约，502 让前端能单独画红/重试
+            return self._send_json(502, {"error": f"额度查不到：{errors[runner]}"})
+        return self._api_quota(errors=errors)
+
+    def _api_quota(self, errors: dict[str, str] | None = None) -> None:
+        """两家各一份：{"claude": {...}, "codex": {...}}，各自
+        usage/fetched_at/error/age_seconds。一期旧 quota.json（整份就是
+        claude 那份）由 quota.load_quota_file 兼容读出，这里不用再管。"""
+        data = quota.load_quota_file()
+        now = datetime.now(timezone.utc)
+        out: dict = {}
+        for runner in store.RUNNERS:
+            entry = dict(data.get(runner) or {})
+            entry.setdefault("usage", None)
+            entry.setdefault("fetched_at", None)
+            entry.setdefault("error", None)
+            entry["age_seconds"] = None
+            fetched = entry.get("fetched_at")
+            if isinstance(fetched, str):
+                try:
+                    age = now - scheduler.parse_iso(fetched)
+                    entry["age_seconds"] = int(age.total_seconds())
+                except ValueError:
+                    pass
+            out[runner] = entry
+        if errors:
+            out["errors"] = errors
         return self._send_json(200, out)
 
 

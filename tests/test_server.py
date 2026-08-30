@@ -1083,19 +1083,25 @@ def test_put_task_rejects_bad_guards_chain_and_keeps_old_file(authed):
 
 
 def test_quota_empty_then_loaded(authed, ns_home):
+    """S6：两家各一份，缺失时是显式的空壳（usage=None），不是裸 {}。"""
     status, _, body = authed.request("GET", "/api/quota")
     assert status == 200
-    assert body == {}
+    assert body == {
+        "claude": {"usage": None, "fetched_at": None, "error": None, "age_seconds": None},
+        "codex": {"usage": None, "fetched_at": None, "error": None, "age_seconds": None},
+    }
 
+    # 一期旧形状（quota.json 整份就是 claude 那份）按 claude 解释
     store.atomic_write_json(ns_home / "quota.json", {
         "usage": {"session_pct": 13, "week_all_pct": 19, "per_model": {"Fable": 35}},
         "fetched_at": store.utc_now_iso(),
     })
     status, _, body = authed.request("GET", "/api/quota")
     assert status == 200
-    assert body["usage"]["session_pct"] == 13
-    assert isinstance(body["age_seconds"], int)
-    assert 0 <= body["age_seconds"] < 60
+    assert body["claude"]["usage"]["session_pct"] == 13
+    assert isinstance(body["claude"]["age_seconds"], int)
+    assert 0 <= body["claude"]["age_seconds"] < 60
+    assert body["codex"]["usage"] is None
 
 
 # ---------- 静态文件与路径安全 ----------
@@ -1201,21 +1207,41 @@ def test_static_no_store_and_versioned_assets(authed):
     assert "./app.js?v=" in text and "./style.css?v=" in text
 
 
-def test_quota_refresh_endpoint(authed, monkeypatch):
-    from nightshift import quota as quota_mod
+def test_quota_refresh_endpoint_default_refreshes_both(authed, monkeypatch):
     from nightshift import server as server_mod
-    fake = {"session_pct": 12, "week_all_pct": 34, "per_model": {"Fable": 56}, "raw": ""}
-    monkeypatch.setattr(server_mod.quota, "fetch_usage", lambda cfg: fake)
+    claude_fake = {"session_pct": 12, "week_all_pct": 34, "per_model": {"Fable": 56}, "raw": ""}
+    codex_fake = {"session_pct": 7, "week_all_pct": 2, "per_model": {},
+                  "rate_limit_reached_type": None, "reset_credits_available": 1, "windows": {}}
+    monkeypatch.setattr(server_mod.quota, "fetch_usage_claude", lambda cfg: claude_fake)
+    monkeypatch.setattr(server_mod.quota, "fetch_usage_codex", lambda cfg: codex_fake)
     status, _, body = authed.request("POST", "/api/quota/refresh")
     assert status == 200, body
-    assert body["usage"]["session_pct"] == 12 and body["age_seconds"] is not None
+    assert body["claude"]["usage"]["session_pct"] == 12 and body["claude"]["age_seconds"] is not None
+    assert body["codex"]["usage"]["session_pct"] == 7
+    assert "errors" not in body
     assert (store.home() / "quota.json").is_file()
+
+
+def test_quota_refresh_endpoint_single_runner_failure_502_without_touching_other(authed, monkeypatch):
+    from nightshift import quota as quota_mod
+    from nightshift import server as server_mod
+    monkeypatch.setattr(server_mod.quota, "fetch_usage_codex", lambda cfg: {"session_pct": 9, "week_all_pct": 1, "per_model": {}})
+    authed.request("POST", "/api/quota/refresh?runner=codex")
 
     def boom(cfg):
         raise quota_mod.UsageUnavailable("x")
-    monkeypatch.setattr(server_mod.quota, "fetch_usage", boom)
-    status, _, body = authed.request("POST", "/api/quota/refresh")
+    monkeypatch.setattr(server_mod.quota, "fetch_usage_claude", boom)
+    status, _, body = authed.request("POST", "/api/quota/refresh?runner=claude")
     assert status == 502 and "额度查不到" in body["error"]
+    # 明确只刷 claude 失败：不该动到刚刷好的 codex 那份
+    status, _, body = authed.request("GET", "/api/quota")
+    assert body["codex"]["usage"]["session_pct"] == 9
+    assert body["claude"]["error"] == "x"
+
+
+def test_quota_refresh_endpoint_bad_runner_400(authed):
+    status, _, body = authed.request("POST", "/api/quota/refresh?runner=gemini")
+    assert status == 400
 
 
 def test_warmup_settings_roundtrip(authed):

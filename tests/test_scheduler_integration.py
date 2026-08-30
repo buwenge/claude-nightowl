@@ -194,7 +194,7 @@ def test_serve_once_launches_then_idle_on_second_pass(trusted_env):
     quota_data = json.loads(
         (store.home() / "quota.json").read_text(encoding="utf-8")
     )
-    assert quota_data["usage"]["session_pct"] == 13
+    assert quota_data["claude"]["usage"]["session_pct"] == 13  # S6：claude 分片
 
     # 第二次 serve --once：exited 不动、没活跃任务不刷额度 → 什么都不做
     out2 = serve_once()

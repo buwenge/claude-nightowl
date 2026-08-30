@@ -9,7 +9,6 @@ ISO 字符串与 datetime 互转用 parse_iso / to_iso（与 store.utc_now_iso �
 
 from __future__ import annotations
 
-import json
 import logging
 import logging.handlers
 import re
@@ -39,6 +38,15 @@ DEFAULT_STUCK_INTERRUPT_TEXT = (
     "来自nightshift：你疑似卡在一条工具调用里已经 {stuck_minutes} 分钟没反应，"
     "刚按了 Esc 把这一轮打断。看看刚才在等的命令/进程是不是真卡死了——"
     "换个方式重试、跳过，或者判断已经没救了就当它失败处理，然后照常继续或收尾。"
+)
+# S6③：Codex 没有 ScheduleWakeup，五小时线到点/刷新都要调度器主动
+# send-keys（config.codex_quota_pause_text / codex_resume_text 网页可改）
+DEFAULT_CODEX_QUOTA_PAUSE_TEXT = (
+    "来自nightshift：五小时额度只剩 {session_left}%（线 {session_line_left}%），"
+    "约 {resets_at} 刷新。现在停下，不要再开新的工具调用，调度器到点会敲你继续。"
+)
+DEFAULT_CODEX_RESUME_TEXT = (
+    "来自nightshift：五小时额度应已刷新，请从刚才停下的地方继续。"
 )
 # 交接文件末行的换班指令（设计稿 §4.4）
 _RE_NEXT_CONTINUE = re.compile(r"^NEXT:\s*continue\s*$")
@@ -119,15 +127,17 @@ def tick(config: dict, now: datetime) -> list[str]:
             actions.extend(_check_exited_chain(task, status, config, now))
         # 其余状态（chained/finished/…）不动
 
-    # 每轮末尾：有活跃任务且 quota.json 缺失/过期才刷 /usage（零开销原则）
-    active_ids = [
-        item["task"]["id"]
+    # 每轮末尾：只刷有活跃任务在等的那家 runner，且它自己的分片缺失/过期才刷
+    # （零开销原则；两家各自独立，S6 前只有 claude，行为不变）
+    active_runners = {
+        item["task"].get("runner") or "claude"
         for item in items
         if store.read_status(item["task"]["id"]).get("state") in ACTIVE_STATES
-    ]
-    if active_ids:
-        _maybe_refresh_quota(config, now, actions)
+    }
+    if active_runners:
+        _maybe_refresh_quota(config, now, actions, runners=active_runners)
     # 预热五小时窗口（config.warmup，网页可改）：到点发一句话给 haiku，一天一次
+    # ——这是 Claude 专属机制，跟 Codex 无关
     slots = warmup.due(config, now)
     for slot in slots:
         result = warmup.run_warmup(config, now, slot=slot)
@@ -136,7 +146,7 @@ def tick(config: dict, now: datetime) -> list[str]:
         )
     if slots:
         # 预热后额度窗口已开始，顺手刷一次 quota.json 让页面立刻看到新刷新时间
-        _maybe_refresh_quota(config, now, actions, force=True)
+        _maybe_refresh_quota(config, now, actions, force=True, runners={"claude"})
     return actions
 
 
@@ -189,12 +199,36 @@ def _note_trigger_met(task: dict, status: dict, now: datetime) -> dict:
     return store.read_status(task["id"])
 
 
+def _fetch_and_record_usage(
+    runner: str, config: dict, now: datetime
+) -> tuple[dict | None, str]:
+    """按 runner 查一次新鲜额度并落盘对应分片（quota.json 的 claude/codex
+    各自一份，互不覆盖）。查不到时也落盘 error，返回 (None, 原因)。"""
+    try:
+        usage = (
+            quota.fetch_usage_codex(config)
+            if runner == "codex" else quota.fetch_usage_claude(config)
+        )
+    except (quota.UsageUnavailable, quota.UsageParseError) as exc:
+        quota.write_quota_runner(
+            runner, {"usage": None, "fetched_at": to_iso(now), "error": str(exc)}
+        )
+        return None, str(exc)
+    quota.write_quota_runner(
+        runner, {"usage": usage, "fetched_at": to_iso(now), "error": None}
+    )
+    return usage, ""
+
+
 def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[str]:
     task_id = task["id"]
     project_path = config["projects"][task["project"]]
+    runner = task.get("runner") or "claude"
 
-    # a. 目录信任：没点过信任，交互式 claude 会卡在信任问答——等人也没用，直接判失败
-    if not launcher.is_trusted(project_path):
+    # a. 目录信任：没点过信任，交互式 claude 会卡在信任问答——等人也没用，直接判失败。
+    # Codex 不吃这份信任记录（自己的信任状态在 ~/.codex/config.toml，覆盖
+    # 每次都显式带在命令行上，见 launcher._codex_command），跳过这条。
+    if runner == "claude" and not launcher.is_trusted(project_path):
         return _fail_now(
             task, config, now,
             f"目录未信任，请先手动在该目录开一次 claude：{project_path}",
@@ -216,15 +250,11 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
             reason = f"同目录任务 {other['task']['id']} 还在跑"
             return _postpone(task, status, config, now, reason, notify=False)
 
-    # c. 额度：查不到一律不放行（fail-closed）
-    try:
-        usage = quota.fetch_usage(config)
-    except (quota.UsageUnavailable, quota.UsageParseError) as exc:
-        return _postpone(task, status, config, now, f"额度查不到（fail-closed）：{exc}")
-    # 顺手把新鲜额度落盘（quota.json 同一格式），网页/hook 都吃它
-    store.atomic_write_json(
-        store.home() / "quota.json", {"usage": usage, "fetched_at": to_iso(now)}
-    )
+    # c. 额度：只查这一班自己的 runner，查不到一律不放行（fail-closed）；
+    # Claude 额度坏了不能拦 Codex 起跑，反之亦然
+    usage, err = _fetch_and_record_usage(runner, config, now)
+    if usage is None:
+        return _postpone(task, status, config, now, f"额度查不到（fail-closed）：{err}")
     ok, reason = quota.check_guards(
         usage, task["model"], config, task.get("guards") or {}
     )
@@ -239,6 +269,7 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
             "week_all_pct": usage.get("week_all_pct"),
             "per_model": usage.get("per_model") or {},
             "fetched_at": to_iso(now),
+            "quota_source": runner,
         },
     )
     # R5：launch 在 tmux 失败/未信任时会把 state 写成 failed 并返回该 status，
@@ -389,6 +420,58 @@ def _check_launching(
     return [f"{task_id} 启动重试 {retries}/{retry_max}"]
 
 
+# ---------- S6③：Codex 五小时额度到线，调度器主动叫停 ----------
+
+
+def _check_codex_quota_pause(
+    task: dict, status: dict, config: dict, now: datetime, window_id: str
+) -> list[str] | None:
+    """working 的 Codex 任务查一眼它自己那份 quota.json 分片：五小时线到了
+    就 send-keys 叫停、转 waiting_wakeup 并记 quota_paused_until；没到线/
+    查不到都返回 None（None ≠ "没发生"，只是"这次没什么可做"，调用方按
+    正常流程继续走）。查不到刷新时间就按最长（5 小时）估一个，不卡死。
+    """
+    task_id = task["id"]
+    guards = task.get("guards") or {}
+    session_max = guards.get("session_pct_max")
+    if session_max is None:
+        return None
+    usage = (quota.load_quota_file().get("codex") or {}).get("usage")
+    if not isinstance(usage, dict):
+        return None
+    session_pct = usage.get("session_pct")
+    if not isinstance(session_pct, int) or session_pct < session_max:
+        return None
+
+    resets_at = usage.get("session_resets")
+    try:
+        paused_until_dt = parse_iso(resets_at) if resets_at else now + timedelta(hours=5)
+    except ValueError:
+        paused_until_dt = now + timedelta(hours=5)
+    paused_until = to_iso(paused_until_dt)
+    text = store.render(
+        config.get("codex_quota_pause_text") or DEFAULT_CODEX_QUOTA_PAUSE_TEXT,
+        session_left=100 - session_pct,
+        session_line_left=100 - session_max,
+        resets_at=resets_at or "未知时间",
+    )
+    launcher.send_keys(window_id, text)
+    store.update_status(
+        task_id,
+        state="waiting_wakeup",
+        quota_paused_until=paused_until,
+        quota_resume_sent=False,
+        quota_pause_count=int(status.get("quota_pause_count") or 0) + 1,
+        last_event_at=to_iso(now),
+    )
+    store.append_event(
+        task_id,
+        f"Codex 五小时额度到线（{session_pct}%）→ 已 send-keys 停下，"
+        f"约 {paused_until} 后调度器主动叫醒",
+    )
+    return [f"{task_id} Codex 额度到线，已停下等 {paused_until}"]
+
+
 # ---------- 运行期巡检：working / waiting_background / idle（设计稿 §5.2） ----------
 
 
@@ -502,19 +585,40 @@ def _check_running(
         )
         return [f"{task_id} 权限模式 {mode} 非 auto → 提醒窗口"]
 
-    # 五小时额度暂停：它该在等缓存闹钟。没定闹钟就停了的（idle），刷新时间一到
-    # 敲一句让它继续；刷新时间没到之前 idle 也不算干完，不许收尾/续班
+    # S6③：Codex 没有 ScheduleWakeup（不能自己定缓存闹钟），working 时五小时
+    # 线到了必须由调度器主动 send-keys 叫它停下、转 waiting_wakeup；
+    # Claude 走 hook.py 的 _quota_check 自助报告，这条只管 codex。
+    if (task.get("runner") or "claude") == "codex" and status.get("state") == "working":
+        codex_pause = _check_codex_quota_pause(task, status, config, now, str(window_id))
+        if codex_pause is not None:
+            return codex_pause
+
+    # 五小时额度暂停：它该在等缓存闹钟。Claude 没定闹钟就停了的（idle），
+    # 刷新时间一到敲一句让它继续；Codex 没有自己定闹钟的能力，闹钟到点
+    # 后必须由调度器主动敲，不能"等它自己醒"。刷新时间没到之前 idle
+    # 也不算干完，不许收尾/续班
     paused_until = status.get("quota_paused_until")
     if paused_until and status.get("state") in ("idle", "waiting_wakeup"):
         if now < parse_iso(paused_until):
             return []
-        if status.get("state") == "idle" and not status.get("quota_resume_sent"):
-            launcher.send_keys(str(window_id), "来自nightshift：五小时额度应已刷新，请从刚才停下的地方继续。")
+        runner = task.get("runner") or "claude"
+        codex_waiting_wakeup = (
+            runner == "codex" and status.get("state") == "waiting_wakeup"
+        )
+        if (
+            status.get("state") == "idle" or codex_waiting_wakeup
+        ) and not status.get("quota_resume_sent"):
+            text = (
+                config.get("codex_resume_text") or DEFAULT_CODEX_RESUME_TEXT
+                if runner == "codex"
+                else "来自nightshift：五小时额度应已刷新，请从刚才停下的地方继续。"
+            )
+            launcher.send_keys(str(window_id), text)
             store.update_status(task_id, quota_resume_sent=True, quota_paused_until=None)
-            store.append_event(task_id, "额度刷新时间已到而它没定闹钟，已 send-keys 让它继续")
+            store.append_event(task_id, "额度刷新时间已到，已 send-keys 让它继续")
             return [f"{task_id} 额度刷新，敲它继续"]
         if status.get("state") == "waiting_wakeup":
-            return []  # 闹钟还没响完，等它自己醒
+            return []  # Claude：闹钟还没响完，等它自己醒
 
     # S3 换班：idle 收尾后按交接文件接下一班（每次评估先落 chain_checked
     # 防重复；评估失败的代价是这班不再自动续，好过重复开出双份后继）
@@ -528,8 +632,12 @@ def _check_running(
     if not guards.get("keepalive", True):
         return []
 
-    sch = config.get("scheduler") or {}
-    idle_needed = timedelta(minutes=sch.get("keepalive_idle_minutes", 50))
+    # S6③：保活分家——claude 50 分钟、codex 25 分钟（GPT-5.6 缓存 30 分钟，
+    # 见靶测记录 F6），各自文案；旧配置没有 config.runners 时兼容视图会从
+    # scheduler.keepalive_* 合成，claude 这条数字/文案跟一期一字不变
+    runner = task.get("runner") or "claude"
+    rc = store.runner_config(config).get(runner) or {}
+    idle_needed = timedelta(minutes=rc.get("keepalive_idle_minutes", 50 if runner == "claude" else 25))
     stamps = [
         parse_iso(status[key])
         for key in ("last_event_at", "last_keepalive_at")
@@ -538,7 +646,7 @@ def _check_running(
     if not stamps or now - max(stamps) < idle_needed:
         return []
 
-    text = sch.get("keepalive_text") or DEFAULT_KEEPALIVE_TEXT
+    text = rc.get("keepalive_text") or DEFAULT_KEEPALIVE_TEXT
     launcher.send_keys(str(window_id), text)
     store.update_status(
         task_id,
@@ -810,26 +918,26 @@ def _finalize_done(task: dict, config: dict, now: datetime) -> list[str]:
 
 
 def _maybe_refresh_quota(
-    config: dict, now: datetime, actions: list[str], force: bool = False
+    config: dict, now: datetime, actions: list[str], force: bool = False,
+    runners: set[str] | None = None,
 ) -> None:
+    """按需刷新——只刷调用方指定的那几家 runner，每家各自独立判断新鲜度、
+    独立落盘（一家刷新失败/过期不影响另一家的好数据，见 quota.write_quota_runner）。
+    """
     sch = config.get("scheduler") or {}
     refresh_after = timedelta(minutes=sch.get("quota_refresh_minutes", 30))
-    qpath = store.home() / "quota.json"
-    if qpath.is_file() and not force:
-        try:
-            with open(qpath, encoding="utf-8") as f:
-                data = json.load(f)
-            if now - parse_iso(data["fetched_at"]) < refresh_after:
-                return  # 还新鲜，不刷
-        except (ValueError, KeyError, OSError, TypeError):
-            pass  # 缺文件键/坏 JSON 当过期处理
-    try:
-        usage = quota.fetch_usage(config)
-        payload: dict = {"usage": usage, "fetched_at": to_iso(now)}
-    except (quota.UsageUnavailable, quota.UsageParseError) as exc:
-        payload = {"error": str(exc), "fetched_at": to_iso(now)}
-    store.atomic_write_json(qpath, payload)
-    actions.append("已刷新 quota.json")
+    for runner in runners or set():
+        if not force:
+            slice_ = quota.load_quota_file().get(runner) or {}
+            fetched_at = slice_.get("fetched_at")
+            if fetched_at:
+                try:
+                    if now - parse_iso(fetched_at) < refresh_after:
+                        continue  # 还新鲜，不刷
+                except ValueError:
+                    pass  # 坏时间戳当过期处理
+        _, err = _fetch_and_record_usage(runner, config, now)
+        actions.append(f"已刷新 {runner} 额度" if not err else f"刷新 {runner} 额度失败：{err}")
 
 
 # ---------- 启动对账（S5：孤儿工作树只提示，绝不自动删） ----------

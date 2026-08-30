@@ -1,19 +1,28 @@
 """quota.py 的测试：/usage 解析、额度门槛、假 claude 的 fetch_usage。"""
 
+import json
 import stat
 from pathlib import Path
 
 import pytest
 
+from nightshift import store
 from nightshift.quota import (
+    AppServerTimeout,
     UsageParseError,
     UsageUnavailable,
     check_guards,
     fetch_usage,
+    fetch_usage_claude,
+    fetch_usage_codex,
+    load_quota_file,
+    normalize_codex_ratelimits,
     parse_usage,
+    write_quota_runner,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+FAKE_APP_SERVER = FIXTURES.parent / "fake_codex_app_server.py"
 
 CONFIG = {
     "claude_bin": "claude",
@@ -185,3 +194,123 @@ def test_resets_in_minutes():
     assert resets_in_minutes(None, now) is None
     # 跨年：一月的时间在八月看来是"一天前以上" → 算下一年
     assert resets_in_minutes("Jan 1, 1am (UTC)", now) > 100 * 24 * 60
+
+
+# ---------- S6：fetch_usage_claude 别名与 Codex 额度 ----------
+
+
+def test_fetch_usage_claude_alias_is_same_function():
+    assert fetch_usage is fetch_usage_claude
+
+
+CODEX_CONFIG = {"runners": {"codex": {"bin": str(FAKE_APP_SERVER)}}}
+
+
+def test_fetch_usage_codex_happy_path(monkeypatch):
+    monkeypatch.delenv("NIGHTSHIFT_CODEX_BIN", raising=False)
+    usage = fetch_usage_codex({"runners": {"codex": {"bin": str(FAKE_APP_SERVER)}}})
+    assert usage["session_pct"] == 12
+    assert usage["week_all_pct"] == 2
+    assert usage["session_resets"] is not None and usage["session_resets"].endswith("Z")
+    assert usage["week_all_resets"] is not None
+    assert usage["per_model"] == {}
+    assert usage["rate_limit_reached_type"] is None
+    assert usage["reset_credits_available"] == 1
+    assert usage["windows"]["primary"]["window_minutes"] == 300
+    assert usage["windows"]["secondary"]["window_minutes"] == 10080
+
+
+def test_fetch_usage_codex_env_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("NIGHTSHIFT_CODEX_BIN", str(FAKE_APP_SERVER))
+    usage = fetch_usage_codex({"runners": {"codex": {"bin": "/nonexistent/codex"}}})
+    assert usage["session_pct"] == 12
+
+
+def test_fetch_usage_codex_missing_binary():
+    with pytest.raises(UsageUnavailable, match="找不到"):
+        fetch_usage_codex({"runners": {"codex": {"bin": "/nonexistent/codex-binary"}}})
+
+
+def test_fetch_usage_codex_hang_times_out(monkeypatch):
+    monkeypatch.setenv("NIGHTSHIFT_FAKE_CODEX_HANG", "1")
+    with pytest.raises(AppServerTimeout):
+        fetch_usage_codex(CODEX_CONFIG, timeout=1.0)
+
+
+def test_fetch_usage_codex_early_exit_is_unavailable(monkeypatch):
+    monkeypatch.setenv("NIGHTSHIFT_FAKE_CODEX_EXIT_EARLY", "1")
+    with pytest.raises(AppServerTimeout):
+        fetch_usage_codex(CODEX_CONFIG, timeout=3.0)
+
+
+def test_normalize_codex_ratelimits_prefers_rate_limits_by_id():
+    result = {
+        "rateLimits": {"limitId": "codex", "primary": {"usedPercent": 99, "windowDurationMins": 300, "resetsAt": 1}},
+        "rateLimitsByLimitId": {
+            "codex": {"limitId": "codex", "primary": {"usedPercent": 12, "windowDurationMins": 300, "resetsAt": 1788099565},
+                      "secondary": {"usedPercent": 2, "windowDurationMins": 10080, "resetsAt": 1788653052},
+                      "rateLimitReachedType": "primary"},
+        },
+        "rateLimitResetCredits": {"availableCount": 0, "credits": []},
+    }
+    usage = normalize_codex_ratelimits(result)
+    assert usage["session_pct"] == 12  # 来自 rateLimitsByLimitId，不是顶层那份 99
+    assert usage["rate_limit_reached_type"] == "primary"
+    assert usage["reset_credits_available"] == 0
+
+
+def test_normalize_codex_ratelimits_missing_fields_are_null_not_zero():
+    usage = normalize_codex_ratelimits({"rateLimits": {}})
+    assert usage["session_pct"] is None
+    assert usage["week_all_pct"] is None
+    assert usage["session_resets"] is None
+    assert usage["rate_limit_reached_type"] is None
+    assert usage["reset_credits_available"] is None
+    assert usage["windows"] == {}
+
+
+def test_normalize_codex_ratelimits_unknown_window_minutes_ignored():
+    """windowDurationMins 既不是 300 也不是 10080：不瞎猜是哪条线，两条都是 None。"""
+    result = {"rateLimits": {"primary": {"usedPercent": 50, "windowDurationMins": 999, "resetsAt": 1}}}
+    usage = normalize_codex_ratelimits(result)
+    assert usage["session_pct"] is None
+    assert usage["week_all_pct"] is None
+    assert usage["windows"]["primary"]["used_pct"] == 50  # 原始数据仍留痕，只是不进 session/week
+
+
+# ---------- S6：quota.json 双 runner 归一读写 ----------
+
+
+def test_load_quota_file_missing_returns_empty_shells():
+    assert load_quota_file() == {"claude": {}, "codex": {}}
+
+
+def test_load_quota_file_old_shape_reads_as_claude():
+    old = {"usage": {"session_pct": 5}, "fetched_at": "2026-08-30T00:00:00Z"}
+    store.atomic_write_json(store.home() / "quota.json", old)
+    data = load_quota_file()
+    assert data["claude"] == old
+    assert data["codex"] == {}
+    # 读取不改盘：文件仍是旧形状，下次成功刷新才会换新形状
+    on_disk = json.loads((store.home() / "quota.json").read_text(encoding="utf-8"))
+    assert on_disk == old
+
+
+def test_load_quota_file_new_shape_roundtrip():
+    new = {"claude": {"usage": {"session_pct": 1}, "fetched_at": "t1", "error": None},
+           "codex": {"usage": {"session_pct": 2}, "fetched_at": "t2", "error": None}}
+    store.atomic_write_json(store.home() / "quota.json", new)
+    assert load_quota_file() == new
+
+
+def test_write_quota_runner_does_not_clobber_the_other():
+    write_quota_runner("claude", {"usage": {"session_pct": 1}, "fetched_at": "t1", "error": None})
+    write_quota_runner("codex", {"usage": {"session_pct": 2}, "fetched_at": "t2", "error": None})
+    data = load_quota_file()
+    assert data["claude"]["usage"]["session_pct"] == 1
+    assert data["codex"]["usage"]["session_pct"] == 2
+    # 再刷新一次 codex，claude 那份原样不动（一家刷新失败/成功都不该动到另一家）
+    write_quota_runner("codex", {"usage": None, "fetched_at": "t3", "error": "查不到"})
+    data = load_quota_file()
+    assert data["claude"]["usage"]["session_pct"] == 1
+    assert data["codex"]["error"] == "查不到"

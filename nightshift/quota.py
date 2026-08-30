@@ -13,18 +13,26 @@ import json
 import math
 import os
 import re
+import select
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 
-from .store import ensure_dirs, home
+from .store import atomic_write_json, ensure_dirs, home, runner_config
 
 __all__ = [
     "resets_in_minutes",
+    "AppServerTimeout",
     "UsageParseError",
     "UsageUnavailable",
     "check_guards",
     "fetch_usage",
+    "fetch_usage_claude",
+    "fetch_usage_codex",
+    "load_quota_file",
+    "normalize_codex_ratelimits",
     "parse_usage",
+    "write_quota_runner",
 ]
 
 
@@ -86,7 +94,7 @@ def parse_usage(text: str) -> dict:
     return result
 
 
-def fetch_usage(config: dict, timeout: int = 120) -> dict:
+def fetch_usage_claude(config: dict, timeout: int = 120) -> dict:
     """跑一次无头 /usage 并解析。非零退出或超时抛 UsageUnavailable。
 
     环境变量 NIGHTSHIFT_FAKE_USAGE_FILE：设了就读该文件当作 /usage 的输出，
@@ -133,6 +141,12 @@ def fetch_usage(config: dict, timeout: int = 120) -> dict:
     return parse_usage(proc.stdout)
 
 
+# 向后兼容别名：__main__.py 的 `nightshift quota` 子命令与一期测试仍按老名字
+# 调用，语义原样不变（就是查 Claude 的额度）。S6 起新代码一律显式写
+# fetch_usage_claude / fetch_usage_codex，不再用这个没有 runner 语义的名字。
+fetch_usage = fetch_usage_claude
+
+
 _RE_RESETS_AT = re.compile(r"([A-Z][a-z]{2}) (\d{1,2}), (\d{1,2})(?::(\d{2}))?(am|pm)\s*\((UTC)\)")
 
 
@@ -160,6 +174,188 @@ def resets_in_minutes(resets_text: str | None, now: datetime | None = None) -> i
     if when < now - timedelta(days=1):
         when = when.replace(year=now.year + 1)
     return max(0, math.ceil((when - now).total_seconds() / 60))
+
+
+class AppServerTimeout(UsageUnavailable):
+    """codex app-server 在给定超时内没有回应/退出（连不上、卡死、协议不对）。"""
+
+
+def _epoch_to_iso(value) -> str | None:
+    """rateLimits 的 resetsAt 是秒级 epoch 整数；不是数字就认不出，返回 None。"""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return datetime.fromtimestamp(value, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def normalize_codex_ratelimits(result: dict) -> dict:
+    """把 `account/rateLimits/read` 的原始响应归一成与 Claude 同一形状的 usage dict。
+
+    S6 靶测记录：`primary` 是五小时窗（windowDurationMins=300），`secondary`
+    是周窗（=10080）——按 windowDurationMins 识别，不按位置盲猜；`rateLimits`
+    与 `rateLimitsByLimitId[limitId]` 是同一份数据的两种呈现，优先按
+    limitId 精确取，取不到才退回顶层 `rateLimits`。字段缺失一律 null，
+    不造百分比、不 fail-open。
+    """
+    rl_flat = result.get("rateLimits") or {}
+    by_id = result.get("rateLimitsByLimitId") or {}
+    limit_id = rl_flat.get("limitId")
+    rl = by_id.get(limit_id) if limit_id and limit_id in by_id else rl_flat
+
+    windows: dict = {}
+    session = week = None
+    for key in ("primary", "secondary"):
+        window = rl.get(key)
+        if not isinstance(window, dict):
+            continue
+        mins = window.get("windowDurationMins")
+        pct = window.get("usedPercent")
+        entry = {
+            "used_pct": pct if isinstance(pct, int) else None,
+            "window_minutes": mins,
+            "resets_at": _epoch_to_iso(window.get("resetsAt")),
+        }
+        windows[key] = entry
+        if mins == 300:
+            session = entry
+        elif mins == 10080:
+            week = entry
+
+    credits = result.get("rateLimitResetCredits") or {}
+    return {
+        "session_pct": session["used_pct"] if session else None,
+        "session_resets": session["resets_at"] if session else None,
+        "week_all_pct": week["used_pct"] if week else None,
+        "week_all_resets": week["resets_at"] if week else None,
+        "per_model": {},       # Codex 没有单模型周线这个概念
+        "per_model_resets": {},
+        "rate_limit_reached_type": rl.get("rateLimitReachedType"),
+        "reset_credits_available": credits.get("availableCount"),
+        "windows": windows,
+    }
+
+
+def _read_jsonl_response(proc: subprocess.Popen, want_id: int, deadline: float) -> dict:
+    """从 app-server 的 stdout 按行读 JSON，直到拿到 id 匹配的那条或超时/EOF。"""
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise AppServerTimeout("codex app-server 超时")
+        ready, _, _ = select.select([proc.stdout], [], [], remaining)
+        if not ready:
+            continue
+        line = proc.stdout.readline()
+        if not line:
+            raise AppServerTimeout("codex app-server 提前退出（EOF）")
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("id") == want_id:
+            return obj
+
+
+def fetch_usage_codex(config: dict, timeout: float = 15.0) -> dict:
+    """起一次短命 `codex app-server --stdio`，握手后取一次
+    `account/rateLimits/read`，归一成统一形状。全程标准库，不联网测试用
+    fake app-server 脚本（NIGHTSHIFT_CODEX_BIN 覆盖，与 launcher 共用同一个
+    环境变量——同一个 codex 可执行文件，只是这里传的子命令不同）。
+
+    每次都要设超时、关 stdin、回收子进程；错误只留脱敏尾部，不带原始
+    payload（可能含账号/额度重置券这类不该进日志的内容）。
+    """
+    bin_path = os.environ.get("NIGHTSHIFT_CODEX_BIN") or (
+        runner_config(config).get("codex") or {}
+    ).get("bin", "codex")
+    ensure_dirs()
+    try:
+        proc = subprocess.Popen(
+            [bin_path, "app-server", "--stdio"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=home(),
+        )
+    except FileNotFoundError as exc:
+        raise UsageUnavailable(f"找不到 codex 可执行文件：{bin_path}") from exc
+
+    deadline = time.time() + timeout
+    try:
+        proc.stdin.write(json.dumps({
+            "id": 1, "method": "initialize",
+            "params": {"clientInfo": {"name": "nightshift", "version": "1"}},
+        }) + "\n")
+        proc.stdin.flush()
+        _read_jsonl_response(proc, 1, deadline)
+        proc.stdin.write(json.dumps({"method": "initialized", "params": {}}) + "\n")
+        proc.stdin.flush()
+        proc.stdin.write(json.dumps({
+            "id": 2, "method": "account/rateLimits/read", "params": {},
+        }) + "\n")
+        proc.stdin.flush()
+        resp = _read_jsonl_response(proc, 2, deadline)
+    except AppServerTimeout:
+        raise
+    except OSError as exc:
+        raise UsageUnavailable(f"codex app-server 通信失败：{exc}") from exc
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+
+    if not isinstance(resp.get("result"), dict):
+        tail = ""
+        try:
+            tail = (proc.stderr.read() or "")[-500:]
+        except Exception:
+            pass
+        raise UsageUnavailable(f"codex app-server 没有返回 rateLimits：{tail}")
+    return normalize_codex_ratelimits(resp["result"])
+
+
+# ---------- quota.json：双 runner 归一读写（S6） ----------
+
+
+def load_quota_file() -> dict:
+    """读 quota.json，统一成 {"claude": {...}, "codex": {...}} 形状（各自
+    "usage"/"fetched_at"/"error" 三键）。
+
+    兼容一期旧形状 `{"usage": ..., "fetched_at": ...}`（按 claude 解释）；
+    读取时不改盘——下次哪家成功刷新了，才会把整份文件换成新形状。
+    文件缺失/坏 JSON/不是对象都返回两家皆空的空壳，不炸。
+    """
+    path = home() / "quota.json"
+    empty = {"claude": {}, "codex": {}}
+    if not path.is_file():
+        return empty
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    if "claude" not in data and "codex" not in data:
+        return {"claude": data, "codex": {}}  # 一期旧形状：整份就是 claude 那份
+    return {"claude": data.get("claude") or {}, "codex": data.get("codex") or {}}
+
+
+def write_quota_runner(runner: str, payload: dict) -> dict:
+    """只更新一家（claude/codex）的分片，另一家原样保留——一家刷新失败
+    不能覆盖另一家最后一次的好数据。返回写盘后的整份内容。"""
+    data = load_quota_file()
+    data[runner] = payload
+    atomic_write_json(home() / "quota.json", data)
+    return data
 
 
 def check_guards(usage: dict, model: str, config: dict, guards: dict) -> tuple[bool, str]:
