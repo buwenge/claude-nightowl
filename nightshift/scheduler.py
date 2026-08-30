@@ -1156,13 +1156,18 @@ def _checkpoint_shift(
     return None
 
 
-def _finalize_done(task: dict, config: dict, now: datetime) -> list[str]:
+def _finalize_done(
+    task: dict, config: dict, now: datetime, *, skip_review: bool = False
+) -> list[str]:
     """最后一班完工分流（判过 NEXT: done 或没交接正常干完都走这里）：
     - worktree=false：原状态机一字不变 → finished；
-    - S7：build 角色 + review.enabled=true → 不直接分流，起同 round 审稿
-      （_start_review_round），真正的 merge_policy 分流要等审稿 done 之后
-      由 _review_done 再次调用本函数（那时角色已是 review，不会再折回
-      _start_review_round，见下面的角色判断）；
+    - S7：build 角色 + review.enabled=true（且未 skip_review）→ 不直接
+      分流，起同 round 审稿（_start_review_round），真正的 merge_policy
+      分流要等审稿 done 之后由 _review_done 再次调用本函数（那时角色已是
+      review，不会再折回 _start_review_round，见下面的角色判断）；
+    - S7④：skip_review=True（网页"跳过审稿"控制 API）明确跳过起审稿，直接
+      按 merge_policy 分流——只有调用方已经核验过"build 已 checkpoint、
+      尚无 done verdict"这个边界才该传 True；
     - true + manual：存档后 → awaiting_merge，树与分支保留，等工头；
     - true + auto：调度器合并 → merged / needs_attention（原因见红字）。
     """
@@ -1172,7 +1177,7 @@ def _finalize_done(task: dict, config: dict, now: datetime) -> list[str]:
         store.append_event(task_id, "收工：worktree=false 走一期路径 → finished")
         return [f"{task_id} 正常干完 → finished"]
     review_cfg = store.review_config(task, config)
-    if review_cfg.get("enabled") and store.role_of(task) == "build":
+    if review_cfg.get("enabled") and store.role_of(task) == "build" and not skip_review:
         return _start_review_round(task, config, now)
     policy = review_cfg.get("merge_policy") or "manual"
     if policy == "manual":

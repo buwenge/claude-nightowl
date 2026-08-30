@@ -129,3 +129,31 @@ def test_quota_shows_explicit_unknown_when_both_windows_missing():
     像正常有数据。"""
     js = (WEB / "app.js").read_text(encoding="utf-8")
     assert "窗口数据未提供/认不出" in js
+
+
+# ---------- S7④：模板页七个新键 ----------
+
+
+def test_index_has_review_template_textareas():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    for piece in (
+        'id="t-review"', 'id="t-reviewfix"', 'id="t-reviewcriteria"',
+        'id="t-reviewwrapup"', 'id="t-reviewstopbuild"', 'id="t-hold"', 'id="t-resume"',
+    ):
+        assert piece in html, piece
+
+
+def test_app_js_loads_and_saves_review_templates():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    for piece in (
+        'cfg.review_template', 'cfg.review_fix_template', 'cfg.review_criteria_text',
+        'cfg.review_wrapup_text', 'cfg.review_stop_build_text', 'cfg.hold_text', 'cfg.resume_text',
+        'review_template: $("t-review").value',
+        'review_fix_template: $("t-reviewfix").value',
+        'review_criteria_text: $("t-reviewcriteria").value',
+        'review_wrapup_text: $("t-reviewwrapup").value',
+        'review_stop_build_text: $("t-reviewstopbuild").value',
+        'hold_text: $("t-hold").value',
+        'resume_text: $("t-resume").value',
+    ):
+        assert piece in js, piece

@@ -45,6 +45,14 @@ CONFIG = {
     "prompt_template": "项目 {project_path}｜任务：{title}\n\n{task}\n\n上下文上限 {context_limit}。",
     "context_warn_text": "到线了 {ctx_k}k/{limit_k}k，收尾写 {handover_path}。",
     "chain_template": "第 {shift} 班。交接：{handover}\n{task}",
+    "review_template": (
+        "REVIEW {title} round={round} base={base_ref}\ndiff: {diff_command}\n"
+        "交接：{build_handover}\n上一轮：{previous_review}\n标准：{criteria}\n"
+        "{stop_build_hint}只读，末行 NEXT。"
+    ),
+    "review_fix_template": (
+        "FIX {title} round={round}\n审稿意见：{review}\n{worktree_instruction}{task}"
+    ),
     "http": {
         "host": "127.0.0.1", "port": 0, "url_prefix": "/nightshift",
         "secure_cookie": False, "cookie_days": 365,
@@ -1545,3 +1553,246 @@ def test_edit_cannot_move_or_disable_an_existing_tree(authed, ns_home, tmp_path)
     task = store.load_task(task_id)
     assert task["project"] == "demo" and task["worktree"] is True
     assert wt.exists()
+
+
+# ---------- S7④：流水线控制 API（我来看/继续/保活/现在就审/跳过审稿/直接返工） ----------
+
+
+def make_review_pipeline(authed, *, build_state="held", review_state="working"):
+    """建一条最小审稿流水线：build（held，已存档）→ review（指定状态）。
+    正常这条链应由调度器 tick 造出来，这里直接在磁盘上摆好现场，专测控制
+    API 本身，不依赖跑一遍真实调度循环。返回 (build_id, review_id)。"""
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "审稿流水线", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+        "review": {"enabled": True, "runner": "claude",
+                   "model": "claude-fable-5", "effort": "high"},
+    })
+    assert status == 201, body
+    build_id = body["id"]
+    store.update_status(
+        build_id, state=build_state, window_id="@1", pane_pid=1,
+        checkpoint_done=True, checkpoint_sha="a" * 40,
+        worktree_path="/tmp/wt", branch="ns/x", base_ref="deadbeef",
+    )
+    build_task = store.load_task(build_id)
+    review_task = {
+        "title": build_task["title"], "project": build_task["project"],
+        "runner": build_task["runner"], "model": build_task["model"],
+        "effort": build_task["effort"], "run_at": "2026-08-28T18:00:00Z",
+        "task_text": build_task["task_text"], "prompt_final": "REVIEW",
+        "review": dict(build_task["review"]), "worktree": True,
+    }
+    review_id = store.create_task(review_task, store.load_config())
+    data = store.load_task(review_id)
+    data.update({"role": "review", "round": 1, "role_shift": 1,
+                 "parent_id": build_id, "pipeline_id": build_id, "shift": 2})
+    store.atomic_write_json(store.task_dir(review_id) / "task.json", data)
+    store.update_status(
+        review_id, state=review_state, window_id="@2", pane_pid=2,
+        worktree_path="/tmp/wt", branch="ns/x", base_ref="deadbeef",
+    )
+    store.update_status(build_id, successor_id=review_id)
+    return build_id, review_id
+
+
+def test_pipeline_action_404_on_unknown_task(authed):
+    for action in ("hold", "continue", "keepalive", "review-now", "skip-review", "fix-now"):
+        status, _, body = authed.request(
+            "POST", f"/api/tasks/20260101-000000-dead/{action}",
+            {"paused": True} if action == "keepalive" else None,
+        )
+        assert status == 404, (action, body)
+
+
+def test_pipeline_hold_pings_alive_windows_and_is_idempotent(authed, monkeypatch):
+    build_id, review_id = make_review_pipeline(authed)
+    sent = []
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: sent.append((wid, text)))
+
+    status, _, body = authed.request("POST", f"/api/tasks/{review_id}/hold")
+    assert status == 200 and body["hold_requested"] is True
+    assert store.read_status(build_id)["hold_requested"] is True  # 记在 pipeline_id（=build_id）上
+    assert {w for w, _ in sent} == {"@1", "@2"}  # 两个活窗口都敲过
+
+    sent.clear()
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/hold")  # 用另一个成员 id 再点一次
+    assert status == 200
+    assert sent == []  # 幂等：已经请求过，不重复敲
+
+
+def test_pipeline_hold_blocks_next_review_verdict_routing(authed, monkeypatch):
+    """先按"我来看"，再让审稿给出 done：下一 tick 应该被拦在 held，不直接合并。"""
+    from nightshift import scheduler
+    build_id, review_id = make_review_pipeline(authed, review_state="idle")
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: None)
+
+    status, _, _ = authed.request("POST", f"/api/tasks/{review_id}/hold")
+    assert status == 200
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("都过了。\n\nNEXT: done", encoding="utf-8")
+    store.update_status(review_id, review_verdict="done", review_file=str(review_file),
+                        review_recorded_round=1)
+
+    from datetime import datetime, timezone
+    scheduler.tick(store.load_config(), datetime.now(timezone.utc))
+    assert store.read_status(review_id)["state"] == "held"
+    assert store.read_status(review_id).get("review_routed_round") != 1
+
+
+def test_pipeline_continue_after_hold_reevaluates_blocked_band(authed, monkeypatch):
+    from nightshift import scheduler
+    from datetime import datetime, timezone
+    build_id, review_id = make_review_pipeline(authed, review_state="idle")
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: None)
+    authed.request("POST", f"/api/tasks/{review_id}/hold")
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("都过了。\n\nNEXT: done", encoding="utf-8")
+    store.update_status(review_id, review_verdict="done", review_file=str(review_file),
+                        review_recorded_round=1)
+    scheduler.tick(store.load_config(), datetime.now(timezone.utc))
+    assert store.read_status(review_id)["state"] == "held"
+
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/continue")
+    assert status == 200 and body["resumed"] is True
+    assert store.read_status(build_id)["hold_requested"] is False
+    assert store.read_status(review_id)["state"] == "idle"
+    scheduler.tick(store.load_config(), datetime.now(timezone.utc))
+    assert store.read_status(review_id)["state"] == "awaiting_merge"  # 真的往下走了
+
+
+def test_pipeline_continue_without_hold_or_round_limit_409(authed):
+    build_id, _ = make_review_pipeline(authed)
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/continue")
+    assert status == 409 and "继续" in body["error"]
+
+
+def test_pipeline_continue_round_limit_sets_override_and_reevaluates(authed):
+    build_id, review_id = make_review_pipeline(authed, review_state="idle")
+    store.update_status(
+        build_id, pipeline_phase="round_limit", fix_count=1,
+    )
+    store.update_status(
+        review_id, state="needs_attention",
+        error="返工轮数已到线（1/1），继续需要工头确认",
+    )
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/continue")
+    assert status == 200 and body["resumed"] is True
+    assert store.read_status(build_id)["round_limit_override"] is True
+    assert store.read_status(review_id)["state"] == "idle"
+
+
+def test_pipeline_keepalive_pause_and_resume(authed):
+    build_id, review_id = make_review_pipeline(authed)
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{review_id}/keepalive", {"paused": True}
+    )
+    assert status == 200 and body["keepalive_paused"] is True
+    assert store.read_status(build_id)["keepalive_paused"] is True  # build 是当前 held 着的那班
+
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{build_id}/keepalive", {"paused": False}
+    )
+    assert status == 200 and body["keepalive_paused"] is False
+    assert store.read_status(build_id)["keepalive_paused"] is False
+
+
+def test_pipeline_keepalive_bad_body(authed):
+    build_id, _ = make_review_pipeline(authed)
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{build_id}/keepalive", {"paused": "yes"}
+    )
+    assert status == 400
+
+
+def test_pipeline_review_now_only_targets_postponed_reviewer(authed):
+    build_id, review_id = make_review_pipeline(authed, review_state="postponed")
+    store.update_status(review_id, next_attempt_at="2099-01-01T00:00:00Z")
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/review-now")
+    assert status == 200 and body["task_id"] == review_id
+    assert store.read_status(review_id)["next_attempt_at"] <= store.utc_now_iso()
+
+    build_id2, review_id2 = make_review_pipeline(authed, review_state="working")
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id2}/review-now")
+    assert status == 409
+
+
+def test_pipeline_skip_review_cancels_pending_review_and_finalizes(authed):
+    build_id, review_id = make_review_pipeline(authed, review_state="scheduled")
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/skip-review")
+    assert status == 200 and body["task_id"] == build_id
+    assert store.read_status(review_id)["state"] == "cancelled"
+    assert store.read_status(build_id)["state"] == "awaiting_merge"  # manual merge_policy
+
+
+def test_pipeline_skip_review_requires_checkpointed_held_build(authed):
+    build_id, review_id = make_review_pipeline(authed, build_state="working")
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/skip-review")
+    assert status == 409
+
+
+def test_pipeline_fix_now_with_instruction_advances_round(authed, monkeypatch):
+    build_id, review_id = make_review_pipeline(authed, review_state="idle")
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    sent = []
+
+    def fake_send_keys(wid, text):
+        sent.append((wid, text))
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(launcher, "send_keys", fake_send_keys)
+
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{build_id}/fix-now", {"instruction": "不等审稿了，先改这个 bug"}
+    )
+    assert status == 200, body
+    assert store.load_task(build_id)["round"] == 2
+    assert store.read_status(build_id)["state"] == "working"
+    assert store.read_status(build_id)["fix_count"] == 1
+    assert any("不等审稿了" in text for _, text in sent)
+
+
+def test_pipeline_fix_now_empty_instruction_reuses_latest_review(authed, monkeypatch):
+    build_id, review_id = make_review_pipeline(authed, review_state="idle")
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    sent = []
+
+    def fake_send_keys(wid, text):
+        sent.append((wid, text))
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(launcher, "send_keys", fake_send_keys)
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("上一轮意见：漏了个边界。\n\nNEXT: fix", encoding="utf-8")
+    store.update_status(review_id, review_file=str(review_file))
+
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/fix-now", {})
+    assert status == 200, body
+    assert any("漏了个边界" in text for _, text in sent)
+
+
+def test_pipeline_fix_now_blank_instruction_and_no_review_400(authed):
+    build_id, _ = make_review_pipeline(authed, review_state="idle")
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/fix-now", {"instruction": "   "})
+    assert status == 400
+
+
+def test_pipeline_fix_now_blocked_while_something_working(authed):
+    build_id, review_id = make_review_pipeline(authed, review_state="working")
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{build_id}/fix-now", {"instruction": "改一下"}
+    )
+    assert status == 409
+
+
+def test_pipeline_fix_now_respects_round_limit(authed):
+    build_id, review_id = make_review_pipeline(authed, review_state="idle")
+    store.update_status(build_id, fix_count=5)  # 默认 max_rounds=5，已到线
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{build_id}/fix-now", {"instruction": "再改改"}
+    )
+    assert status == 409 and "到线" in body["error"]

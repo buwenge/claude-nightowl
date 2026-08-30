@@ -1150,6 +1150,13 @@ function loadTemplatesView() {
     $("t-chain").value = cfg.chain_template || "";
     $("t-stopbg").value = cfg.stop_background_text || "";
     $("t-stuckinterrupt").value = cfg.stuck_interrupt_text || "";
+    $("t-review").value = cfg.review_template || "";
+    $("t-reviewfix").value = cfg.review_fix_template || "";
+    $("t-reviewcriteria").value = cfg.review_criteria_text || "";
+    $("t-reviewwrapup").value = cfg.review_wrapup_text || "";
+    $("t-reviewstopbuild").value = cfg.review_stop_build_text || "";
+    $("t-hold").value = cfg.hold_text || "";
+    $("t-resume").value = cfg.resume_text || "";
   }).catch(function () {});
 }
 
@@ -1164,7 +1171,14 @@ function saveTemplates() {
     quota_other_model_text: $("t-quotaother").value,
     chain_template: $("t-chain").value,
     stop_background_text: $("t-stopbg").value,
-    stuck_interrupt_text: $("t-stuckinterrupt").value
+    stuck_interrupt_text: $("t-stuckinterrupt").value,
+    review_template: $("t-review").value,
+    review_fix_template: $("t-reviewfix").value,
+    review_criteria_text: $("t-reviewcriteria").value,
+    review_wrapup_text: $("t-reviewwrapup").value,
+    review_stop_build_text: $("t-reviewstopbuild").value,
+    hold_text: $("t-hold").value,
+    resume_text: $("t-resume").value
   }).then(function () {
     note.textContent = "已保存";
     setTimeout(function () { note.textContent = ""; }, 3000);

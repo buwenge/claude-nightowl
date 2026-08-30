@@ -208,6 +208,34 @@
     <p class="hint">占位符：{stuck_minutes} 卡住的分钟数。Esc 只能打断当前这一轮，不会触发它自己收尾（Claude Code 官方说明：Stop 不认用户中断），所以按完 Esc 会紧接着把这段话敲进去起一个新轮次，让它自己判断刚才卡在哪、要不要继续。</p>
     <textarea id="t-stuckinterrupt" class="tall" rows="4"></textarea>
 
+    <h2>审稿班提示词</h2>
+    <p class="hint">占位符：{task} {title} {project_path} {base_ref} {diff_command} {build_handover} {previous_review} {round} {criteria} {stop_build_hint}（系统自动填）。只读审查，最终回复正文就是审稿意见，末行严格写 NEXT: done / fix / pending。</p>
+    <textarea id="t-review" class="mono tall" rows="8"></textarea>
+
+    <h2>返工班提示词</h2>
+    <p class="hint">占位符：{task} {title} {project_path} {round} {review} {context_limit} {worktree_instruction}（系统自动填）</p>
+    <textarea id="t-reviewfix" class="mono tall" rows="6"></textarea>
+
+    <h2>审稿通过标准（默认文案）</h2>
+    <p class="hint">任务里没单独补一句时用这条；{criteria} 占位符即渲染这段文本。</p>
+    <textarea id="t-reviewcriteria" class="tall" rows="3"></textarea>
+
+    <h2>审稿班额度到线收尾</h2>
+    <p class="hint">占位符：{week_left} {week_line_left} {model_line_left} {model_note}。叫它把已看到的意见写进最终回复正文、末行 NEXT: pending，不叫它写交接文件。</p>
+    <textarea id="t-reviewwrapup" class="tall" rows="4"></textarea>
+
+    <h2>审稿通过后敲给施工班的话</h2>
+    <p class="hint">审稿 NEXT: done 且施工班还 held 着时敲给它的一句话，原样发送、没有占位符。</p>
+    <textarea id="t-reviewstopbuild" class="tall" rows="3"></textarea>
+
+    <h2>"我来看"生效时投给两边的话</h2>
+    <p class="hint">按"我来看"时敲给当前活窗口的一句话，原样发送、没有占位符。</p>
+    <textarea id="t-hold" class="tall" rows="3"></textarea>
+
+    <h2>"继续"时投给施工班的话</h2>
+    <p class="hint">按"继续"后敲给恢复施工的窗口的一句话，原样发送、没有占位符。</p>
+    <textarea id="t-resume" class="tall" rows="3"></textarea>
+
     <p id="tpl-note" class="ok-note"></p>
     <button type="button" id="btn-save-tpl" class="primary" style="width:100%">保存模板</button>
   </section>

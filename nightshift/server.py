@@ -45,6 +45,10 @@ _RE_TASK_DETAIL = re.compile(rf"^/api/tasks/({_TASK_ID_RE})$")
 _RE_TASK_ACTION = re.compile(
     rf"^/api/tasks/({_TASK_ID_RE})/(run-now|cancel|merge|discard)$"
 )
+# S7④：流水线控制 action，接受这条流水线任一成员的 task id
+_RE_PIPELINE_ACTION = re.compile(
+    rf"^/api/tasks/({_TASK_ID_RE})/(hold|continue|keepalive|review-now|skip-review|fix-now)$"
+)
 _RE_TASK_MESSAGE = re.compile(rf"^/api/tasks/({_TASK_ID_RE})/message$")
 _RE_TASK_SESSION = re.compile(
     rf"^/api/tasks/({_TASK_ID_RE})/(interrupt|stop-background)$"
@@ -418,6 +422,20 @@ class _Handler(BaseHTTPRequestHandler):
             if action == "interrupt":
                 return self._api_interrupt(task_id)
             return self._api_stop_background(task_id)
+        match = _RE_PIPELINE_ACTION.match(path)
+        if match:
+            task_id, action = match.group(1), match.group(2)
+            if action == "hold":
+                return self._api_pipeline_hold(task_id)
+            if action == "continue":
+                return self._api_pipeline_continue(task_id)
+            if action == "keepalive":
+                return self._api_pipeline_keepalive(task_id)
+            if action == "review-now":
+                return self._api_pipeline_review_now(task_id)
+            if action == "skip-review":
+                return self._api_pipeline_skip_review(task_id)
+            return self._api_pipeline_fix_now(task_id)
         self._send_json(404, {"error": "没有这个路径"})
 
     def _route_put(self) -> None:
@@ -525,6 +543,21 @@ class _Handler(BaseHTTPRequestHandler):
             "codex_quota_pause_text": cfg.get("codex_quota_pause_text", ""),
             "codex_resume_text": cfg.get("codex_resume_text", ""),
             "codex_stop_background_text": cfg.get("codex_stop_background_text", ""),
+            # S7①：审稿流水线的七个模板键，生产 config 缺键时展示 fallback
+            "review_template": cfg.get("review_template", ""),
+            "review_fix_template": cfg.get("review_fix_template", ""),
+            "review_criteria_text": cfg.get("review_criteria_text", ""),
+            "review_wrapup_text": cfg.get("review_wrapup_text", ""),
+            "review_stop_build_text": cfg.get("review_stop_build_text", ""),
+            "hold_text": cfg.get("hold_text", ""),
+            "resume_text": cfg.get("resume_text", ""),
+            # S7①：config.review 的默认值（max_rounds/on_no_quota/merge_policy），
+            # 新建页折叠区要展示；缺整个对象时走代码 fallback（跟 store.review_config 一致）
+            "review_defaults": {
+                "max_rounds": (cfg.get("review") or {}).get("max_rounds", 5),
+                "on_no_quota": (cfg.get("review") or {}).get("on_no_quota", "release"),
+                "merge_policy": (cfg.get("review") or {}).get("merge_policy", "manual"),
+            },
             "display_tz_offset_hours": cfg.get("display_tz_offset_hours"),
             # 可选：顶栏"回主站"链接 {"text": "...", "href": "..."}，没配就不显示
             "home_link": (cfg.get("http") or {}).get("home_link"),
@@ -536,6 +569,8 @@ class _Handler(BaseHTTPRequestHandler):
         "prompt_template", "context_warn_text", "quota_pause_text", "quota_wrapup_text",
         "quota_other_model_text", "chain_template", "stop_background_text", "stuck_interrupt_text",
         "codex_quota_pause_text", "codex_resume_text", "codex_stop_background_text",
+        "review_template", "review_fix_template", "review_criteria_text",
+        "review_wrapup_text", "review_stop_build_text", "hold_text", "resume_text",
     )
 
     def _api_templates(self) -> None:
@@ -943,6 +978,245 @@ class _Handler(BaseHTTPRequestHandler):
             logger.info("网页丢弃工作树：%s（%s）", task_id, note)
             return self._send_json(200, {"ok": True, "note": note})
         return self._send_json(409, {"error": note})
+
+    # ---------- S7④：流水线控制（我来看/继续/保活/现在就审/跳过审稿/直接返工） ----------
+
+    def _resolve_pipeline(self, task_id: str) -> str | None:
+        """流水线任一成员 task id → coordinator id（pipeline_id）；任务不
+        存在发 404 并返回 None。六个控制 action 共用这一步解析。"""
+        try:
+            task = store.load_task(task_id)
+        except (OSError, ValueError):
+            self._send_json(404, {"error": "任务不存在"})
+            return None
+        return store.pipeline_id_of(task)
+
+    def _pipeline_members(self, pipeline_id: str) -> list[dict]:
+        return [
+            item for item in store.list_tasks()
+            if store.pipeline_id_of(item["task"]) == pipeline_id
+        ]
+
+    def _api_pipeline_hold(self, task_id: str) -> None:
+        """我来看：幂等设置 pipeline hold，向当前活窗口各敲一次 hold_text。"""
+        pipeline_id = self._resolve_pipeline(task_id)
+        if pipeline_id is None:
+            return
+        coordinator = store.read_status(pipeline_id)
+        cfg = store.load_config()
+        if not coordinator.get("hold_requested"):
+            store.update_status(pipeline_id, hold_requested=True)
+            text = cfg.get("hold_text") or "来自nightshift：工头要来看，停在这里别再动代码；有人问再答。"
+            pinged = []
+            for item in self._pipeline_members(pipeline_id):
+                wid = (item["status"] or {}).get("window_id")
+                if wid and launcher.window_alive(str(wid), cfg):
+                    launcher.send_keys(str(wid), text)
+                    pinged.append(str(wid))
+            store.append_event(
+                pipeline_id,
+                f"我来看：已请求，敲了 {len(pinged)} 个活窗口" if pinged
+                else "我来看：已请求，当前没有活窗口",
+            )
+        logger.info("网页我来看：%s", pipeline_id)
+        return self._send_json(200, {"ok": True, "hold_requested": True})
+
+    def _api_pipeline_continue(self, task_id: str) -> None:
+        """继续：清 hold_requested 并执行一个 resume_action——要么是从
+        "我来看"恢复（重新评估被拦下的那一班），要么是从返工轮数上限恢复
+        （放行一轮，不永久取消上限）。两者都找不到就 409。"""
+        pipeline_id = self._resolve_pipeline(task_id)
+        if pipeline_id is None:
+            return
+        coordinator = store.read_status(pipeline_id)
+        if coordinator.get("hold_requested"):
+            store.update_status(pipeline_id, hold_requested=False)
+            blocked = None
+            for item in self._pipeline_members(pipeline_id):
+                t, s = item["task"], item["status"]
+                if s.get("state") == "held" and "工头" in (s.get("held_reason") or ""):
+                    blocked = (t, s)
+            if blocked is None:
+                store.append_event(pipeline_id, "继续：已清\"我来看\"请求")
+                logger.info("网页继续（我来看）：%s（无阻塞班）", pipeline_id)
+                return self._send_json(200, {"ok": True, "resumed": False})
+            t, _ = blocked
+            if store.role_of(t) == "build":
+                store.update_status(t["id"], state="idle", chain_checked=False)
+            else:
+                store.update_status(t["id"], state="idle")
+            store.append_event(t["id"], "继续：清\"我来看\"请求，重新评估这一班的下一步")
+            logger.info("网页继续（我来看）：%s → %s", pipeline_id, t["id"])
+            return self._send_json(200, {"ok": True, "resumed": True, "task_id": t["id"]})
+
+        if coordinator.get("pipeline_phase") == "round_limit":
+            blocked = None
+            for item in self._pipeline_members(pipeline_id):
+                t, s = item["task"], item["status"]
+                if s.get("state") == "needs_attention" and "到线" in (s.get("error") or ""):
+                    blocked = (t, s)
+            if blocked is None:
+                return self._send_json(409, {"error": "没有找到卡在返工轮数上限的审稿班"})
+            t, _ = blocked
+            store.update_status(pipeline_id, round_limit_override=True)
+            store.update_status(t["id"], state="idle")
+            store.append_event(t["id"], "继续：放行一轮返工上限（不永久取消上限）")
+            logger.info("网页继续（返工上限）：%s → %s", pipeline_id, t["id"])
+            return self._send_json(200, {"ok": True, "resumed": True, "task_id": t["id"]})
+
+        return self._send_json(409, {"error": "当前没有等你\"继续\"的动作"})
+
+    def _api_pipeline_keepalive(self, task_id: str) -> None:
+        """暂停/恢复保活：只改运行期暂停位（status.keepalive_paused），不
+        碰 held/reviewing/waiting_wakeup 等流程状态。"""
+        pipeline_id = self._resolve_pipeline(task_id)
+        if pipeline_id is None:
+            return
+        data = self._read_json()
+        if data is None:
+            return
+        paused = data.get("paused")
+        if not isinstance(paused, bool):
+            return self._send_json(400, {"error": "paused 必须是布尔值"})
+        target = None
+        for item in self._pipeline_members(pipeline_id):
+            t, s = item["task"], item["status"]
+            if s.get("state") in ("held", "waiting_background"):
+                target = t["id"]
+        if target is None:
+            return self._send_json(409, {"error": "当前没有在等保活的班"})
+        store.update_status(target, keepalive_paused=paused)
+        store.append_event(target, f"保活{'暂停' if paused else '恢复'}（网页按钮）")
+        logger.info("网页%s保活：%s", "暂停" if paused else "恢复", target)
+        return self._send_json(200, {"ok": True, "keepalive_paused": paused})
+
+    def _api_pipeline_review_now(self, task_id: str) -> None:
+        """现在就审：只对因审稿方额度被推迟（postponed）的审稿班跳过等待
+        时间，仍走完整的额度预检（下一 tick 的 _try_launch 照常判），不是
+        绕过额度守卫。"""
+        pipeline_id = self._resolve_pipeline(task_id)
+        if pipeline_id is None:
+            return
+        target = None
+        for item in self._pipeline_members(pipeline_id):
+            t, s = item["task"], item["status"]
+            if store.role_of(t) == "review" and s.get("state") == "postponed":
+                target = t["id"]
+        if target is None:
+            return self._send_json(409, {"error": "没有正在等额度的审稿班"})
+
+        def mut(status: dict) -> None:
+            status["next_attempt_at"] = store.utc_now_iso()
+
+        store.modify_status(target, mut)
+        store.append_event(target, "网页：现在就审（跳过等待，仍要过完整额度预检）")
+        logger.info("网页现在就审：%s → %s", pipeline_id, target)
+        return self._send_json(200, {"ok": True, "task_id": target})
+
+    def _api_pipeline_skip_review(self, task_id: str) -> None:
+        """跳过审稿：直接收工按 merge policy 分流；只在 build 已 checkpoint、
+        尚无 done verdict 的边界允许（held 等审稿、审稿还没起跑/还在等额度）。
+        """
+        pipeline_id = self._resolve_pipeline(task_id)
+        if pipeline_id is None:
+            return
+        build_item = None
+        pending_review = None
+        for item in self._pipeline_members(pipeline_id):
+            t, s = item["task"], item["status"]
+            if (
+                store.role_of(t) == "build" and s.get("state") == "held"
+                and s.get("checkpoint_done")
+            ):
+                build_item = (t, s)
+            if store.role_of(t) == "review" and s.get("state") in ("scheduled", "postponed"):
+                pending_review = (t, s)
+        if build_item is None:
+            return self._send_json(
+                409, {"error": "没有已存档、等审稿的施工班可以跳过审稿"}
+            )
+        t, _ = build_item
+        if pending_review is not None:
+            rt, _ = pending_review
+            store.update_status(rt["id"], state="cancelled", last_event_at=store.utc_now_iso())
+            store.append_event(rt["id"], "网页：跳过审稿，本班取消")
+        cfg = store.load_config()
+        scheduler._finalize_done(
+            t, cfg, datetime.now(timezone.utc), skip_review=True
+        )
+        store.append_event(t["id"], "网页：跳过审稿，直接按 merge policy 收工")
+        logger.info("网页跳过审稿：%s → %s", pipeline_id, t["id"])
+        return self._send_json(200, {"ok": True, "task_id": t["id"]})
+
+    def _api_pipeline_fix_now(self, task_id: str) -> None:
+        """直接返工：不等审稿，带用户给的非空 instruction（或复用这一轮已有
+        的审稿意见）直接进入下一轮 build。仍受 max_rounds/单轮放行与"一个
+        working"的约束。"""
+        pipeline_id = self._resolve_pipeline(task_id)
+        if pipeline_id is None:
+            return
+        data = self._read_json()
+        if data is None:
+            return
+        instruction = data.get("instruction")
+        if instruction is not None and not isinstance(instruction, str):
+            return self._send_json(400, {"error": "instruction 必须是字符串"})
+
+        members = self._pipeline_members(pipeline_id)
+        for item in members:
+            if (item["status"] or {}).get("state") == "working":
+                return self._send_json(
+                    409, {"error": "这条流水线正有一班在跑，不能现在插入返工"}
+                )
+
+        review_item = None
+        for item in members:
+            t, s = item["task"], item["status"]
+            if store.role_of(t) != "review":
+                continue
+            if review_item is None or store.round_of(t) >= store.round_of(review_item[0]):
+                review_item = (t, s)
+        if review_item is None:
+            return self._send_json(409, {"error": "这条流水线还没有审稿班，用不了直接返工"})
+        rt, rs = review_item
+        if rs.get("state") not in ("scheduled", "postponed", "idle", "held"):
+            return self._send_json(
+                409, {"error": f"审稿班当前状态 {rs.get('state')} 不能直接返工"}
+            )
+
+        text = (instruction or "").strip()
+        if not text:
+            latest = rs.get("review_file")
+            if latest and Path(latest).is_file():
+                text = Path(latest).read_text(encoding="utf-8", errors="replace")
+        if not text:
+            return self._send_json(
+                400, {"error": "instruction 不能为空，且这一轮也没有可用的审稿意见"}
+            )
+
+        cfg = store.load_config()
+        coordinator = store.read_status(pipeline_id)
+        review_cfg = store.review_config(rt, cfg)
+        max_rounds = int(review_cfg.get("max_rounds") or 5)
+        fix_count = int(coordinator.get("fix_count") or 0)
+        if fix_count >= max_rounds and not coordinator.get("round_limit_override"):
+            return self._send_json(
+                409,
+                {"error": f"返工轮数已到线（{fix_count}/{max_rounds}），"
+                          "请先在网页点\"继续\"放行一轮"},
+            )
+
+        round_ = store.round_of(rt)
+        review_file = store.task_dir(rt["id"]) / f"review-{round_}.md"
+        store.atomic_write_text(review_file, text)
+        store.update_status(
+            rt["id"], state="idle", review_verdict="fix", review_file=str(review_file),
+            review_recorded_round=round_,
+        )
+        store.append_event(rt["id"], "网页：不等审稿，直接按给定意见返工（fix-now）")
+        actions = scheduler._review_fix(store.load_task(rt["id"]), cfg, datetime.now(timezone.utc))
+        logger.info("网页直接返工：%s → %s", pipeline_id, rt["id"])
+        return self._send_json(200, {"ok": True, "task_id": rt["id"], "actions": actions})
 
     def _api_delete(self, task_id: str) -> None:
         if self._load_existing(task_id) is None:
