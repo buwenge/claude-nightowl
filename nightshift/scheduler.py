@@ -23,8 +23,11 @@ __all__ = ["parse_iso", "to_iso", "tick", "run_forever", "reconcile_worktrees"]
 
 # retry_max 的兜底值（task.json 里没写时按 3）
 DEFAULT_RETRY_MAX = 3
-# 视为"活跃"的状态：额度刷新看它们，同目录不并跑也拦它们
-ACTIVE_STATES = ("launching", "working", "waiting_background", "waiting_wakeup")
+# 视为"活跃"的状态：额度刷新看它们，同目录不并跑也拦它们。S7：held 加入
+# 活跃态（会话还活着，只是明确不施工）；worktree=true 的同项目并跑豁免
+# （_try_launch 里已有）天然覆盖"同一流水线一个 held 一个 working"的例外，
+# 不需要给 held 单独开一条豁免规则。
+ACTIVE_STATES = ("launching", "working", "waiting_background", "waiting_wakeup", "held")
 # config.scheduler 缺 keepalive_text 时的兜底文案（与 config.example.json 一致）
 DEFAULT_KEEPALIVE_TEXT = (
     "来自nightshift：保活探针——背景任务还在跑吗？简短回一句即可。"
@@ -120,7 +123,7 @@ def tick(config: dict, now: datetime) -> list[str]:
                 actions.extend(_try_launch(task, status, config, now))
         elif state == "launching":
             actions.extend(_check_launching(task, status, config, now))
-        elif state in ("working", "waiting_background", "waiting_wakeup", "idle"):
+        elif state in ("working", "waiting_background", "waiting_wakeup", "idle", "held"):
             actions.extend(_check_running(task, status, config, now))
         elif state == "exited":
             # S3 换班：exited 也评估一次（写完交接后会话被关/崩了的情形）
@@ -223,7 +226,8 @@ def _fetch_and_record_usage(
 def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[str]:
     task_id = task["id"]
     project_path = config["projects"][task["project"]]
-    runner = task.get("runner") or "claude"
+    # S7：这一班自己的有效工人（review 角色可能跟顶层 build runner 不同）。
+    runner = store.effective_runner(task)
 
     # a. 目录信任：没点过信任，交互式 claude 会卡在信任问答——等人也没用，直接判失败。
     # Codex 不吃这份信任记录（自己的信任状态在 ~/.codex/config.toml，覆盖
@@ -256,9 +260,11 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
     if usage is None:
         return _postpone(task, status, config, now, f"额度查不到（fail-closed）：{err}")
     ok, reason = quota.check_guards(
-        usage, task["model"], config, task.get("guards") or {}, runner=runner
+        usage, store.effective_model(task), config, task.get("guards") or {}, runner=runner
     )
     if not ok:
+        if store.role_of(task) == "review":
+            _apply_review_no_quota_policy(task, config, now)
         return _postpone(task, status, config, now, reason)
 
     # d. 全过 → 起跑（launcher.launch 自己会先落盘 launching 再碰 tmux）
@@ -711,7 +717,8 @@ def _check_running(
         and bool(pane_pid)
         and launcher.pid_alive(int(pane_pid))
     )
-    runner = task.get("runner") or "claude"
+    # S7：这一班自己的有效工人（review 角色可能跟顶层 build runner 不同）。
+    runner = store.effective_runner(task)
 
     # S6.1 A4：Codex 的 F12 后台核对必须在通用 window_gone 判断之前做，且不
     # 分当前顶层状态（working 也要查）——原来挂在通用 alive 分支之后、又只
@@ -866,16 +873,26 @@ def _check_running(
             return []  # Claude：闹钟还没响完，等它自己醒
 
     # S3 换班：idle 收尾后按交接文件接下一班（每次评估先落 chain_checked
-    # 防重复；评估失败的代价是这班不再自动续，好过重复开出双份后继）
-    if status.get("state") == "idle" and not status.get("chain_checked"):
-        return _check_idle_chain(task, status, config, now)
+    # 防重复；评估失败的代价是这班不再自动续，好过重复开出双份后继）。
+    # S7：review 角色走独立的 verdict 分流，不进 build 的交接判定。
+    if status.get("state") == "idle":
+        if store.role_of(task) == "review":
+            result = _check_review_idle(task, status, config, now)
+            if result is not None:
+                return result
+        elif not status.get("chain_checked"):
+            return _check_idle_chain(task, status, config, now)
 
-    if status.get("state") != "waiting_background":
+    if status.get("state") not in ("waiting_background", "held"):
         return []  # idle 永远不戳（8/27 事故的反面，设计稿 §5.2）
 
     guards = task.get("guards") or {}
     if not guards.get("keepalive", True):
         return []
+    if (task.get("keepalive") or {}).get("enabled") is False:
+        return []  # S7：task.keepalive.enabled 是长期开关，跟 guards.keepalive 并存
+    if status.get("keepalive_paused"):
+        return []  # S7：按钮暂停位，只停戳不改状态/流程
 
     # S6③：保活分家——claude 50 分钟、codex 25 分钟（GPT-5.6 缓存 30 分钟，
     # 见靶测记录 F6），各自文案；旧配置没有 config.runners 时兼容视图会从
@@ -897,7 +914,9 @@ def _check_running(
         last_keepalive_at=to_iso(now),
         keepalive_count=int(status.get("keepalive_count") or 0) + 1,
     )
-    store.append_event(task_id, "保活戳：waiting_background 静默超时，已 send-keys 探针")
+    store.append_event(
+        task_id, f"保活戳：{status.get('state')} 静默超时，已 send-keys 探针"
+    )
     return [f"{task_id} 保活戳"]
 
 
@@ -1004,27 +1023,34 @@ def _chain_continue(
     """
     task_id = task["id"]
     shift = int(task.get("shift") or 1)
+    # S7：换班上限比较 role_shift（本角色本轮的续班计数），不再拿全局 shift
+    # ——否则角色轮转（build→review→build…）会让审稿班吃掉施工班的窗口
+    # 额度。纯 build 流水线（没有审稿）里 role_shift 与 shift 从头到尾同步
+    # 递增，这条改动对它们零行为差异。
+    role_shift = int(task.get("role_shift") or 1)
     chain = task.get("chain") or {}
     max_windows = int(chain.get("max_windows") or 3)
-    if shift >= max_windows:
+    if role_shift >= max_windows:
         store.update_status(
             task_id, state="chain_exhausted", last_event_at=to_iso(now)
         )
         store.append_event(
-            task_id, f"已连开 {shift} 班（上限 {max_windows}）→ chain_exhausted"
+            task_id,
+            f"本角色已连开 {role_shift} 班（上限 {max_windows}，全局第 {shift} 班）"
+            "→ chain_exhausted",
         )
         launcher.open_notice_window(
             task,
             "(班次用尽)",
             [
-                f"已连开 {shift} 班（chain.max_windows={max_windows}），不再自动续班",
+                f"本角色已连开 {role_shift} 班（chain.max_windows={max_windows}），不再自动续班",
                 "任务可能没做完；要继续可调大上限后在网页重建任务",
             ],
             config,
         )
         return [f"{task_id} 第 {shift} 班结束：班次用尽"]
     successor_id = store.create_successor(task, handover_text, config)
-    if (task.get("runner") or "claude") == "codex":
+    if store.effective_runner(task) == "codex":
         window_id = status.get("window_id")
         if window_id:
             closed = launcher.close_windows([window_id], config)
@@ -1133,6 +1159,10 @@ def _checkpoint_shift(
 def _finalize_done(task: dict, config: dict, now: datetime) -> list[str]:
     """最后一班完工分流（判过 NEXT: done 或没交接正常干完都走这里）：
     - worktree=false：原状态机一字不变 → finished；
+    - S7：build 角色 + review.enabled=true → 不直接分流，起同 round 审稿
+      （_start_review_round），真正的 merge_policy 分流要等审稿 done 之后
+      由 _review_done 再次调用本函数（那时角色已是 review，不会再折回
+      _start_review_round，见下面的角色判断）；
     - true + manual：存档后 → awaiting_merge，树与分支保留，等工头；
     - true + auto：调度器合并 → merged / needs_attention（原因见红字）。
     """
@@ -1141,7 +1171,10 @@ def _finalize_done(task: dict, config: dict, now: datetime) -> list[str]:
         store.update_status(task_id, state="finished", last_event_at=to_iso(now))
         store.append_event(task_id, "收工：worktree=false 走一期路径 → finished")
         return [f"{task_id} 正常干完 → finished"]
-    policy = (task.get("review") or {}).get("merge_policy") or "manual"
+    review_cfg = store.review_config(task, config)
+    if review_cfg.get("enabled") and store.role_of(task) == "build":
+        return _start_review_round(task, config, now)
+    policy = review_cfg.get("merge_policy") or "manual"
     if policy == "manual":
         store.update_status(
             task_id, state="awaiting_merge", last_event_at=to_iso(now)
@@ -1175,6 +1208,315 @@ def _finalize_done(task: dict, config: dict, now: datetime) -> list[str]:
             config,
         )
     return [f"{task_id} 干完但自动合并没成：{note}"]
+
+
+# ---------- S7：审稿流水线（build ↔ review 轮转、held、返工轮数、我来看） ----------
+
+DEFAULT_REVIEW_STOP_BUILD_TEXT = (
+    "来自nightshift：审稿已经通过（NEXT: done），这条流水线收尾了，请停下不要再继续动代码。"
+)
+
+
+def _coordinator_id(task: dict) -> str:
+    return store.pipeline_id_of(task)
+
+
+def _coordinator_status(task: dict) -> dict:
+    """流水线协调字段（fix_count/hold_requested/pipeline_phase/…）统一记在
+    pipeline_id 对应的根任务 status 上，跨 task 更新前先定位这唯一
+    coordinator（设计稿"先确定唯一 coordinator，通过一个 flock 内的原子
+    append/update helper"——store.update_status 已经是这样一个 helper）。
+    """
+    return store.read_status(_coordinator_id(task))
+
+
+def _update_coordinator(task: dict, **fields) -> dict:
+    return store.update_status(_coordinator_id(task), **fields)
+
+
+def _hold_blocks(task: dict, config: dict, now: datetime, *, reason: str) -> list[str] | None:
+    """流水线协调状态若 hold_requested：这一班转 held 并停在这里，不再往下
+    走（不起审稿、不返工、不合并）；否则返回 None 交回调用方继续正常流程。
+    "我来看"不按 Esc、不打断正在进行的工具调用——这里只在自然的决策点
+    （起审稿前/返工前/合并前）拦截，不会打断任何工具调用。
+    """
+    coordinator = _coordinator_status(task)
+    if not coordinator.get("hold_requested"):
+        return None
+    task_id = task["id"]
+    store.update_status(
+        task_id, state="held", held_since=to_iso(now), held_reason=reason,
+        last_event_at=to_iso(now),
+    )
+    _update_coordinator(task, pipeline_phase="held")
+    store.append_event(task_id, f"我来看：{reason}，停在这里等工头")
+    return [f"{task_id} 我来看 → held（{reason}）"]
+
+
+def _previous_review_text(task: dict, round_: int) -> str:
+    """这条流水线上一轮（round_ - 1）审稿意见的原文；round_ <= 1 或找不到
+    就返回空串（模板里 {previous_review} 天然是可选前缀）。"""
+    if round_ <= 1:
+        return ""
+    pid = _coordinator_id(task)
+    for item in store.list_tasks():
+        other = item["task"]
+        if store.pipeline_id_of(other) != pid:
+            continue
+        if store.role_of(other) != "review" or store.round_of(other) != round_ - 1:
+            continue
+        review_file = (item["status"] or {}).get("review_file")
+        if review_file and Path(review_file).is_file():
+            return Path(review_file).read_text(encoding="utf-8", errors="replace")
+    return ""
+
+
+def _apply_review_no_quota_policy(review_task: dict, config: dict, now: datetime) -> None:
+    """审稿方额度不足、还没起跑就被预检拦下（_try_launch 的额度关卡）：按
+    review.on_no_quota 处理挂着的 build 父班——release 直接关它的窗口（工作
+    树上的改动已经打过存档点，不需要会话继续开着烧保活）；hold 什么都不
+    做，build 继续 held、按其 runner 的保活间隔戳。只在第一次因这个原因
+    处理父班时动手，避免每个 tick 都重复关同一个窗口。
+    """
+    parent_id = review_task.get("parent_id")
+    if not parent_id:
+        return
+    review_cfg = store.review_config(review_task, config)
+    if (review_cfg.get("on_no_quota") or "release") != "release":
+        return
+    parent_status = store.read_status(parent_id)
+    if parent_status.get("state") != "held" or parent_status.get("review_no_quota_released"):
+        return
+    window_id = parent_status.get("window_id")
+    if window_id:
+        launcher.close_windows([window_id], config)
+    store.update_status(parent_id, review_no_quota_released=True)
+    store.append_event(
+        parent_id,
+        "审稿方额度不足（on_no_quota=release）：施工窗口已关闭，"
+        "等审稿额度刷新后另起审稿",
+    )
+
+
+def _start_review_round(task: dict, config: dict, now: datetime) -> list[str]:
+    """build 班收工（NEXT: done）且这条流水线开着审稿：起同 round 的审稿
+    班，build 班转 held 保活等结果。"""
+    task_id = task["id"]
+    blocked = _hold_blocks(task, config, now, reason="收工后本该起审稿，但工头要来看")
+    if blocked is not None:
+        return blocked
+    round_ = store.round_of(task)
+    status = store.read_status(task_id)
+    wt = status.get("worktree_path")
+    base_ref = status.get("base_ref")
+    if not wt or not base_ref:
+        reason = "审稿流水线要求工作树元数据（worktree_path/base_ref），但这一班缺失"
+        store.update_status(
+            task_id, state="needs_attention", error=reason, last_event_at=to_iso(now)
+        )
+        store.append_event(task_id, reason)
+        launcher.open_notice_window(task, "(需要人工)", [reason], config)
+        return [f"{task_id} 审稿流水线元数据缺失 → needs_attention"]
+
+    handover_text = _read_handover(_handover_file(task, status))
+    prompt = store.render_review_prompt(
+        config, task,
+        base_ref=str(base_ref),
+        diff_command=f"git diff {base_ref}..HEAD",
+        build_handover=handover_text,
+        previous_review=_previous_review_text(task, round_),
+        round_=round_,
+    )
+    review_id = store.create_cross_role_successor(
+        task, config, role="review", round_=round_,
+        prompt_final=prompt, parent_next_state="held",
+    )
+    store.update_status(
+        task_id, held_since=to_iso(now),
+        held_reason=f"等待第 {round_} 轮审稿", last_event_at=to_iso(now),
+    )
+    _update_coordinator(task, pipeline_phase="reviewing")
+    store.append_event(task_id, f"收工，进入第 {round_} 轮审稿 → {review_id}")
+    return [f"{task_id} 起第 {round_} 轮审稿 → {review_id}"]
+
+
+def _check_review_idle(
+    task: dict, status: dict, config: dict, now: datetime
+) -> list[str] | None:
+    """review 角色的 idle 分流：读 hook 落好的 review_verdict，按
+    done/fix/pending 三态分流；返回 None 交回调用方按普通流程走（verdict
+    还没落盘，或这一轮已经处理过）。"""
+    task_id = task["id"]
+    round_ = store.round_of(task)
+    verdict = status.get("review_verdict")
+    if verdict is None:
+        return None  # hook 还没落 verdict，等下一 tick
+
+    if verdict == "fix":
+        coordinator = _coordinator_status(task)
+        review_cfg = store.review_config(task, config)
+        max_rounds = int(review_cfg.get("max_rounds") or 5)
+        fix_count = int(coordinator.get("fix_count") or 0)
+        if fix_count >= max_rounds and not coordinator.get("round_limit_override"):
+            if status.get("round_limit_noted_round") != round_:
+                reason = f"返工轮数已到线（{fix_count}/{max_rounds}），继续需要工头确认"
+                store.update_status(
+                    task_id, state="needs_attention", error=reason,
+                    round_limit_noted_round=round_, last_event_at=to_iso(now),
+                )
+                _update_coordinator(task, pipeline_phase="round_limit")
+                store.append_event(task_id, f"{reason} → needs_attention")
+                launcher.open_notice_window(
+                    task, "(需要人工)",
+                    [reason, "网页上点“继续”可以再放一轮，不会自动无限返工"],
+                    config,
+                )
+                return [f"{task_id} 返工轮数到线 → needs_attention"]
+            return []  # 已经告过警，安静等工头点"继续"
+
+    if verdict in ("done", "fix"):
+        blocked = _hold_blocks(
+            task, config, now,
+            reason="审稿已给出结果（{}），但工头要来看".format(verdict),
+        )
+        if blocked is not None:
+            return blocked
+
+    if status.get("review_routed_round") == round_:
+        return []  # 这一轮已经处理过（幂等）
+    store.update_status(task_id, review_routed_round=round_)
+
+    if verdict == "done":
+        return _review_done(task, config, now)
+    if verdict == "pending":
+        return _review_pending(task, config, now)
+    return _review_fix(task, config, now)  # fix，或 hook 已经归一过的非法值
+
+
+def _review_done(review_task: dict, config: dict, now: datetime) -> list[str]:
+    """审稿通过：叫停仍 held 着的 build 会话（若还活着），复用
+    `_finalize_done` 走 merge_policy 分流（manual → awaiting_merge；
+    auto → 唯一 merge helper）。"""
+    task_id = review_task["id"]
+    parent_id = review_task.get("parent_id")
+    if parent_id:
+        parent_status = store.read_status(parent_id)
+        window_id = parent_status.get("window_id")
+        if (
+            parent_status.get("state") == "held" and window_id
+            and launcher.window_alive(str(window_id), config)
+        ):
+            text = config.get("review_stop_build_text") or DEFAULT_REVIEW_STOP_BUILD_TEXT
+            launcher.send_keys(str(window_id), text)
+            store.append_event(parent_id, "审稿已通过（NEXT: done），已敲停施工班")
+        store.update_status(
+            parent_id, state="chained", successor_id=task_id, last_event_at=to_iso(now)
+        )
+    _update_coordinator(review_task, pipeline_phase="done")
+    store.append_event(task_id, "审稿通过（NEXT: done）")
+    return _finalize_done(review_task, config, now)
+
+
+def _review_pending(review_task: dict, config: dict, now: datetime) -> list[str]:
+    """审稿额度到线、意见没写完（NEXT: pending，不计轮数）：按
+    review.on_no_quota release/hold 处理这一轮——release 另起同轮审稿等
+    额度刷新；hold 转 held 保活等刷新。不把半截意见当 fix 让 build 盲改。"""
+    task_id = review_task["id"]
+    round_ = store.round_of(review_task)
+    review_cfg = store.review_config(review_task, config)
+    on_no_quota = review_cfg.get("on_no_quota") or "release"
+    store.append_event(task_id, f"审稿第 {round_} 轮 pending（{on_no_quota}）")
+    if on_no_quota == "hold":
+        store.update_status(
+            task_id, state="held", held_since=to_iso(now),
+            held_reason="审稿额度到线，等刷新后继续", last_event_at=to_iso(now),
+        )
+        return [f"{task_id} 审稿 pending → held"]
+
+    status = store.read_status(task_id)
+    base_ref = status.get("base_ref") or ""
+    prompt = store.render_review_prompt(
+        config, review_task, base_ref=str(base_ref),
+        diff_command=f"git diff {base_ref}..HEAD",
+        build_handover=None, previous_review="", round_=round_,
+    )
+    new_review_id = store.create_cross_role_successor(
+        review_task, config, role="review", round_=round_,
+        prompt_final=prompt, parent_next_state="chained",
+    )
+    store.append_event(task_id, f"按 on_no_quota=release 另起第 {round_} 轮审稿 {new_review_id}")
+    return [f"{task_id} 审稿 pending → 另起 {new_review_id}"]
+
+
+def _review_fix(review_task: dict, config: dict, now: datetime) -> list[str]:
+    """审稿 NEXT: fix：记一次 fix_count，起下一轮 build 返工——若合格 held
+    build 会话仍活着，直接 send-keys 完整意见继续（不新开窗口）；否则造
+    新的 build 班。两条路径都留下不覆盖的 round/checkpoint 审计。"""
+    task_id = review_task["id"]
+    round_ = store.round_of(review_task)
+    next_round = round_ + 1
+    coordinator = _coordinator_status(review_task)
+    fix_count = int(coordinator.get("fix_count") or 0) + 1
+    _update_coordinator(
+        review_task, fix_count=fix_count, pipeline_phase="build",
+        round_limit_override=False,
+    )
+
+    review_file = store.read_status(task_id).get("review_file")
+    review_text = ""
+    if review_file and Path(review_file).is_file():
+        review_text = Path(review_file).read_text(encoding="utf-8", errors="replace")
+
+    parent_id = review_task.get("parent_id")
+    parent_status = store.read_status(parent_id) if parent_id else {}
+    window_id = parent_status.get("window_id")
+    if (
+        parent_id and parent_status.get("state") == "held" and window_id
+        and launcher.window_alive(str(window_id), config)
+    ):
+        parent_task = store.load_task(parent_id)
+        parent_task["round"] = next_round
+        store.atomic_write_json(store.task_dir(parent_id) / "task.json", parent_task)
+        fix_text = store.render_review_fix_prompt(
+            config, parent_task, round_=next_round, review_text=review_text,
+        )
+        proc = launcher.send_keys(str(window_id), fix_text)
+        if proc.returncode != 0:
+            reason = "审稿退回，但把返工意见敲进施工窗口失败（send-keys 失败）"
+            store.update_status(
+                task_id, state="needs_attention", error=reason, last_event_at=to_iso(now)
+            )
+            store.append_event(task_id, reason)
+            launcher.open_notice_window(review_task, "(需要人工)", [reason], config)
+            return [f"{task_id} 返工投递失败 → needs_attention"]
+        # 同一个 build task id 复用进下一轮：checkpoint 相关字段要归零才能
+        # 让 _checkpoint_shift/_check_idle_chain 重新跑一遍；归零前先把上一
+        # 轮的存档点归档进历史，不能覆盖丢失审计线索（不许复用 task id 后
+        # 悄悄盖掉上一轮的 checkpoint_sha）。
+        history = list(parent_status.get("checkpoint_history") or [])
+        if parent_status.get("checkpoint_sha"):
+            history.append({"round": round_, "sha": parent_status["checkpoint_sha"]})
+        store.update_status(
+            parent_id, state="working", round=next_round, last_event_at=to_iso(now),
+            chain_checked=False, checkpoint_done=False, checkpoint_sha=None,
+            checkpoint_history=history,
+        )
+        store.update_status(task_id, state="chained", successor_id=parent_id)
+        store.append_event(
+            parent_id, f"审稿退回（第 {round_} 轮），已捎话继续第 {next_round} 轮返工（同一会话）"
+        )
+        store.append_event(task_id, f"审稿退回，已捎话给仍 held 着的施工班第 {next_round} 轮")
+        return [f"{task_id} 审稿 fix → 捎话继续（第 {next_round} 轮）"]
+
+    prompt = store.render_review_fix_prompt(
+        config, review_task, round_=next_round, review_text=review_text,
+    )
+    build_id = store.create_cross_role_successor(
+        review_task, config, role="build", round_=next_round,
+        prompt_final=prompt, parent_next_state="chained",
+    )
+    store.append_event(task_id, f"审稿退回 → 新起第 {next_round} 轮返工班 {build_id}")
+    return [f"{task_id} 审稿 fix → 新起返工班 {build_id}"]
 
 
 # ---------- 额度刷新（零开销原则） ----------

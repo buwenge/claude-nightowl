@@ -964,7 +964,8 @@ def test_chain_no_handover_never_warned_finishes(monkeypatch):
 
 def test_chain_shift_at_max_windows_exhausted(monkeypatch):
     fakes = Fakes(monkeypatch)
-    tid = make_task(shift=3, worktree=False)  # chain.max_windows=3，这班就是最后一班
+    # S7：换班上限现在比较 role_shift，纯 build 链路里两者同步递增
+    tid = make_task(shift=3, role_shift=3, worktree=False)  # chain.max_windows=3，这班就是最后一班
     _go_idle(tid)
     _write_handover(tid, "还没做完。\nNEXT: continue", shift=3)
     actions = scheduler.tick(CONFIG, NOW)
@@ -1975,3 +1976,350 @@ def test_run_forever_reloads_config_each_tick(tmp_path, monkeypatch):
     store.atomic_write_json(store.home() / "config.json", {**CONFIG, "marker": "first"})
     sched.run_forever({**CONFIG, "marker": "stale"}, max_ticks=2)
     assert seen == ["first", "second"]
+
+
+# ---------- S7：审稿流水线（build ↔ review 轮转、held、返工轮数、我来看） ----------
+
+REVIEW_CONFIG = {
+    **CONFIG,
+    "review_template": (
+        "REVIEW {title} round={round} base={base_ref}\ndiff: {diff_command}\n"
+        "交接：{build_handover}\n上一轮：{previous_review}\n标准：{criteria}\n"
+        "{stop_build_hint}只读，末行 NEXT。"
+    ),
+    "review_fix_template": (
+        "FIX {title} round={round}\n审稿意见：{review}\n{worktree_instruction}{task}"
+    ),
+    "review": {"max_rounds": 5, "on_no_quota": "release", "merge_policy": "manual",
+               "criteria_text": ""},
+}
+
+
+def make_review_task(**over):
+    task = {
+        "title": "审稿流水线任务",
+        "project": "demo",
+        "model": "claude-fable-5",
+        "effort": "high",
+        "run_at": scheduler.to_iso(NOW),
+        "task_text": "正文",
+        "prompt_final": "提示词",
+        "review": {
+            "enabled": True, "runner": "claude",
+            "model": "claude-fable-5", "effort": "high",
+        },
+    }
+    task.update(over)
+    return store.create_task(task, REVIEW_CONFIG)
+
+
+def _review_config_for(proj: Path) -> dict:
+    cfg = dict(REVIEW_CONFIG)
+    cfg["projects"] = {"demo": str(proj), "other": str(proj / "nope")}
+    return cfg
+
+
+def test_review_pipeline_fix_then_done_reuses_held_session(tmp_path, monkeypatch):
+    """held 会话还活着：fix 直接捎话续第 2 轮，不新开窗口；第 2 轮 done →
+    manual 收工 awaiting_merge。全程 fix_count/round/checkpoint 历史正确。"""
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _review_config_for(proj)
+    tid = make_review_task()
+    wt = _register_tree(proj, tid, "审稿流水线任务")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("build round1\n", encoding="utf-8")
+    _write_handover(tid, "第一轮写完了。\nNEXT: done")
+
+    actions = scheduler.tick(cfg, NOW)
+    parent_status = store.read_status(tid)
+    assert parent_status["state"] == "held"
+    c1 = parent_status["checkpoint_sha"]
+    assert c1 and len(c1) == 40
+    review_id = parent_status["successor_id"]
+    assert any(review_id in a for a in actions)
+    review_task = store.load_task(review_id)
+    assert review_task["role"] == "review"
+    assert review_task["round"] == 1
+    assert review_task["pipeline_id"] == tid
+    assert store.read_status(review_id)["state"] == "scheduled"
+
+    # 审稿班起跑并给出 fix（模拟 hook 已落 verdict）
+    _go_idle(review_id, window_id="@2")
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("有个边界条件没处理。\n\nNEXT: fix", encoding="utf-8")
+    store.update_status(review_id, review_verdict="fix", review_file=str(review_file),
+                        review_recorded_round=1)
+
+    scheduler.tick(cfg, NOW)
+    build_status = store.read_status(tid)
+    assert build_status["state"] == "working"
+    assert store.load_task(tid)["round"] == 2
+    assert build_status["checkpoint_history"] == [{"round": 1, "sha": c1}]
+    assert build_status["checkpoint_sha"] is None
+    assert build_status["chain_checked"] is False
+    coordinator = store.read_status(tid)  # tid == pipeline_id（根任务）
+    assert coordinator["fix_count"] == 1
+    assert any("有个边界条件" in text for _, text in fakes.send_keys_calls)
+    assert fakes.close_calls == []  # 没新开窗口，不该关任何窗口
+    assert store.read_status(review_id)["state"] == "chained"
+
+    # 第 2 轮返工完成
+    (wt / "canary.txt").write_text("build round1\nbuild round2\n", encoding="utf-8")
+    _go_idle(tid, window_id="@1")
+    _write_handover(tid, "改好了。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    build_status2 = store.read_status(tid)
+    assert build_status2["state"] == "held"
+    c2 = build_status2["checkpoint_sha"]
+    assert c2 and c2 != c1
+    review2_id = build_status2["successor_id"]
+    review2_task = store.load_task(review2_id)
+    assert review2_task["round"] == 2
+    assert "有个边界条件没处理" in review2_task["prompt_final"]  # 上一轮意见传给了这一轮 review
+
+    # 第 2 轮审稿 done → manual 收工 awaiting_merge，build 会话被敲停
+    _go_idle(review2_id, window_id="@3")
+    review2_file = store.task_dir(review2_id) / "review-2.md"
+    review2_file.write_text("都改好了，测试也过。\n\nNEXT: done", encoding="utf-8")
+    store.update_status(review2_id, review_verdict="done", review_file=str(review2_file),
+                        review_recorded_round=2)
+    scheduler.tick(cfg, NOW)
+    assert store.read_status(review2_id)["state"] == "awaiting_merge"
+    assert store.read_status(tid)["state"] == "chained"
+    assert any("done" in text.lower() or "审稿" in text for _, text in fakes.send_keys_calls)
+
+
+def test_review_pipeline_fix_opens_new_build_when_held_window_gone(monkeypatch):
+    """held 会话窗口已经不在了：fix 造新的返工班（新 task id），不是捎话。"""
+    fakes = Fakes(monkeypatch)
+    # 只让 build 的窗口 @1 消失；review 自己的窗口 @2 仍然活着（否则它自己
+    # 的 idle 处理都进不去，会被通用 window_gone 分支抢答成 exited）
+    import nightshift.launcher as launcher_mod
+    monkeypatch.setattr(
+        launcher_mod, "window_alive",
+        lambda wid, config: str(wid) != "@1",
+    )
+    tid = make_review_task(worktree=True)
+    store.update_status(tid, worktree_path="/tmp/does-not-matter",
+                        branch="ns/x", base_ref="deadbeef")
+    _go_idle(tid, window_id="@1")
+    review_id = store.create_task({
+        "title": "审稿流水线任务", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": scheduler.to_iso(NOW), "task_text": "正文",
+        "prompt_final": "提示词", "runner": "claude",
+        "review": {"enabled": True, "runner": "claude", "model": "claude-fable-5", "effort": "high"},
+    }, REVIEW_CONFIG)
+    data = store.load_task(review_id)
+    data.update({"role": "review", "round": 1, "role_shift": 1,
+                 "parent_id": tid, "pipeline_id": tid, "shift": 2})
+    store.atomic_write_json(store.task_dir(review_id) / "task.json", data)
+    store.update_status(tid, state="held", successor_id=review_id)
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("退回重做。\n\nNEXT: fix", encoding="utf-8")
+    _go_idle(review_id, window_id="@2")
+    store.update_status(review_id, review_verdict="fix", review_file=str(review_file),
+                        review_recorded_round=1)
+
+    actions = scheduler.tick(REVIEW_CONFIG, NOW)
+    review_status = store.read_status(review_id)
+    assert review_status["state"] == "chained"
+    build2_id = review_status["successor_id"]
+    assert build2_id != tid
+    build2 = store.load_task(build2_id)
+    assert build2["role"] == "build" and build2["round"] == 2
+    assert build2["parent_id"] == review_id
+    assert "退回重做" in build2["prompt_final"]
+    assert any(build2_id in a for a in actions)
+
+
+def test_review_pipeline_round_limit_needs_confirmation_then_continue(tmp_path, monkeypatch):
+    """max_rounds=1：第一次 fix 必须允许恰好一次返工；第二次 fix 到线告警，
+    "继续"（round_limit_override）再放一轮。"""
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = dict(_review_config_for(proj))
+    cfg["review"] = {**cfg["review"], "max_rounds": 1}
+    tid = make_review_task(review={
+        "enabled": True, "runner": "claude", "model": "claude-fable-5",
+        "effort": "high", "max_rounds": 1,
+    })
+    wt = _register_tree(proj, tid, "审稿流水线任务")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "第一轮。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    review_id = store.read_status(tid)["successor_id"]
+
+    _go_idle(review_id, window_id="@2")
+    rf1 = store.task_dir(review_id) / "review-1.md"
+    rf1.write_text("第一次退回。\n\nNEXT: fix", encoding="utf-8")
+    store.update_status(review_id, review_verdict="fix", review_file=str(rf1), review_recorded_round=1)
+    scheduler.tick(cfg, NOW)  # 第一次返工：允许（首轮不占返工次数）
+    assert store.read_status(tid)["state"] == "working"
+    assert store.read_status(tid)["fix_count"] == 1
+
+    (wt / "canary.txt").write_text("r1\nr2\n", encoding="utf-8")
+    _go_idle(tid, window_id="@1")
+    _write_handover(tid, "第二轮。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    review2_id = store.read_status(tid)["successor_id"]
+    _go_idle(review2_id, window_id="@3")
+    rf2 = store.task_dir(review2_id) / "review-2.md"
+    rf2.write_text("又要退回。\n\nNEXT: fix", encoding="utf-8")
+    store.update_status(review2_id, review_verdict="fix", review_file=str(rf2), review_recorded_round=2)
+
+    scheduler.tick(cfg, NOW)  # 第二次 fix：fix_count(1) >= max_rounds(1) → 到线
+    review2_status = store.read_status(review2_id)
+    assert review2_status["state"] == "needs_attention"
+    assert "到线" in review2_status["error"]
+    assert store.read_status(tid)["fix_count"] == 1  # 没有偷偷再 +1
+    assert len(fakes.notice_calls) >= 1
+
+    # 再 tick：安静等，不重复告警/不自动返工
+    notice_count_before = len(fakes.notice_calls)
+    scheduler.tick(cfg, NOW)
+    assert len(fakes.notice_calls) == notice_count_before
+    assert store.read_status(review2_id)["state"] == "needs_attention"
+
+    # "继续"：网页控制 API 会做的事——放行一次 + 把这一班拨回 idle 重新评估
+    store.update_status(tid, round_limit_override=True)
+    store.update_status(review2_id, state="idle")
+    scheduler.tick(cfg, NOW)
+    assert store.read_status(tid)["state"] == "working"
+    assert store.read_status(tid)["fix_count"] == 2
+    assert store.read_status(tid)["round_limit_override"] is False  # 消耗掉了，不能永久取消上限
+
+
+def test_review_pipeline_hold_blocks_before_starting_review(tmp_path, monkeypatch):
+    """"我来看"在起审稿前拦截：build 转 held 但不产生审稿班；理由带"工头"。"""
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _review_config_for(proj)
+    tid = make_review_task()
+    wt = _register_tree(proj, tid, "审稿流水线任务")
+    store.update_status(tid, hold_requested=True)  # 根任务就是 coordinator（tid 自己）
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "写完了。\nNEXT: done")
+
+    scheduler.tick(cfg, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "held"
+    assert "工头" in status["held_reason"]
+    assert "successor_id" not in status  # 没有起审稿班
+
+
+def test_review_pipeline_hold_blocks_before_fix_and_merge(monkeypatch):
+    """"我来看"在返工前/合并前同样拦截，且是幂等的（重复 tick 不重复告警）。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_review_task(worktree=True)
+    store.update_status(tid, worktree_path="/tmp/x", branch="ns/x", base_ref="deadbeef",
+                        state="held")
+    review_id = store.create_task({
+        "title": "审稿流水线任务", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": scheduler.to_iso(NOW), "task_text": "正文",
+        "prompt_final": "提示词",
+        "review": {"enabled": True, "runner": "claude", "model": "claude-fable-5", "effort": "high"},
+    }, REVIEW_CONFIG)
+    data = store.load_task(review_id)
+    data.update({"role": "review", "round": 1, "role_shift": 1, "parent_id": tid,
+                 "pipeline_id": tid, "shift": 2})
+    store.atomic_write_json(store.task_dir(review_id) / "task.json", data)
+    store.update_status(tid, successor_id=review_id)
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("都过了。\n\nNEXT: done", encoding="utf-8")
+    _go_idle(review_id, window_id="@2")
+    store.update_status(review_id, review_verdict="done", review_file=str(review_file),
+                        review_recorded_round=1)
+    store.update_status(tid, hold_requested=True)
+
+    scheduler.tick(REVIEW_CONFIG, NOW)
+    status = store.read_status(review_id)
+    assert status["state"] == "held"
+    assert status.get("review_routed_round") != 1  # 没有真的按 done 分流下去
+
+
+def test_review_pipeline_pending_hold_and_release(tmp_path, monkeypatch):
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+
+    cfg_hold = dict(_review_config_for(proj))
+    cfg_hold["review"] = {**cfg_hold["review"], "on_no_quota": "hold"}
+    tid = make_review_task(review={
+        "enabled": True, "runner": "claude", "model": "claude-fable-5",
+        "effort": "high", "on_no_quota": "hold",
+    })
+    wt = _register_tree(proj, tid, "审稿流水线任务")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "写完了。\nNEXT: done")
+    scheduler.tick(cfg_hold, NOW)
+    review_id = store.read_status(tid)["successor_id"]
+    _go_idle(review_id, window_id="@2")
+    rf = store.task_dir(review_id) / "review-1.md"
+    rf.write_text("额度到线，没看完。\n\nNEXT: pending", encoding="utf-8")
+    store.update_status(review_id, review_verdict="pending", review_file=str(rf),
+                        review_recorded_round=1)
+    scheduler.tick(cfg_hold, NOW)
+    assert store.read_status(review_id)["state"] == "held"
+
+    # release（默认）：另起同轮审稿
+    (tmp_path / "release").mkdir()
+    proj2 = _make_repo(tmp_path / "release")
+    cfg_release = _review_config_for(proj2)
+    tid2 = make_review_task(title="release流水线", review={
+        "enabled": True, "runner": "claude", "model": "claude-fable-5",
+        "effort": "high", "on_no_quota": "release",
+    })
+    wt2 = _register_tree(proj2, tid2, "release流水线")
+    _go_idle(tid2, window_id="@11")
+    (wt2 / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid2, "写完了。\nNEXT: done")
+    scheduler.tick(cfg_release, NOW)
+    review2_id = store.read_status(tid2)["successor_id"]
+    _go_idle(review2_id, window_id="@12")
+    rf2 = store.task_dir(review2_id) / "review-1.md"
+    rf2.write_text("额度到线，没看完。\n\nNEXT: pending", encoding="utf-8")
+    store.update_status(review2_id, review_verdict="pending", review_file=str(rf2),
+                        review_recorded_round=1)
+    scheduler.tick(cfg_release, NOW)
+    review2_status = store.read_status(review2_id)
+    assert review2_status["state"] == "chained"
+    new_review_id = review2_status["successor_id"]
+    new_review = store.load_task(new_review_id)
+    assert new_review["role"] == "review" and new_review["round"] == 1
+    assert new_review["role_shift"] == 1  # 全新会话，不是同角色续班
+
+
+def test_apply_review_no_quota_policy_release_closes_build_window(monkeypatch):
+    """审稿方额度不足、预检直接拦下起跑（还没起窗口）：release 关闭 held
+    着的 build 窗口；hold 什么都不做。"""
+    import nightshift.scheduler as sched
+    fakes = Fakes(monkeypatch)
+    bad_usage = dict(fakes.usage)
+    bad_usage["session_pct"] = 99
+    fakes.usage = bad_usage
+
+    tid = make_review_task(review={
+        "enabled": True, "runner": "claude", "model": "claude-fable-5",
+        "effort": "high", "on_no_quota": "release",
+    }, guards={"session_pct_max": 10, "weekly_pct_max": 95})
+    store.update_status(tid, state="held", window_id="@1", pane_pid=1)
+    review_id = store.create_task({
+        "title": "审稿流水线任务", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": scheduler.to_iso(NOW), "task_text": "正文",
+        "prompt_final": "提示词", "guards": {"session_pct_max": 10, "weekly_pct_max": 95},
+        "review": {"enabled": True, "runner": "claude", "model": "claude-fable-5", "effort": "high",
+                   "on_no_quota": "release"},
+    }, REVIEW_CONFIG)
+    data = store.load_task(review_id)
+    data.update({"role": "review", "round": 1, "role_shift": 1, "parent_id": tid,
+                 "pipeline_id": tid, "shift": 2})
+    store.atomic_write_json(store.task_dir(review_id) / "task.json", data)
+    store.update_status(tid, successor_id=review_id)
+
+    sched.tick(REVIEW_CONFIG, NOW)
+    assert fakes.close_calls == [["@1"]]
+    assert store.read_status(tid)["review_no_quota_released"] is True
+    assert store.read_status(review_id)["state"] == "postponed"
