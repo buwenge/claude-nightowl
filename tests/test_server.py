@@ -989,6 +989,66 @@ def test_stop_background_sends_config_text(authed, monkeypatch):
     assert status == 409
 
 
+def test_task_detail_and_list_expose_background_summary_for_codex(authed, ns_home):
+    from nightshift import background_runner
+    cfg = store.load_config()
+    cfg["runners"] = {
+        "codex": {"bin": "codex", "models": {"gpt-5.6-luna": {"context_limit": None}},
+                  "efforts": ["low", "medium", "high", "xhigh"]},
+    }
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "Codex后台摘要", "project": "demo", "runner": "codex",
+        "model": "gpt-5.6-luna", "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+    })
+    task_id = body["id"]
+    background_runner.modify_registry(task_id, lambda d: d.update({
+        "bg-1": {"state": "running"},
+        "bg-2": {"state": "finished", "notification_state": "pending"},
+        "bg-3": {"state": "finished", "notification_state": "notified"},
+    }))
+    status, _, detail = authed.request("GET", f"/api/tasks/{task_id}")
+    assert status == 200
+    assert detail["background_summary"] == {"running": 1, "finished_pending": 1}
+    assert len(detail["background_items"]) == 3
+
+    status, _, items = authed.request("GET", "/api/tasks")
+    item = next(i for i in items if i["task"]["id"] == task_id)
+    assert item["background_summary"] == {"running": 1, "finished_pending": 1}
+
+    # Claude 任务不该带这个键（没有后台登记簿这个概念）
+    claude_id = make_task(authed, "普通claude任务")
+    status, _, claude_detail = authed.request("GET", f"/api/tasks/{claude_id}")
+    assert "background_summary" not in claude_detail
+
+
+def test_stop_background_codex_uses_background_runner_text(authed, ns_home, monkeypatch):
+    """S6④：Codex 没有 TaskStop，停后台文案要明确指向 background_runner 的 list/stop。"""
+    cfg = store.load_config()
+    cfg["runners"] = {
+        "codex": {"bin": "codex", "models": {"gpt-5.6-luna": {"context_limit": None}},
+                  "efforts": ["low", "medium", "high", "xhigh"]},
+    }
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "Codex停后台", "project": "demo", "runner": "codex",
+        "model": "gpt-5.6-luna", "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+    })
+    assert status == 201, body
+    task_id = body["id"]
+    store.update_status(task_id, state="waiting_background", window_id="@11", pane_pid=1)
+    sent = []
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: sent.append((wid, text)))
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/stop-background")
+    assert status == 200, body
+    assert len(sent) == 1
+    assert "background_runner" in sent[0][1]
+    assert "TaskStop" not in sent[0][1]
+
+
 # ---------- S4.1 必修1/必修3：窗口真存活现查 tmux；事件一行 ----------
 
 

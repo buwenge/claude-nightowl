@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from nightshift import launcher, quota, scheduler, store, worktree
+from nightshift import background_runner, launcher, quota, scheduler, store, worktree
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 NOW = datetime(2026, 8, 27, 18, 0, 0, tzinfo=timezone.utc)
@@ -1481,6 +1481,234 @@ def test_keepalive_codex_25_minutes_claude_50_minutes(monkeypatch):
     at_51 = NOW + timedelta(minutes=51)
     sched.tick(CODEX_CONFIG, at_51)
     assert store.read_status(claude_tid)["keepalive_count"] == 1
+
+
+# ---------- S6④：Codex 后台登记簿核对（F12） ----------
+
+
+def _codex_running_task(monkeypatch, sched, window_id="@1"):
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)))
+    tid = make_task_codex()
+    store.update_status(tid, state="idle", window_id=window_id, pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+    return tid, sent
+
+
+def test_codex_idle_with_running_background_forced_back(monkeypatch):
+    """核心不变量：登记簿里还有 running 项，idle 必须被摁回 waiting_background，
+    不许收尾、不许存档、不许换班。"""
+    import nightshift.scheduler as sched
+    tid, sent = _codex_running_task(monkeypatch, sched)
+    background_runner.modify_registry(tid, lambda d: d.update(
+        {"bg-1": {"state": "running", "background_id": "bg-1"}}
+    ))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "waiting_background"
+    assert sent == []  # 只是纠正状态，不是完成通知，不该敲键
+    assert "chain_checked" not in status  # 没走到 idle-chain 那条路
+
+
+def test_codex_running_background_stale_heartbeat_needs_attention(monkeypatch):
+    """原 wrapper 心跳超时（大概率丢了：那次 exec 的沙箱/PID namespace 没了）：
+    不能让任务永远卡在 waiting_background 等一个再也不会来的完成事件。"""
+    import nightshift.scheduler as sched
+    notices = []
+    monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: notices.append(a))
+    tid, sent = _codex_running_task(monkeypatch, sched)
+    stale_hb = scheduler.to_iso(NOW - timedelta(seconds=200))
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "running", "background_id": "bg-1", "heartbeat_at": stale_hb},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention"
+    assert sent == []  # 不敲错窗口
+    assert len(notices) == 1
+
+    # 重复 tick：同一次心跳超时不许反复告警
+    sched.tick(CODEX_CONFIG, NOW + timedelta(seconds=30))
+    assert len(notices) == 1
+
+
+def test_codex_running_background_fresh_heartbeat_stays_waiting_background(monkeypatch):
+    """心跳新鲜（原 wrapper 还活着、还在正常跑）：不该被误判成丢失。"""
+    import nightshift.scheduler as sched
+    notices = []
+    monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: notices.append(a))
+    tid, sent = _codex_running_task(monkeypatch, sched)
+    fresh_hb = scheduler.to_iso(NOW - timedelta(seconds=2))
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "running", "background_id": "bg-1", "heartbeat_at": fresh_hb},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "waiting_background"
+    assert notices == []
+
+
+def test_codex_running_background_missing_heartbeat_not_treated_as_stale(monkeypatch):
+    """刚起、wrapper 还没来得及写第一次心跳（没有 heartbeat_at 字段）：不能
+    误判成丢失，走正常的 waiting_background 路径。"""
+    import nightshift.scheduler as sched
+    notices = []
+    monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: notices.append(a))
+    tid, sent = _codex_running_task(monkeypatch, sched)
+    background_runner.modify_registry(tid, lambda d: d.update(
+        {"bg-1": {"state": "running", "background_id": "bg-1"}}
+    ))
+    sched.tick(CODEX_CONFIG, NOW)
+    assert store.read_status(tid)["state"] == "waiting_background"
+    assert notices == []
+
+
+def test_codex_background_heartbeat_stale_seconds_config_override(monkeypatch):
+    """`scheduler.background_heartbeat_stale_seconds` 可配置宽限，不是硬编码。"""
+    import nightshift.scheduler as sched
+    notices = []
+    monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: notices.append(a))
+    tid, sent = _codex_running_task(monkeypatch, sched)
+    hb_30s_ago = scheduler.to_iso(NOW - timedelta(seconds=30))
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "running", "background_id": "bg-1", "heartbeat_at": hb_30s_ago},
+    }))
+    tight_config = {
+        **CODEX_CONFIG,
+        "scheduler": {**CODEX_CONFIG["scheduler"], "background_heartbeat_stale_seconds": 10},
+    }
+    sched.tick(tight_config, NOW)
+    # 30 秒前的心跳，宽限只有 10 秒：该判丢失
+    assert store.read_status(tid)["state"] == "needs_attention"
+    assert len(notices) == 1
+
+
+def test_codex_finished_background_notifies_and_marks_once(monkeypatch):
+    import nightshift.scheduler as sched
+    tid, sent = _codex_running_task(monkeypatch, sched)
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "finished", "background_id": "bg-1", "exit_code": 0,
+                 "result_path": "/tmp/x.log", "notification_state": "pending"},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    assert len(sent) == 1
+    assert "bg-1" in sent[0][1] and "/tmp/x.log" in sent[0][1]
+    registry = background_runner.load_registry(tid)
+    assert registry["bg-1"]["notification_state"] == "notified"
+    assert store.read_status(tid)["state"] == "waiting_background"
+
+    # 重复 tick：同一个 completion 不许再敲一次
+    sched.tick(CODEX_CONFIG, NOW + timedelta(seconds=30))
+    assert len(sent) == 1
+
+
+def test_codex_multiple_finished_items_combine_into_one_message(monkeypatch):
+    import nightshift.scheduler as sched
+    tid, sent = _codex_running_task(monkeypatch, sched)
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "finished", "background_id": "bg-1", "exit_code": 0,
+                 "result_path": "/tmp/a.log", "notification_state": "pending"},
+        "bg-2": {"state": "finished", "background_id": "bg-2", "exit_code": 1,
+                 "result_path": "/tmp/b.log", "notification_state": "pending"},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    assert len(sent) == 1  # 合并成一条
+    assert "bg-1" in sent[0][1] and "bg-2" in sent[0][1]
+
+
+def test_codex_finished_plus_still_running_stays_waiting_background(monkeypatch):
+    """有的完成了、有的还在跑：通知完那个完成的，但仍留在 waiting_background。"""
+    import nightshift.scheduler as sched
+    tid, sent = _codex_running_task(monkeypatch, sched)
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "finished", "background_id": "bg-1", "exit_code": 0,
+                 "result_path": "/tmp/a.log", "notification_state": "pending"},
+        "bg-2": {"state": "running", "background_id": "bg-2"},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    assert len(sent) == 1
+    status = store.read_status(tid)
+    assert status["state"] == "waiting_background"
+
+
+def test_codex_background_finished_window_gone_needs_attention(monkeypatch):
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: False)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)))
+    notices = []
+    monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: notices.append(a))
+    tid = make_task_codex()
+    # window_alive False 会先在通用 alive 检查那里判 exited；这里直接单测
+    # _reconcile_codex_background 本体，覆盖"窗口消失"这条防线
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "finished", "background_id": "bg-1", "exit_code": 0,
+                 "result_path": "/tmp/a.log", "notification_state": "pending"},
+    }))
+    status = store.read_status(tid)
+    result = sched._reconcile_codex_background(store.load_task(tid), status, CODEX_CONFIG, NOW, "@1")
+    assert result is not None
+    assert store.read_status(tid)["state"] == "needs_attention"
+    assert sent == []  # 不敲错窗口
+    assert len(notices) == 1
+
+
+def test_codex_background_survives_registry_reread_like_restart(monkeypatch):
+    """"scheduler 重启前后不丢事件"离线等价：只要登记簿在磁盘上，
+    重新读取（模拟进程重启后的冷启动）也能正确核对，不依赖内存态。"""
+    import nightshift.scheduler as sched
+    tid, sent = _codex_running_task(monkeypatch, sched)
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "finished", "background_id": "bg-1", "exit_code": 0,
+                 "result_path": "/tmp/a.log", "notification_state": "pending"},
+    }))
+    # 全新读一遍登记簿（不依赖任何进程内缓存/全局状态）
+    fresh_registry = background_runner.load_registry(tid)
+    assert fresh_registry["bg-1"]["state"] == "finished"
+    sched.tick(CODEX_CONFIG, NOW)
+    assert len(sent) == 1
+    assert background_runner.load_registry(tid)["bg-1"]["notification_state"] == "notified"
+
+
+def test_codex_empty_or_bad_registry_does_not_block_idle_chain(monkeypatch):
+    """没有登记簿/登记簿是空文件：不该拦着正常收尾流程（老式非工作树任务，
+    避免这里被工作树存档点的机制干扰，那不是这条测试要看的东西）。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)))
+    tid = make_task_codex(worktree=False)
+    store.update_status(tid, state="idle", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+    # 没有 background.json：_reconcile 返回 None，交回正常流程
+    sched.tick(CODEX_CONFIG, NOW)
+    assert sent == []
+    status = store.read_status(tid)
+    assert status["state"] == "finished"  # 正常按老式路径收尾，没被拦住
+
+
+def test_codex_working_task_not_disturbed_by_finished_background(monkeypatch):
+    """working 中途不该被后台完成打断——等它自然停到 idle/waiting_background
+    再通知，免得往正在打字的会话里插话。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)))
+    tid = make_task_codex()
+    store.update_status(tid, state="working", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "finished", "background_id": "bg-1", "exit_code": 0,
+                 "result_path": "/tmp/a.log", "notification_state": "pending"},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    assert sent == []
+    assert store.read_status(tid)["state"] == "working"
 
 
 def test_run_forever_reloads_config_each_tick(tmp_path, monkeypatch):

@@ -25,7 +25,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import auth, launcher, quota, scheduler, store, warmup, worktree
+from . import auth, background_runner, launcher, quota, scheduler, store, warmup, worktree
 
 __all__ = ["make_server", "serve_http"]
 
@@ -101,6 +101,12 @@ DEFAULT_STOP_BACKGROUND_TEXT = (
     "来自nightshift：请立刻用 TaskStop 停掉所有后台任务和子 agent，"
     "后台起的命令行进程也一并杀掉，然后停下不要继续。"
 )
+# S6④：Codex 没有 TaskStop，改成让它自己调用 background_runner 的 list/stop
+DEFAULT_CODEX_STOP_BACKGROUND_TEXT = (
+    "来自nightshift：请用 `python3 -m nightshift.background_runner list` "
+    "看一下登记在这个任务下的后台进程，然后逐个用 "
+    "`python3 -m nightshift.background_runner stop <background_id>` 停掉，然后停下不要继续。"
+)
 
 
 def _trigger_text(task: dict) -> str:
@@ -128,6 +134,17 @@ def _tail_lines(path: Path, count: int) -> list[str]:
             return f.read().splitlines()[-count:]
     except OSError:
         return []
+
+
+def _background_summary(task_id: str) -> dict:
+    """S6④：F12 后台项摘要——运行中 / 已完成待通知的数量，给卡片一眼看的数字。"""
+    registry = background_runner.load_registry(task_id)
+    running = sum(1 for r in registry.values() if r.get("state") == "running")
+    finished_pending = sum(
+        1 for r in registry.values()
+        if r.get("state") == "finished" and r.get("notification_state") != "notified"
+    )
+    return {"running": running, "finished_pending": finished_pending}
 
 
 def _version_assets(html: bytes) -> bytes:
@@ -499,6 +516,9 @@ class _Handler(BaseHTTPRequestHandler):
             "chain_template": cfg.get("chain_template", ""),
             "stop_background_text": cfg.get("stop_background_text", ""),
             "stuck_interrupt_text": cfg.get("stuck_interrupt_text", ""),
+            "codex_quota_pause_text": cfg.get("codex_quota_pause_text", ""),
+            "codex_resume_text": cfg.get("codex_resume_text", ""),
+            "codex_stop_background_text": cfg.get("codex_stop_background_text", ""),
             "display_tz_offset_hours": cfg.get("display_tz_offset_hours"),
             # 可选：顶栏"回主站"链接 {"text": "...", "href": "..."}，没配就不显示
             "home_link": (cfg.get("http") or {}).get("home_link"),
@@ -506,7 +526,11 @@ class _Handler(BaseHTTPRequestHandler):
             "warmup_state": warmup.read_state(),
         })
 
-    _TEMPLATE_KEYS = ("prompt_template", "context_warn_text", "quota_pause_text", "quota_wrapup_text", "quota_other_model_text", "chain_template", "stop_background_text", "stuck_interrupt_text")
+    _TEMPLATE_KEYS = (
+        "prompt_template", "context_warn_text", "quota_pause_text", "quota_wrapup_text",
+        "quota_other_model_text", "chain_template", "stop_background_text", "stuck_interrupt_text",
+        "codex_quota_pause_text", "codex_resume_text", "codex_stop_background_text",
+    )
 
     def _api_templates(self) -> None:
         data = self._read_json()
@@ -583,6 +607,8 @@ class _Handler(BaseHTTPRequestHandler):
             item["events_tail"] = _tail_lines(store.task_dir(task_id) / "events.log", 5)
             item["trigger_text"] = _trigger_text(item["task"])
             item["draft"] = self._read_draft(task_id)
+            if item["task"]["runner"] == "codex":
+                item["background_summary"] = _background_summary(task_id)
         return self._send_json(200, items)
 
     def _api_worktrees(self) -> None:
@@ -605,11 +631,15 @@ class _Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError):
             return self._send_json(404, {"error": "任务不存在"})
         task.setdefault("runner", "claude")  # 仅展示；不回写 task.json
-        return self._send_json(200, {
+        out = {
             "task": task,
             "status": store.read_status(task_id),
             "events": _tail_lines(store.task_dir(task_id) / "events.log", 50),
-        })
+        }
+        if task["runner"] == "codex":
+            out["background_summary"] = _background_summary(task_id)
+            out["background_items"] = list(background_runner.load_registry(task_id).values())
+        return self._send_json(200, out)
 
     def _api_create_task(self) -> None:
         data = self._read_json()
@@ -829,16 +859,20 @@ class _Handler(BaseHTTPRequestHandler):
         return self._send_json(200, {"ok": True})
 
     def _api_stop_background(self, task_id: str) -> None:
-        """停后台（S4②）：把 config.stop_background_text 敲进会话窗口。"""
-        if self._load_existing(task_id) is None:
+        """停后台（S4②，S6④ 按 runner 分文案）：Claude 用 config.stop_background_text
+        （TaskStop）；Codex 改成明确调用 background_runner 的 list/stop 能力——
+        Codex 没有 TaskStop 这个概念，裸敲同一句 Claude 文案它根本听不懂。"""
+        task = self._load_existing(task_id)
+        if task is None:
             return
         window_id = self._require_live_window(task_id)
         if window_id is None:
             return
-        text = (
-            store.load_config().get("stop_background_text")
-            or DEFAULT_STOP_BACKGROUND_TEXT
-        )
+        cfg = store.load_config()
+        if (task.get("runner") or "claude") == "codex":
+            text = cfg.get("codex_stop_background_text") or DEFAULT_CODEX_STOP_BACKGROUND_TEXT
+        else:
+            text = cfg.get("stop_background_text") or DEFAULT_STOP_BACKGROUND_TEXT
         launcher.send_keys(window_id, text)
         store.append_event(task_id, "停后台：已敲入停后台文案，让它自己清后台")
         logger.info("网页停后台：%s", task_id)

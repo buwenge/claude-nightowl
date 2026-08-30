@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import launcher, quota, store, warmup, worktree
+from . import background_runner, launcher, quota, store, warmup, worktree
 
 __all__ = ["parse_iso", "to_iso", "tick", "run_forever", "reconcile_worktrees"]
 
@@ -472,6 +472,114 @@ def _check_codex_quota_pause(
     return [f"{task_id} Codex 额度到线，已停下等 {paused_until}"]
 
 
+# ---------- S6④：Codex 后台进程登记簿核对（F12） ----------
+
+
+_BACKGROUND_HEARTBEAT_STALE_SECONDS_DEFAULT = 90
+
+
+def _background_heartbeat_stale(rec: dict, now: datetime, config: dict) -> bool:
+    """wrapper 是前台进程，正常跑的话每 ~1 秒刷一次 heartbeat_at；心跳长期不
+    动多半是原 wrapper/沙箱丢了（比如那次 exec 的 PID namespace 整个没了），
+    不能让任务永远卡在 waiting_background 等一个再也不会来的完成事件。"""
+    hb = rec.get("heartbeat_at")
+    if not hb:
+        return False  # 刚起还没来得及第一次心跳，别误判
+    try:
+        hb_dt = parse_iso(hb)
+    except (ValueError, TypeError):
+        return False
+    sch = config.get("scheduler") or {}
+    grace = sch.get("background_heartbeat_stale_seconds")
+    if grace is None:
+        grace = _BACKGROUND_HEARTBEAT_STALE_SECONDS_DEFAULT
+    return (now - hb_dt).total_seconds() > grace
+
+
+def _reconcile_codex_background(
+    task: dict, status: dict, config: dict, now: datetime, window_id: str
+) -> list[str] | None:
+    """核对这个 codex 任务的后台登记簿（background_runner.py）。
+
+    - 有已完成且未通知的项：核对窗口还在（核不对就 needs_attention + 告警，
+      绝不敲错窗口），对它 send-keys 一次"读取并继续"，标记已通知——同一
+      completion 只敲一次；
+    - 有登记中的 running 项但心跳超时：原 wrapper 大概率丢了（沙箱/窗口没了、
+      进程被杀），转 needs_attention + 单次告警，不能永远卡 waiting_background；
+    - 没有已完成待通知的项、心跳也正常，但还有登记中的 running 项：state 摁回
+      waiting_background（不许 idle/存档/换班），只在真的需要纠正时才动，
+      已经是 waiting_background 就不重复写盘/不短路，好让保活戳照常生效；
+    - 都没有：返回 None，交回调用方按原状态机走（多半是没有后台项，或者
+      后台项都完成且已通知完——那才轮到真正的 idle/收尾）。
+    """
+    task_id = task["id"]
+    registry = background_runner.load_registry(task_id)
+    if not registry:
+        return None
+
+    finished_pending = [
+        r for r in registry.values()
+        if r.get("state") == "finished" and r.get("notification_state") != "notified"
+    ]
+    if finished_pending:
+        if not window_id or not launcher.window_alive(window_id, config):
+            if not status.get("background_attention_noted"):
+                reason = f"{len(finished_pending)} 个后台任务已完成，但窗口已消失，无法通知它继续读取结果"
+                store.update_status(
+                    task_id, state="needs_attention", error=reason,
+                    background_attention_noted=True, last_event_at=to_iso(now),
+                )
+                store.append_event(task_id, f"后台完成但窗口消失 → needs_attention：{reason}")
+                launcher.open_notice_window(task, "(需要人工)", [reason], config)
+            return [f"{task_id} 后台完成但窗口消失 → needs_attention"]
+
+        lines = [
+            f"来自nightshift：后台任务 {r['background_id']} 已结束"
+            f"（exit={r.get('exit_code')}），结果在 {r.get('result_path')}，请读取并继续。"
+            for r in finished_pending
+        ]
+        launcher.send_keys(window_id, "\n".join(lines))
+        ids = [r["background_id"] for r in finished_pending]
+
+        def mark_notified(data: dict) -> None:
+            for bid in ids:
+                rec = data.get(bid)
+                if rec is not None:
+                    rec["notification_state"] = "notified"
+                    rec["notified_at"] = to_iso(now)
+
+        background_runner.modify_registry(task_id, mark_notified)
+        store.append_event(task_id, f"后台完成已通知，已 send-keys 唤醒：{'、'.join(ids)}")
+        if status.get("state") != "waiting_background":
+            store.update_status(task_id, state="waiting_background", last_event_at=to_iso(now))
+        return [f"{task_id} 后台完成，已敲醒继续读取结果：{'、'.join(ids)}"]
+
+    running = [r for r in registry.values() if r.get("state") == "running"]
+    stale = [r for r in running if _background_heartbeat_stale(r, now, config)]
+    if stale:
+        if not status.get("background_attention_noted"):
+            ids = "、".join(r["background_id"] for r in stale)
+            reason = f"{len(stale)} 个后台任务心跳超时（原 wrapper 可能已丢失）：{ids}"
+            store.update_status(
+                task_id, state="needs_attention", error=reason,
+                background_attention_noted=True, last_event_at=to_iso(now),
+            )
+            store.append_event(task_id, f"后台心跳超时 → needs_attention：{reason}")
+            launcher.open_notice_window(task, "(需要人工)", [reason], config)
+        return [f"{task_id} 后台心跳超时 → needs_attention"]
+
+    if running and status.get("state") != "waiting_background":
+        store.update_status(task_id, state="waiting_background", last_event_at=to_iso(now))
+        store.append_event(
+            task_id,
+            f"仍有 {len(running)} 个后台任务在跑，state 摁回 waiting_background"
+            "（不许 idle/存档/换班）",
+        )
+        return [f"{task_id} 后台仍在跑 → waiting_background"]
+
+    return None
+
+
 # ---------- 运行期巡检：working / waiting_background / idle（设计稿 §5.2） ----------
 
 
@@ -517,6 +625,15 @@ def _check_running(
         )
         store.append_event(task_id, "窗口不在了且没等到 SessionEnd → exited(window_gone)")
         return [f"{task_id} 窗口消失 → exited(window_gone)"]
+
+    # S6④：Codex 后台登记簿核对（F12）——只在"看起来干完了/已经在等后台"的
+    # 时候查，working 中途不打扰（正忙着，不该往它嘴里塞话）
+    if (task.get("runner") or "claude") == "codex" and status.get("state") in (
+        "idle", "waiting_background",
+    ):
+        bg_result = _reconcile_codex_background(task, status, config, now, str(window_id))
+        if bg_result is not None:
+            return bg_result
 
     # S4 疑似卡住：working/waiting_background 静默太久（一条前台工具调用里
     # 轮询、轮次不结束、hook 不响）。只标状态与事件，不动会话、不改 state；
