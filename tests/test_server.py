@@ -429,6 +429,96 @@ def test_create_task_worktree_fields(authed):
     assert status == 400
 
 
+# ---------- S6：runner ----------
+
+
+def test_api_config_exposes_runners_compat_view(authed):
+    """base CONFIG 没有 runners 键：/api/config 合成只含 claude 的兼容视图。"""
+    status, _, body = authed.request("GET", "/api/config")
+    assert status == 200
+    assert set(body["runners"]) == {"claude"}
+    assert body["runners"]["claude"]["models"]["claude-fable-5"] == {"context_limit": 500000}
+    assert body["runners"]["claude"]["efforts"] == CONFIG["efforts"]
+
+
+def test_api_config_exposes_codex_runner_when_configured(authed, ns_home):
+    cfg = store.load_config()
+    cfg["runners"] = {
+        "codex": {"bin": "codex", "models": {"gpt-5.6-luna": {"context_limit": None}},
+                  "efforts": ["low", "medium", "high", "xhigh"]},
+    }
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    status, _, body = authed.request("GET", "/api/config")
+    assert status == 200
+    assert set(body["runners"]) == {"claude", "codex"}
+    assert body["runners"]["codex"]["models"] == {"gpt-5.6-luna": {"context_limit": None}}
+    # 顶层老字段（旧前端还在读的）原样保留，没被 runners 抢走
+    assert body["models"]["claude-fable-5"] == {"context_limit": 500000, "usage_label": "Fable"}
+
+
+def test_create_task_codex_runner_rejected_when_not_configured(authed):
+    """base CONFIG 没配 codex：建 codex 任务被 400 拦下，带人话原因。"""
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "该建不成的 codex 任务", "project": "demo", "runner": "codex",
+        "model": "gpt-5.6-luna", "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+    })
+    assert status == 400
+    assert "Codex" in body["error"]
+
+
+def test_create_task_codex_runner_ok_when_configured(authed, ns_home):
+    cfg = store.load_config()
+    cfg["runners"] = {
+        "codex": {"bin": "codex", "models": {"gpt-5.6-luna": {"context_limit": None}},
+                  "efforts": ["low", "medium", "high", "xhigh"]},
+    }
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "Codex 任务", "project": "demo", "runner": "codex",
+        "model": "gpt-5.6-luna", "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+    })
+    assert status == 201, body
+    assert store.load_task(body["id"])["runner"] == "codex"
+
+
+def test_put_task_can_change_runner_when_unrun_not_when_active(authed, ns_home):
+    cfg = store.load_config()
+    cfg["runners"] = {
+        "codex": {"bin": "codex", "models": {"gpt-5.6-luna": {"context_limit": None}},
+                  "efforts": ["low", "medium", "high", "xhigh"]},
+    }
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    task_id = make_task(authed, "未跑改 runner")
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {
+        "runner": "codex", "model": "gpt-5.6-luna", "effort": "high",
+    })
+    assert status == 200, body
+    assert store.load_task(task_id)["runner"] == "codex"
+    # 活跃编辑：runner 不在允许键里，改不了
+    store.update_status(task_id, state="working")
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {"runner": "claude"})
+    assert status == 400
+    assert store.load_task(task_id)["runner"] == "codex"
+
+
+def test_list_tasks_shows_runner_claude_for_legacy_task_without_rewriting(authed, ns_home):
+    """S6 上线前落盘的旧任务没有 runner 字段：列表显示 claude，task.json 不回写。"""
+    task_id = make_task(authed, "旧任务")
+    task = store.load_task(task_id)
+    del task["runner"]
+    store.atomic_write_json(store.task_dir(task_id) / "task.json", task)
+    status, _, body = authed.request("GET", "/api/tasks")
+    assert status == 200
+    item = next(i for i in body if i["task"]["id"] == task_id)
+    assert item["task"]["runner"] == "claude"
+    on_disk = json.loads((store.task_dir(task_id) / "task.json").read_text(encoding="utf-8"))
+    assert "runner" not in on_disk  # 展示归展示，磁盘没被偷偷迁移
+    status, _, detail = authed.request("GET", f"/api/tasks/{task_id}")
+    assert detail["task"]["runner"] == "claude"
+
+
 def test_preview_worktree_instruction(authed, ns_home):
     # {worktree_instruction} 是可选占位符：模板里有才会渲染
     cfg = store.load_config()

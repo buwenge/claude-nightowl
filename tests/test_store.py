@@ -315,8 +315,16 @@ def test_config_example_json_valid():
         "prompt_template",
         "context_warn_text",
         "chain_template",
+        "runners",
     ):
         assert key in config, f"config.example.json 缺键：{key}"
+    for name in ("claude", "codex"):
+        rc = config["runners"][name]
+        assert rc["models"], f"config.runners.{name}.models 不能是空的"
+        assert rc["efforts"], f"config.runners.{name}.efforts 不能是空的"
+    # S6：Codex 模型没有稳定上下文水位来源，必须显式 null，不许猜一个窗口大小
+    for spec in config["runners"]["codex"]["models"].values():
+        assert spec["context_limit"] is None
 
 
 # ---------- S5：worktree / review 字段 ----------
@@ -438,3 +446,158 @@ def test_create_successor_renders_all_placeholders(tmp_path, monkeypatch):
     for piece in ("标题X", "正文Y", "交接Z", "第 2 班", "/home/user/projects/demo", "1000000"):
         assert piece in prompt, piece
     assert "{" not in prompt.replace("{}", "")
+
+
+# ---------- S6：runner 配置、任务字段与兼容层 ----------
+
+RUNNERS_CONFIG = {
+    **CONFIG,
+    "chain_template": "{task} 第 {shift} 班 {handover}",
+    "default_context_limit": 1000000,
+    "runners": {
+        "claude": {
+            "bin": "claude",
+            "models": {"claude-fable-5": {"context_limit": 500000}},
+            "efforts": ["low", "medium", "high", "xhigh", "max"],
+        },
+        "codex": {
+            "bin": "codex",
+            "profile": "nightowl",
+            "models": {"gpt-5.6-luna": {"context_limit": None}},
+            "efforts": ["low", "medium", "high", "xhigh"],
+        },
+    },
+}
+
+
+def test_runner_config_old_config_synthesizes_claude_only():
+    """旧 config（没有 runners 键）：合成只含 claude 的兼容视图，没有 codex。"""
+    old_config = {
+        **CONFIG,
+        "claude_bin": "claude",
+        "probe_model": "claude-haiku-4-5-20251001",
+        "models": {"claude-fable-5": {"context_limit": 500000}},
+    }
+    rc = store.runner_config(old_config)
+    assert set(rc) == {"claude"}
+    assert rc["claude"]["bin"] == "claude"
+    assert rc["claude"]["probe_model"] == "claude-haiku-4-5-20251001"
+    assert rc["claude"]["models"] == {"claude-fable-5": {"context_limit": 500000}}
+    assert rc["claude"]["efforts"] == CONFIG["efforts"]
+
+
+def test_runner_config_new_config_used_as_is():
+    rc = store.runner_config(RUNNERS_CONFIG)
+    assert rc is RUNNERS_CONFIG["runners"]
+    assert set(rc) == {"claude", "codex"}
+
+
+def test_runner_config_codex_only_runners_key_keeps_claude_compat():
+    """runners 里只写了 codex（没写 claude）：claude 仍从顶层兼容合成。"""
+    config = {
+        **CONFIG,
+        "claude_bin": "claude",
+        "models": {"claude-fable-5": {"context_limit": 500000}},
+        "runners": {"codex": RUNNERS_CONFIG["runners"]["codex"]},
+    }
+    rc = store.runner_config(config)
+    assert set(rc) == {"claude", "codex"}
+    assert rc["claude"]["models"] == {"claude-fable-5": {"context_limit": 500000}}
+    assert rc["codex"]["bin"] == "codex"
+
+
+def test_validate_task_default_runner_is_claude():
+    task = make_task()
+    assert "runner" not in task
+    assert store.validate_task(task, RUNNERS_CONFIG) == "time"
+
+
+def test_validate_task_explicit_codex_runner():
+    task = make_task(runner="codex", model="gpt-5.6-luna", effort="high")
+    assert store.validate_task(task, RUNNERS_CONFIG) == "time"
+
+
+def test_validate_task_rejects_unknown_runner_literal():
+    with pytest.raises(ValueError):
+        store.validate_task(make_task(runner="gemini"), RUNNERS_CONFIG)
+
+
+def test_validate_task_rejects_runner_not_configured():
+    """codex 请求了但 config.runners 里没配 codex：报人话错误，不是泛化崩溃。"""
+    with pytest.raises(ValueError, match="Codex"):
+        store.validate_task(make_task(runner="codex", model="x", effort="high"), CONFIG)
+
+
+def test_validate_task_cross_runner_model_rejected():
+    """拿 Claude 的模型给 codex 任务用：按 codex 的模型表校验，直接拒。"""
+    with pytest.raises(ValueError, match="Codex"):
+        store.validate_task(
+            make_task(runner="codex", model="claude-fable-5", effort="high"),
+            RUNNERS_CONFIG,
+        )
+    with pytest.raises(ValueError, match="Claude Code"):
+        store.validate_task(
+            make_task(runner="claude", model="gpt-5.6-luna", effort="high"),
+            RUNNERS_CONFIG,
+        )
+
+
+def test_validate_task_cross_runner_effort_rejected():
+    with pytest.raises(ValueError, match="Codex"):
+        store.validate_task(
+            make_task(runner="codex", model="gpt-5.6-luna", effort="max"),  # codex 没有 max
+            RUNNERS_CONFIG,
+        )
+
+
+def test_validate_task_model_check_skipped_when_models_dict_empty():
+    """旧配置常见：runner 的 models 字典是空的——不拦任意模型名，只保留 effort 校验。"""
+    assert store.validate_task(make_task(model="随便什么模型"), CONFIG) == "time"
+
+
+def test_create_task_defaults_runner_claude_and_persists():
+    tid = store.create_task(make_task(), RUNNERS_CONFIG)
+    assert store.load_task(tid)["runner"] == "claude"
+
+
+def test_create_task_explicit_codex_runner_persists():
+    tid = store.create_task(
+        make_task(runner="codex", model="gpt-5.6-luna", effort="high"), RUNNERS_CONFIG
+    )
+    assert store.load_task(tid)["runner"] == "codex"
+
+
+def test_old_task_json_missing_runner_stays_claude_via_validate():
+    """S6 上线前落盘的旧记录没有 runner 字段：按 claude 解释，不回写不迁移。"""
+    old = {
+        "id": "20250101-000000-eeee", "title": "旧任务", "project": "demo",
+        "model": "claude-fable-5", "effort": "high", "shift": 1,
+        "run_at": "2025-01-01T00:00:00Z", "task_text": "正文",
+        "prompt_final": "提示词", "created_at": "2025-01-01T00:00:00Z",
+        "trigger": {"type": "time"},
+    }
+    d = store.task_dir("20250101-000000-eeee")
+    d.mkdir(parents=True, exist_ok=True)
+    store.atomic_write_json(d / "task.json", old)
+    loaded = store.load_task("20250101-000000-eeee")
+    assert "runner" not in loaded
+    assert store.validate_task(loaded, RUNNERS_CONFIG, task_id=loaded["id"]) == "time"
+
+
+def test_create_successor_copies_runner():
+    parent_id = store.create_task(
+        make_task(runner="codex", model="gpt-5.6-luna", effort="high"), RUNNERS_CONFIG
+    )
+    succ = store.load_task(store.create_successor(
+        store.load_task(parent_id), "交接", RUNNERS_CONFIG))
+    assert succ["runner"] == "codex"
+    # 旧式父任务（缺 runner）：后继也按 claude 解释，不吃别的默认
+    parent2 = make_task()
+    del parent2["run_at"]
+    parent2["run_at"] = "2026-08-27T18:00:00Z"
+    parent2_id = store.create_task(parent2, RUNNERS_CONFIG)
+    task2 = store.load_task(parent2_id)
+    del task2["runner"]  # 模拟 S6 上线前落盘、没有这个字段的旧记录
+    store.atomic_write_json(store.task_dir(parent2_id) / "task.json", task2)
+    succ2 = store.load_task(store.create_successor(task2, "交接", RUNNERS_CONFIG))
+    assert succ2["runner"] == "claude"

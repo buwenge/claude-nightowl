@@ -22,6 +22,7 @@ from .context import context_limit_for
 __all__ = [
     "ConfigMissing",
     "ENDED_STATES",
+    "RUNNERS",
     "STATES",
     "WORKTREE_INSTRUCTION",
     "append_event",
@@ -40,12 +41,18 @@ __all__ = [
     "new_task_id",
     "read_status",
     "render",
+    "runner_config",
+    "runner_label",
     "task_dir",
     "update_status",
     "utc_now_iso",
     "validate_task",
     "worktree_enabled",
 ]
+
+# S6：两家工人。运行时永远只认这两个字面量，config.runners 只提供各自的
+# bin/models/efforts/保活参数，不扩展这个集合。
+RUNNERS = ("claude", "codex")
 
 
 class ConfigMissing(Exception):
@@ -187,6 +194,40 @@ def worktree_enabled(task: dict) -> bool:
     return task.get("worktree") is True
 
 
+def runner_label(runner: str) -> str:
+    """runner 字面量的人话标签，供错误文案/前端展示使用。"""
+    return "Codex" if runner == "codex" else "Claude Code"
+
+
+def runner_config(config: dict) -> dict:
+    """统一 runner 配置视图：{"claude": {...}, "codex": {...}}（codex 键
+    不一定存在——旧配置或没配 codex 时就是没有）。
+
+    - config.runners 存在且含 "claude" 键：直接原样返回（S6 起的新配置）；
+    - 否则（S6 上线前的旧 config，或 runners 只写了 codex 没写 claude）：
+      从顶层 claude_bin/probe_model/models/efforts/scheduler.keepalive_*
+      合成一份只含 claude 的兼容视图，旧配置/旧任务因此原样能跑；
+      若 config.runners 里另外声明了 codex（哪怕没声明 claude），一并纳入。
+    """
+    runners = config.get("runners")
+    sch = config.get("scheduler") or {}
+    compat = {
+        "claude": {
+            "bin": config.get("claude_bin", "claude"),
+            "probe_model": config.get("probe_model"),
+            "models": config.get("models") or {},
+            "efforts": config.get("efforts") or [],
+            "keepalive_idle_minutes": sch.get("keepalive_idle_minutes", 50),
+            "keepalive_text": sch.get("keepalive_text"),
+        }
+    }
+    if isinstance(runners, dict):
+        if "claude" in runners:
+            return runners
+        compat.update(runners)
+    return compat
+
+
 def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> str:
     """校验一个完整任务 dict；不合法抛 ValueError，通过返回归一后的触发类型。
 
@@ -205,6 +246,11 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
     - worktree / review（S5）：worktree 存在必须是布尔值；review 存在必须是
       对象且只认 enabled / merge_policy 两个键，enabled 只能 false
       （联动审稿要到 S7 才开放），merge_policy 只认 manual / auto。
+    - runner（S6）：缺省 claude；只认 RUNNERS 里的字面量；该 runner 必须在
+      config.runners（或旧配置合成的兼容视图）里配置了，否则报人话错误；
+      model / effort 严格限定在这个 runner 自己的 models/efforts 里——
+      不能拿 Claude 的模型表校验 Codex 任务，反之亦然。models 字典为空
+      （旧配置常见）时跳过模型名单校验，只保留原有的 effort 校验。
     """
     for key in _REQUIRED_FIELDS:
         if key == "run_at":
@@ -213,8 +259,19 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
             raise ValueError(f"缺少必填字段：{key}")
     if task["project"] not in config["projects"]:
         raise ValueError(f"project 不在 config.projects 里：{task['project']}")
-    if task["effort"] not in config["efforts"]:
-        raise ValueError(f"effort 不在 config.efforts 里：{task['effort']}")
+
+    runner = task.get("runner") or "claude"
+    if runner not in RUNNERS:
+        raise ValueError(f"runner 只认 {'/'.join(RUNNERS)}：{runner}")
+    rc = runner_config(config).get(runner)
+    if not rc:
+        raise ValueError(f"{runner_label(runner)} 还没在 config.runners 里配置")
+    label = runner_label(runner)
+    if task["effort"] not in (rc.get("efforts") or []):
+        raise ValueError(f"{label} 不支持这个档位：{task['effort']}")
+    models = rc.get("models") or {}
+    if models and task["model"] not in models:
+        raise ValueError(f"{label} 不支持这个模型：{task['model']}")
 
     for key in ("guards", "chain"):
         value = task.get(key)
@@ -288,6 +345,7 @@ def create_task(task: dict, config: dict) -> str:
     """
     data = dict(task)
     data["trigger"] = data.get("trigger") or {"type": "time"}
+    data["runner"] = data.get("runner") or "claude"  # S6：新任务显式落盘缺省值
     if data.get("worktree") is None:
         data["worktree"] = True  # 新任务缺省建树
     validate_task(data, config)  # 先原样校验：review 形状不对在这里报人话错误
@@ -379,6 +437,7 @@ def create_successor(parent_task: dict, handover_text: str | None, config: dict)
     task: dict = {
         "title": parent_task["title"],
         "project": parent_task["project"],
+        "runner": parent_task.get("runner") or "claude",
         "model": parent_task["model"],
         "effort": parent_task["effort"],
         "run_at": utc_now_iso(),

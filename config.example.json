@@ -33,6 +33,44 @@
     "xhigh",
     "max"
   ],
+  "runners": {
+    "claude": {
+      "bin": "claude",
+      "probe_model": "claude-haiku-4-5-20251001",
+      "models": {
+        "claude-fable-5": {
+          "context_limit": 1000000,
+          "usage_label": "Fable"
+        },
+        "claude-opus-5": {
+          "context_limit": 1000000,
+          "usage_label": "Opus"
+        },
+        "claude-sonnet-5": {
+          "context_limit": 1000000,
+          "usage_label": "Sonnet"
+        },
+        "claude-haiku-4-5-20251001": {
+          "context_limit": 200000
+        }
+      },
+      "efforts": ["low", "medium", "high", "xhigh", "max"],
+      "keepalive_idle_minutes": 50,
+      "keepalive_text": "来自nightshift：保活探针——背景任务还在跑吗？简短回一句即可。"
+    },
+    "codex": {
+      "bin": "codex",
+      "profile": "nightowl",
+      "models": {
+        "gpt-5.6-luna": {
+          "context_limit": null
+        }
+      },
+      "efforts": ["low", "medium", "high", "xhigh"],
+      "keepalive_idle_minutes": 25,
+      "keepalive_text": "来自nightshift：保活探针——登记的后台任务还在跑吗？请读取状态后简短回复。"
+    }
+  },
   "guards": {
     "session_pct_max": 80,
     "weekly_pct_max": 95,

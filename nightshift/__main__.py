@@ -74,6 +74,7 @@ def cmd_add(args) -> int:
     task = {
         "title": args.title,
         "project": args.project,
+        "runner": args.runner,
         "model": args.model,
         "effort": args.effort,
         "run_at": run_at,
@@ -238,7 +239,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("add", help="建一个定时任务")
     p.add_argument("--title", required=True, help="任务标题（也是 tmux 窗口名的一部分）")
     p.add_argument("--project", required=True, help="项目名，必须是 config.projects 里的键")
-    p.add_argument("--model", required=True, help="模型名，建议用 config.models 里的键")
+    p.add_argument("--runner", choices=store.RUNNERS, default="claude",
+                   help="用谁施工：claude（默认）或 codex")
+    p.add_argument("--model", required=True, help="模型名，建议用 config.runners.<runner>.models 里的键")
     p.add_argument("--effort", required=True, help="思考档位（config.efforts 之一）")
     p.add_argument("--run-at", required=True,
                    help='本地计划时间，如 "2026-08-28 02:30"')

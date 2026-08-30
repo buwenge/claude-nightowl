@@ -76,7 +76,7 @@ _TERMINAL_STATES = (
 # PUT 编辑允许的键，按状态分级（S4②）
 # 未跑状态（scheduled/postponed/failed/cancelled）：全字段可改
 _EDITABLE_UNRUN = (
-    "title", "project", "model", "effort", "run_at",
+    "title", "project", "runner", "model", "effort", "run_at",
     "task_text", "prompt_final", "guards", "chain", "trigger",
     "worktree", "review",  # S5：没起跑还能改工作树/审稿占位形状
 )
@@ -472,10 +472,23 @@ class _Handler(BaseHTTPRequestHandler):
             }
             for name, spec in (cfg.get("models") or {}).items()
         }
+        runners = {
+            name: {
+                "models": {
+                    mname: {"context_limit": (mspec or {}).get("context_limit")}
+                    for mname, mspec in (rc.get("models") or {}).items()
+                },
+                "efforts": rc.get("efforts") or [],
+            }
+            for name, rc in store.runner_config(cfg).items()
+        }
         return self._send_json(200, {
             "projects": cfg.get("projects") or {},
             "models": models,
             "efforts": cfg.get("efforts") or [],
+            # S6：按 runner 分家的模型/档位，前端"用谁施工"下拉据此换选项；
+            # 旧版前端不认这个键，忽略即可，不影响上面两个兼容字段
+            "runners": runners,
             "guards": cfg.get("guards") or {},
             "chain": cfg.get("chain") or {},
             "prompt_template": cfg.get("prompt_template", ""),
@@ -566,6 +579,7 @@ class _Handler(BaseHTTPRequestHandler):
         items = store.list_tasks()
         for item in items:
             task_id = item["task"]["id"]
+            item["task"].setdefault("runner", "claude")  # 仅展示；不回写 task.json
             item["events_tail"] = _tail_lines(store.task_dir(task_id) / "events.log", 5)
             item["trigger_text"] = _trigger_text(item["task"])
             item["draft"] = self._read_draft(task_id)
@@ -590,6 +604,7 @@ class _Handler(BaseHTTPRequestHandler):
             task = store.load_task(task_id)
         except (OSError, ValueError):
             return self._send_json(404, {"error": "任务不存在"})
+        task.setdefault("runner", "claude")  # 仅展示；不回写 task.json
         return self._send_json(200, {
             "task": task,
             "status": store.read_status(task_id),
@@ -608,6 +623,8 @@ class _Handler(BaseHTTPRequestHandler):
             key: data.get(key)
             for key in ("title", "project", "model", "effort", "run_at", "task_text", "prompt_final")
         }
+        if data.get("runner") is not None:
+            task["runner"] = data["runner"]
         for key in ("guards", "chain", "trigger", "review"):
             if data.get(key) is not None:
                 if not isinstance(data[key], dict):

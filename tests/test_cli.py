@@ -78,6 +78,36 @@ def test_add_prompt_file_gets_runtime_preamble(tmp_path):
     assert written.endswith("自定义全文，没有前言。\n")
 
 
+def test_add_default_runner_is_claude():
+    rc = cli.main(add_args())
+    assert rc == 0
+    task = store.list_tasks()[0]["task"]
+    assert task["runner"] == "claude"
+
+
+def test_add_explicit_codex_runner(tmp_path):
+    config = dict(CONFIG)
+    config["runners"] = {
+        "claude": {"models": CONFIG["models"], "efforts": CONFIG["efforts"]},
+        "codex": {"bin": "codex", "models": {"gpt-5.6-luna": {"context_limit": None}},
+                  "efforts": ["low", "medium", "high", "xhigh"]},
+    }
+    store.atomic_write_json(tmp_path / "config.json", config)
+    rc = cli.main([
+        "add", "--title", "Codex建的", "--project", "demo", "--runner", "codex",
+        "--model", "gpt-5.6-luna", "--effort", "high",
+        "--run-at", "2026-08-30 02:30", "--task-text", "正文",
+    ])
+    assert rc == 0
+    task = store.list_tasks()[0]["task"]
+    assert task["runner"] == "codex"
+
+
+def test_add_bad_runner_rejected_by_argparse():
+    with pytest.raises(SystemExit):
+        cli.main(add_args("--runner", "gemini"))
+
+
 def test_serve_once_runs_reconcile_and_tick():
     """--once 也跑一次启动对账：无孤儿也原子写 orphan_worktrees.json = []。"""
     rc = cli.main(["serve", "--once"])

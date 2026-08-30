@@ -31,6 +31,7 @@ CONFIG = {
     "projects": {"demo": "/home/user/projects/demo"},
     "models": {
         "claude-fable-5": {"context_limit": 500000, "usage_label": "Fable"},
+        "claude-sonnet-5": {"context_limit": 500000, "usage_label": "Sonnet"},
         "claude-haiku-4-5-20251001": {"context_limit": 200000},
     },
     "default_context_limit": 200000,
