@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import background_runner, launcher, quota, store, warmup, worktree
+from . import background_runner, hook, launcher, quota, store, warmup, worktree
 
 __all__ = ["parse_iso", "to_iso", "tick", "run_forever", "reconcile_worktrees"]
 
@@ -493,6 +493,16 @@ def _check_codex_quota_pause(
       本该作废的旧数字先停下再马上因为刷出新数字被恢复；
     - send-keys 真的失败就不能假装已经停下了：不写 waiting_wakeup，留在
       working 让下一 tick 重试。
+
+    S7.2 阻断六：review 角色不能走 build 的这套协议——build 语气的文案不
+    要求 NEXT，`waiting_wakeup` 是 build 专属"自己设了缓存闹钟"语义。
+    role=review 时改用 `hook.DEFAULT_REVIEW_QUOTA_PAUSE_TEXT`（末行要求
+    NEXT: pending），send-keys 成功后**不改 state**（留在 working，等它
+    真的发一个 Stop）——S7.1②已经把 review 的 Stop 统一成"永远转
+    idle"，随后 `_check_review_idle`→`_review_pending` 按 `on_no_quota`
+    接手，跟 Claude 走的是同一条后续路径。只落 `quota_paused_until`（供
+    `_review_hold_resume_eta` 复用这份精确刷新时间）与
+    `quota_pause_count`。
     """
     task_id = task["id"]
     guards = task.get("guards") or {}
@@ -530,12 +540,29 @@ def _check_codex_quota_pause(
     except ValueError:
         paused_until_dt = now + timedelta(hours=5)
     paused_until = to_iso(paused_until_dt)
-    text = store.render(
-        config.get("codex_quota_pause_text") or DEFAULT_CODEX_QUOTA_PAUSE_TEXT,
-        session_left=100 - session_pct,
-        session_line_left=100 - session_max,
-        resets_at=resets_at or "未知时间",
-    )
+    is_review = store.role_of(task) == "review"
+    if is_review:
+        # DEFAULT_REVIEW_QUOTA_PAUSE_TEXT 的 {resets_in} 占位符期待"还有几
+        # 分钟"的整数（跟 hook.py 里 Claude 那份用法一致），不是原始 ISO
+        # 时间戳——`resets_at` 已经在上面被 `parse_iso` 成功解析进
+        # `paused_until_dt`（否则会走 5 小时兜底分支），用它跟 now 的差值
+        # 换算成分钟数，不能直接把 `resets_at` 塞进去。
+        resets_in_val = (
+            max(0, int((paused_until_dt - now).total_seconds() // 60)) if resets_at else None
+        )
+        text = store.render(
+            config.get("review_quota_pause_text") or hook.DEFAULT_REVIEW_QUOTA_PAUSE_TEXT,
+            session_left=100 - session_pct,
+            session_line_left=100 - session_max,
+            resets_in=("未知" if resets_in_val is None else resets_in_val),
+        )
+    else:
+        text = store.render(
+            config.get("codex_quota_pause_text") or DEFAULT_CODEX_QUOTA_PAUSE_TEXT,
+            session_left=100 - session_pct,
+            session_line_left=100 - session_max,
+            resets_at=resets_at or "未知时间",
+        )
     proc = launcher.send_keys(window_id, text)
     if proc.returncode != 0:
         store.append_event(
@@ -544,6 +571,23 @@ def _check_codex_quota_pause(
             f"（returncode={proc.returncode}），未能让它停下，留在 working 下 tick 重试",
         )
         return [f"{task_id} Codex 额度到线但叫停失败"]
+    if is_review:
+        # S7.2 阻断六：不转 waiting_wakeup（build 专属语义）——留在
+        # working，等它真的发一个 Stop（应该带 NEXT: pending），走
+        # S7.1②建好的 review 统一 idle → _check_review_idle →
+        # _review_pending 路径接手，不在这里替它判断。
+        store.update_status(
+            task_id,
+            quota_paused_until=paused_until,
+            quota_pause_count=int(status.get("quota_pause_count") or 0) + 1,
+            last_event_at=to_iso(now),
+        )
+        store.append_event(
+            task_id,
+            f"Codex review 五小时额度到线（{session_pct}%）→ 已要求当场 NEXT:pending，"
+            f"约 {paused_until} 后可恢复",
+        )
+        return [f"{task_id} Codex review 额度到线，已要求 pending"]
     store.update_status(
         task_id,
         state="waiting_wakeup",
@@ -736,6 +780,33 @@ def _check_running(
 ) -> list[str]:
     task_id = task["id"]
 
+    # S7.2 兼容尾巴 2：coordinator 身份核验。`pipeline_id_of(task)` 算出的
+    # coordinator id 如果不是自身，必须真的对应一个存在的 task（有
+    # task.json）——核验不过就 fail-closed 到 needs_attention，不能让后面
+    # 任何 `_update_coordinator()`/`_coordinator_status()` 调用（散布在
+    # 审稿流水线各处：`_hold_blocks`/`_start_review_round`/`_review_fix`/
+    # `_review_done`/`_reconcile_stale_fix_intent` 等）凭空建出只有
+    # status.json、没有 task.json 的"幽灵 coordinator"目录。放在整个函数
+    # 最开头，早于 R1 存活判断与任何角色分支逻辑。
+    coordinator_id = store.pipeline_id_of(task)
+    if coordinator_id != task_id:
+        try:
+            store.load_task(coordinator_id)
+        except (OSError, ValueError):
+            reason = f"pipeline_id 指向的 coordinator 任务 {coordinator_id} 不存在，链路损坏"
+            already_flagged = (
+                status.get("state") == "needs_attention" and status.get("error") == reason
+            )
+            if not already_flagged:
+                store.update_status(
+                    task_id, state="needs_attention", error=reason, last_event_at=to_iso(now)
+                )
+                store.append_event(task_id, reason)
+            if not status.get("coordinator_broken_noted"):
+                launcher.open_notice_window(task, "(需要人工)", [reason], config)
+                store.update_status(task_id, coordinator_broken_noted=True)
+            return [f"{task_id} coordinator 链路损坏 → needs_attention"]
+
     # R1 兜底：run.sh 写了 exit_code 就是 claude 死透（SessionEnd hook 超时/
     # 被杀没来的情形）；窗口还在也只是 read 留窗的假象。SessionEnd 正常时
     # 它会先把 state 写成 exited，轮不到这条。
@@ -903,8 +974,21 @@ def _check_running(
     # 刷新时间一到敲一句让它继续；Codex 没有自己定闹钟的能力，闹钟到点
     # 后必须由调度器主动敲，不能"等它自己醒"。刷新时间没到之前 idle
     # 也不算干完，不许收尾/续班
+    # S7.2 阻断六（自查补充）：这段是 build 专属的"五小时线自己设了缓存
+    # 闹钟，刷新时间到了主动敲它继续"协议。review 角色不用它——
+    # `_check_codex_quota_pause` 现在给 review 发的是要求 NEXT:pending 的
+    # 文案且不改 state，review 后续的 Stop 会把 state 转回 idle 但
+    # `quota_paused_until` 仍然留着；如果不排除 review，这里会在
+    # `_check_review_idle` 之前抢先拦截，轻则让已经落盘的 pending verdict
+    # 迟迟得不到路由，重了到点还会往 review 窗口发一句 build 语气的"请继续"
+    # （不是 review 的 NEXT 协议），产生跟阻断六同一类的误判。review 的
+    # idle+quota_paused_until 场景交给下面的 `_check_review_idle` 与专属
+    # hold 恢复分支处理，不进这段。
     paused_until = status.get("quota_paused_until")
-    if paused_until and status.get("state") in ("idle", "waiting_wakeup"):
+    if (
+        paused_until and status.get("state") in ("idle", "waiting_wakeup")
+        and store.role_of(task) != "review"
+    ):
         if now < parse_iso(paused_until):
             return []
         codex_waiting_wakeup = (
@@ -1577,10 +1661,17 @@ def _review_done(review_task: dict, config: dict, now: datetime) -> list[str]:
     会摸错任务、build 永久 held 泄漏窗口/保活。
 
     S7.1 阻断六：叫停 build 的 send-keys 若失败，不能假装它已经停了——build
-    标 needs_attention（而不是 chained），让人工确认那扇仍可能在跑的窗口，
-    不悄悄放过随后可能发生的合并/删树风险。review 自己该走的
-    `_finalize_done` 仍然照常走（审稿通过是既成事实，不因为"敲个招呼没敲
-    成功"而回滚）。
+    标 needs_attention（而不是 chained），让人工确认那扇仍可能在跑的窗口。
+
+    S7.2 阻断七：停工失败时以前 build 虽然标了 needs_attention，但函数末尾
+    仍无条件调用 `_finalize_done`——auto 策略会继续 merge/清树，跟那扇
+    "可能还在跑"的施工窗口打架（它要是真还在写文件，工作树在合并/清理时
+    被改动就是数据损坏）。改成停工失败时 review 自己也转
+    needs_attention、**不调用** `_finalize_done`，直接 return，把收尾
+    整个暂停下来等人工确认。"停工成功"的定义就是"send-keys 返回码为
+    0"——不引入等 SessionEnd/窗口消失确认的新机制（那是更大的架构改动，
+    这次范围内不做，明确写在这里：这是选择，不是遗漏）。只有确认成功
+    （或者本来就没有活着的 build 需要停）才继续走 `_finalize_done`。
     """
     task_id = review_task["id"]
     current = _current_build(review_task)
@@ -1599,16 +1690,26 @@ def _review_done(review_task: dict, config: dict, now: datetime) -> list[str]:
             else:
                 store.append_event(parent_id, "审稿已通过（NEXT: done），已敲停施工班")
         if stop_failed:
-            reason = "审稿已通过，但没能让仍在跑的施工窗口停下（send-keys 失败），请手动确认/关闭"
+            build_reason = "审稿已通过，但没能让仍在跑的施工窗口停下（send-keys 失败），请手动确认/关闭"
             store.update_status(
-                parent_id, state="needs_attention", error=reason, last_event_at=to_iso(now)
+                parent_id, state="needs_attention", error=build_reason, last_event_at=to_iso(now)
             )
-            store.append_event(parent_id, reason)
-            launcher.open_notice_window(parent_task, "(需要人工)", [reason], config)
-        else:
+            store.append_event(parent_id, build_reason)
+            launcher.open_notice_window(parent_task, "(需要人工)", [build_reason], config)
+            # S7.2 阻断七：不能继续 finalize——那扇窗口可能还在写代码，
+            # auto 策略的自动合并/清树会跟它打架。review 自己也转
+            # needs_attention，整条流水线的收工暂停在这里等人工确认。
+            review_reason = "审稿已通过，但没能让仍在跑的施工窗口停下，暂缓自动收尾直到人工确认"
             store.update_status(
-                parent_id, state="chained", successor_id=task_id, last_event_at=to_iso(now)
+                task_id, state="needs_attention", error=review_reason, last_event_at=to_iso(now)
             )
+            _update_coordinator(review_task, pipeline_phase="stop_failed")
+            store.append_event(task_id, review_reason)
+            launcher.open_notice_window(review_task, "(需要人工)", [review_reason], config)
+            return [f"{task_id} 审稿通过但停工未确认成功 → 暂缓收尾，需人工确认"]
+        store.update_status(
+            parent_id, state="chained", successor_id=task_id, last_event_at=to_iso(now)
+        )
     _update_coordinator(review_task, pipeline_phase="done")
     store.append_event(task_id, "审稿通过（NEXT: done）")
     return _finalize_done(review_task, config, now)
@@ -1696,31 +1797,41 @@ def _reconcile_stale_fix_intent(task: dict, config: dict, now: datetime) -> list
     重新走一遍正常流程，也不能自动重发（会造成双份返工提示，同一条意见
     在窗口里出现两次）。一律 fail-closed 到 needs_attention，把 intent
     原样留在 coordinator 上当审计证据，人工核对 build 实际进度（看它的
-    tmux 面板/round 是否已经推进）后手动清理再继续。只在第一次发现时
-    落盘、开提醒窗，后续 tick 安静跳过，不重复刷屏。
+    tmux 面板/round 是否已经推进）后手动清理再继续。
 
-    只查真存在的 coordinator（`_coordinator_status` 内部就是
-    `store.read_status`，coordinator 不存在时返回空 dict，`get` 拿不到
-    intent，天然不会误判）；没有 intent 时返回 None，调用方按正常流程继续。
+    协调者自查补充：build 与 review 是同一条 pipeline 里两个独立的任务，
+    都会各自调用到这个函数（只要它们各自处于活跃状态、被 `_check_running`
+    巡检到）。"要不要开新的提醒窗口"（全局只应该做一次，用
+    `pending_fix_intent_noted` 控制）与"要不要把**这一个**任务自己标成
+    needs_attention"（应该对每一个被巡检到、受影响的任务都做，天然幂等、
+    不产生新副作用）是两件不同的事——早期版本把两者绑在一起，导致同一
+    tick/后续 tick 里第二个被处理到的任务（先到的那个已经把
+    `pending_fix_intent_noted` 置位）直接安静跳过、自己的 state 从头到尾
+    没被设过 needs_attention，操作者盯着这一个任务的卡片完全看不出异常。
+    改成分开判断：状态字段每次都按需补齐（已经是 needs_attention 且原因
+    一致就不重复写），提醒窗口仍然只开一次。
     """
     coordinator = _coordinator_status(task)
     intent = coordinator.get("pending_fix_intent")
     if not intent:
         return None
     task_id = task["id"]
-    if coordinator.get("pending_fix_intent_noted"):
-        return []  # 已经告警过，安静等人处理
     reason = (
         f"上一次返工投递在写盘中途被打断（{intent!r}），消息可能已经送达施工"
         "会话，不自动重发——请人工核对 build 实际进度（tmux 面板/round 是否"
         "已推进），确认后手动清掉这份 pending_fix_intent 再继续"
     )
-    store.update_status(
-        task_id, state="needs_attention", error=reason, last_event_at=to_iso(now)
-    )
-    store.append_event(task_id, reason)
-    launcher.open_notice_window(task, "(需要人工)", [reason], config)
-    _update_coordinator(task, pending_fix_intent_noted=True)
+    already_flagged = (
+        task_status := store.read_status(task_id)
+    ).get("state") == "needs_attention" and task_status.get("error") == reason
+    if not already_flagged:
+        store.update_status(
+            task_id, state="needs_attention", error=reason, last_event_at=to_iso(now)
+        )
+        store.append_event(task_id, reason)
+    if not coordinator.get("pending_fix_intent_noted"):
+        launcher.open_notice_window(task, "(需要人工)", [reason], config)
+        _update_coordinator(task, pending_fix_intent_noted=True)
     return [f"{task_id} 上一次返工投递中断，未收口 → needs_attention（不自动重发）"]
 
 

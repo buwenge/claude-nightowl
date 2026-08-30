@@ -1783,6 +1783,62 @@ def test_pipeline_skip_review_requires_checkpointed_held_build(authed):
     assert status == 409
 
 
+def test_pipeline_skip_review_rejects_any_started_review_not_only_working(authed):
+    """S7.2 阻断八：以前只拦 review==working；review 已经起跑过、或已经有
+    verdict 落盘的任何一种状态（launching/waiting_background/
+    waiting_wakeup/held/idle）都不该被放行继续跳过——跳过的意义只在
+    "review 压根还没起跑"（scheduled/postponed）。"""
+    for state in ("launching", "waiting_background", "waiting_wakeup", "held", "idle"):
+        build_id, review_id = make_review_pipeline(authed, review_state=state)
+        status, _, body = authed.request("POST", f"/api/tasks/{build_id}/skip-review")
+        assert status == 409, f"review_state={state} 应该被拒绝，实际 {status} {body}"
+        assert store.read_status(review_id)["state"] == state  # 没被悄悄取消
+
+
+def test_pipeline_skip_review_merge_failure_returns_non_2xx(authed):
+    """S7.2 阻断八：跳过审稿后自动合并没成功时，响应不能还是
+    `200 + ok:true`（只在第二个字段 merge_ok 里说真话）——状态码要用 409，
+    `ok` 字段本身必须是 false，客户端读第一个字段就能判断出失败。"""
+    build_id, review_id = make_review_pipeline(authed, review_state="scheduled")
+    build_task = store.load_task(build_id)
+    build_task["review"] = {**build_task["review"], "merge_policy": "auto"}
+    store.atomic_write_json(store.task_dir(build_id) / "task.json", build_task)
+    # CONFIG 里 demo 项目路径是假的（/home/user/projects/demo，不存在），
+    # 自动合并必然失败，走 _finalize_done 的 needs_attention 分支。
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/skip-review")
+    assert status == 409, body
+    assert body["ok"] is False
+    assert body["merge_ok"] is False
+    assert store.read_status(build_id)["state"] == "needs_attention"
+
+
+def test_pipeline_keepalive_partial_failure_reports_207(authed, monkeypatch):
+    """S7.2 阻断八：keepalive 的多目标写盘不是真正的跨文件事务——某个目标
+    写失败时不能假装全部成功，响应要如实列出成功/失败的目标，状态码用
+    207（部分成功）。"""
+    build_id, review_id = make_review_pipeline(authed, review_state="waiting_background")
+    # build 默认就是 held；review 摆成 waiting_background——两者都落在
+    # keepalive 的目标状态集合里，才能真的同时命中两个目标做部分失败。
+
+    real_update_status = store.update_status
+    failed_id = review_id
+
+    def flaky_update_status(task_id, **fields):
+        if task_id == failed_id and "keepalive_paused" in fields:
+            raise OSError("模拟磁盘写失败")
+        return real_update_status(task_id, **fields)
+
+    monkeypatch.setattr(store, "update_status", flaky_update_status)
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{build_id}/keepalive", {"paused": True}
+    )
+    assert status == 207, body
+    assert body["ok"] is False
+    assert failed_id in body["failed_targets"]
+    assert build_id in body["paused_targets"]
+    assert store.read_status(build_id)["keepalive_paused"] is True
+
+
 def test_pipeline_fix_now_with_instruction_advances_round(authed, monkeypatch):
     build_id, review_id = make_review_pipeline(authed, review_state="idle")
     monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)

@@ -317,14 +317,18 @@ def review_config(task: dict, config: dict) -> dict:
     merge_policy = pick("merge_policy")
     # S7.1 非阻断尾巴：坏值就地报出人话原因，不要让它一路传到 scheduler
     # 里某个 int(...)/字符串比较才炸——那时完全看不出是哪份配置的问题。
-    try:
-        max_rounds_int = int(max_rounds)
-    except (TypeError, ValueError):
-        raise ConfigInvalid(
-            f"review.max_rounds 必须是正整数，读到 {max_rounds!r}"
-        ) from None
-    if max_rounds_int <= 0:
+    # S7.2 兼容尾巴 1：改用跟 `validate_task`（本文件里同名字段的任务级
+    # 校验）完全一致的严格口径——`int(max_rounds)` 会悄悄接受
+    # `True`（bool 是 int 子类）、`1.5`（截断成 1）、`"5"`（数字字符串）
+    # 这类不该通过的值；config.review 是直接从 config.json 反序列化，没有
+    # 经过 create_task 时的 validate_task 把关，必须在这里同样严格。
+    if (
+        isinstance(max_rounds, bool)
+        or not isinstance(max_rounds, int)
+        or max_rounds <= 0
+    ):
         raise ConfigInvalid(f"review.max_rounds 必须是正整数，读到 {max_rounds!r}")
+    max_rounds_int = max_rounds
     if on_no_quota not in ON_NO_QUOTA_VALUES:
         raise ConfigInvalid(
             f"review.on_no_quota 只认 {'/'.join(ON_NO_QUOTA_VALUES)}，读到 {on_no_quota!r}"

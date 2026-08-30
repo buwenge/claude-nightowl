@@ -1481,6 +1481,121 @@ def test_codex_working_over_session_line_sends_pause_and_waits(monkeypatch):
     assert len(sent) == 1
 
 
+def test_codex_review_over_session_line_uses_review_text_and_stays_working(monkeypatch):
+    """S7.2 阻断六：Codex review 撞五小时线不能走 build 那套协议——旧写法
+    发的是 build 语气文案（不要求 NEXT）且转 build 专属的 waiting_wakeup，
+    review 随后真的发 Stop 时因为没有合法 NEXT 会被 `_parse_review_verdict`
+    判协议缺失、保守转成 fix（把额度暂停误判成代码审查退回）。改法：
+    role=review 时发 review 语气文案（要求 NEXT: pending）、send-keys 成功
+    后不改 state（留在 working，等它真的发 Stop）。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(
+        sched.launcher, "send_keys",
+        lambda w, t: sent.append(t) or subprocess.CompletedProcess([], 0),
+    )
+    tid = store.create_task({
+        "title": "codex 审稿", "project": "demo", "runner": "codex",
+        "model": "gpt-5.6-luna", "effort": "high", "run_at": scheduler.to_iso(NOW),
+        "task_text": "正文", "prompt_final": "提示词",
+        "guards": {"session_pct_max": 80, "weekly_pct_max": 95},
+        "review": {"enabled": True, "runner": "codex", "model": "gpt-5.6-luna", "effort": "high"},
+    }, CODEX_CONFIG)
+    data = store.load_task(tid)
+    data["role"] = "review"
+    store.atomic_write_json(store.task_dir(tid) / "task.json", data)
+    quota.write_quota_runner("codex", {
+        "usage": {"session_pct": 85, "session_resets": "2026-08-27T20:00:00Z",
+                  "week_all_pct": 1, "per_model": {}},
+        "fetched_at": scheduler.to_iso(NOW), "error": None,
+    })
+    store.update_status(tid, state="working", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "working"  # 不转 build 专属的 waiting_wakeup
+    assert status["quota_paused_until"] == "2026-08-27T20:00:00Z"
+    assert len(sent) == 1
+    assert "NEXT: pending" in sent[0]
+    assert "缓存闹钟" not in sent[0] and "ScheduleWakeup" not in sent[0]
+
+    # 随后模拟它真的回复 NEXT:pending（走 S7.1②建好的 review 统一 idle →
+    # _check_review_idle → _review_pending 路径，不再被 parser 判协议缺失）
+    review_file = store.task_dir(tid) / "review-1.md"
+    review_file.write_text("额度到线，没看完。\n\nNEXT: pending", encoding="utf-8")
+    store.update_status(
+        tid, state="idle", review_verdict="pending", review_verdict_final=False,
+        review_file=str(review_file), review_recorded_round=1,
+    )
+    sched.tick(CODEX_CONFIG, NOW)
+    after = store.read_status(tid)
+    # 默认 on_no_quota=release：另起同轮审稿，不是被当 fix 误判返工
+    assert after["state"] == "chained"
+    new_review = store.load_task(after["successor_id"])
+    assert new_review["role"] == "review" and new_review["round"] == 1
+
+
+def test_codex_review_over_session_line_then_pending_hold_resumes(monkeypatch):
+    """S7.2 阻断六后续：on_no_quota=hold 场景下，Codex review 五小时线
+    → NEXT:pending → held，_review_hold_resume_eta 应该优先复用
+    `_check_codex_quota_pause` 已经落盘的精确 `quota_paused_until`（不是
+    自己另估一个），到点能被 review 专属恢复文案叫醒。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(
+        sched.launcher, "send_keys",
+        lambda w, t: sent.append(t) or subprocess.CompletedProcess([], 0),
+    )
+    cfg = dict(CODEX_CONFIG)
+    cfg["review"] = {"max_rounds": 5, "on_no_quota": "hold", "merge_policy": "manual"}
+    tid = store.create_task({
+        "title": "codex 审稿 hold", "project": "demo", "runner": "codex",
+        "model": "gpt-5.6-luna", "effort": "high", "run_at": scheduler.to_iso(NOW),
+        "task_text": "正文", "prompt_final": "提示词",
+        "guards": {"session_pct_max": 80, "weekly_pct_max": 95},
+        "review": {"enabled": True, "runner": "codex", "model": "gpt-5.6-luna", "effort": "high",
+                   "on_no_quota": "hold"},
+    }, cfg)
+    data = store.load_task(tid)
+    data["role"] = "review"
+    store.atomic_write_json(store.task_dir(tid) / "task.json", data)
+    quota.write_quota_runner("codex", {
+        "usage": {"session_pct": 85, "session_resets": "2026-08-27T20:00:00Z",
+                  "week_all_pct": 1, "per_model": {}},
+        "fetched_at": scheduler.to_iso(NOW), "error": None,
+    })
+    store.update_status(tid, state="working", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+    sched.tick(cfg, NOW)
+    paused_until = store.read_status(tid)["quota_paused_until"]
+    assert paused_until == "2026-08-27T20:00:00Z"
+
+    review_file = store.task_dir(tid) / "review-1.md"
+    review_file.write_text("额度到线，没看完。\n\nNEXT: pending", encoding="utf-8")
+    store.update_status(
+        tid, state="idle", review_verdict="pending", review_verdict_final=False,
+        review_file=str(review_file), review_recorded_round=1,
+    )
+    sched.tick(cfg, NOW)
+    held_status = store.read_status(tid)
+    assert held_status["state"] == "held"
+    # _review_hold_resume_eta 复用了已经精确落盘的 quota_paused_until，
+    # 不是另估一个模糊值
+    assert held_status["quota_paused_until"] == paused_until
+
+    after_refresh = datetime(2026, 8, 27, 20, 5, tzinfo=timezone.utc)
+    sched.tick(cfg, after_refresh)
+    resumed = store.read_status(tid)
+    assert resumed["state"] == "working"
+    assert resumed["review_awaiting_verdict"] is True
+    assert len(sent) == 2  # 第一次五小时线提醒 + 这次恢复
+    assert "NEXT: pending" not in sent[-1] or "继续" in sent[-1]  # 恢复文案要求继续审稿
+
+
 def test_codex_waiting_wakeup_actively_woken_unlike_claude(monkeypatch):
     """S6③ 核心行为差异：Claude 的 waiting_wakeup 等它自己醒（不敲）；
     Codex 没有这个能力，到点必须调度器主动敲，只敲一次。"""
@@ -2278,6 +2393,50 @@ def test_review_pipeline_fix_opens_new_build_when_held_window_gone(monkeypatch):
     assert any(build2_id in a for a in actions)
 
 
+def test_review_done_stop_build_failure_blocks_finalize(tmp_path, monkeypatch):
+    """S7.2 阻断七：审稿通过（NEXT: done）但叫停仍在跑的 build 失败
+    （send-keys 返回非零）时，以前 build 虽然被标 needs_attention，但函数
+    末尾仍无条件调用 `_finalize_done`——auto 策略会继续 merge/清树，跟那扇
+    "可能还在跑"的施工窗口打架。改法：停工失败时 review 自己也转
+    needs_attention，`_finalize_done` 一次都不该被调用（不是看返回值猜，
+    用 monkeypatch 替身直接断言调用次数为 0）。"""
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _review_config_for(proj)
+    tid = make_review_task()
+    _register_tree(proj, tid, "审稿流水线任务")
+    _go_idle(tid, window_id="@1")
+    _write_handover(tid, "写完了。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    review_id = store.read_status(tid)["successor_id"]
+
+    finalize_calls: list[str] = []
+    monkeypatch.setattr(
+        scheduler, "_finalize_done",
+        lambda task, *a, **k: finalize_calls.append(task["id"]) or [],
+    )
+    monkeypatch.setattr(
+        launcher, "send_keys",
+        lambda w, t: subprocess.CompletedProcess([], 1, "", "send-keys 失败"),
+    )
+    _go_idle(review_id, window_id="@2")
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("都过了。\n\nNEXT: done", encoding="utf-8")
+    store.update_status(review_id, review_verdict="done", review_file=str(review_file),
+                        review_recorded_round=1)
+    scheduler.tick(cfg, NOW)
+
+    assert finalize_calls == []  # 一次都没被调用，不是被调用后返回失败
+    build_status = store.read_status(tid)
+    assert build_status["state"] == "needs_attention"
+    assert "停下" in build_status["error"]
+    review_status = store.read_status(review_id)
+    assert review_status["state"] == "needs_attention"
+    assert "暂缓" in review_status["error"]
+    # 两边各自开过一次提醒窗（build 一次 + review 一次）
+    assert len(fakes.notice_calls) == 2
+
+
 def test_review_pipeline_round_limit_needs_confirmation_then_continue(tmp_path, monkeypatch):
     """max_rounds=1：第一次 fix 必须允许恰好一次返工；第二次 fix 到线告警，
     "继续"（round_limit_override）再放一轮。"""
@@ -2594,6 +2753,86 @@ def test_review_pipeline_mixed_cc_build_codex_review(tmp_path, monkeypatch):
     assert build_status2["state"] == "working"
     assert store.load_task(tid)["round"] == 2
     assert store.effective_runner(store.load_task(tid)) == "claude"
+
+
+def test_review_pipeline_codex_build_claude_review_full_cycle(tmp_path, monkeypatch):
+    """S7.2 兼容尾巴 3：验收单曾把
+    `test_tick_refreshes_both_runners_when_codex_build_held_claude_review_working`
+    当成"Codex build → Claude review 组合的端到端覆盖"，但那条测试造的是两个
+    完全不相干的独立任务（没有共同 pipeline_id/parent_id），只测了 tick()
+    额度刷新的收集逻辑，从没真正走过一条 Codex 施工→Claude 审稿的流水线。
+    这里补一条真正的端到端：起跑→build 收工→Claude 审稿→fix 原地捎话返工
+    （Codex build 复用，shift 单调领号）→第二轮 done→manual 收工
+    awaiting_merge，全程 build 顶层/effective runner 恒为 codex、review 的
+    effective runner 恒为 claude，两家额度分片各自独立被查。"""
+    fakes = Fakes(monkeypatch)
+    monkeypatch.setattr(quota, "fetch_usage_codex", lambda config, timeout=15.0: dict(fakes.usage))
+    proj = _make_repo(tmp_path)
+    cfg = dict(REVIEW_CODEX_CONFIG)
+    cfg["projects"] = {"demo": str(proj), "other": str(proj / "nope")}
+    tid = store.create_task({
+        "title": "codex 施工 claude 审稿", "project": "demo", "runner": "codex",
+        "model": "gpt-5.6-luna", "effort": "high", "run_at": scheduler.to_iso(NOW),
+        "task_text": "正文", "prompt_final": "提示词",
+        "review": {"enabled": True, "runner": "claude", "model": "claude-fable-5", "effort": "high"},
+    }, cfg)
+    build1_shift = store.load_task(tid)["shift"]
+    wt = _register_tree(proj, tid, "codex 施工 claude 审稿")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "写完了。\nNEXT: done")
+
+    scheduler.tick(cfg, NOW)
+    build_status = store.read_status(tid)
+    assert build_status["state"] == "held"
+    review_id = build_status["successor_id"]
+    review_task = store.load_task(review_id)
+    assert review_task["role"] == "review"
+    assert review_task["runner"] == "codex"  # 顶层仍是这条流水线的建造配方
+    assert store.effective_runner(review_task) == "claude"  # 但这一班真正用 claude
+    assert store.load_task(review_id)["shift"] > build1_shift  # 单调
+
+    review_task["run_at"] = scheduler.to_iso(NOW)
+    store.atomic_write_json(store.task_dir(review_id) / "task.json", review_task)
+    scheduler.tick(cfg, NOW)
+    review_status = store.read_status(review_id)
+    assert review_status["state"] == "launching"
+    assert review_status["quota_at_launch"]["quota_source"] == "claude"
+    assert fakes.launch_calls == [review_id]  # build 仍 held，同 pipeline 互斥没有拦住对侧起跑
+
+    # 审稿退回：build（codex）仍 held → 原地捎话返工
+    _go_idle(review_id, window_id="@2")
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("退回。\n\nNEXT: fix", encoding="utf-8")
+    store.update_status(review_id, review_verdict="fix", review_file=str(review_file),
+                        review_recorded_round=1)
+    scheduler.tick(cfg, NOW)
+    build_status2 = store.read_status(tid)
+    assert build_status2["state"] == "working"
+    build_task2 = store.load_task(tid)
+    assert build_task2["round"] == 2
+    assert store.effective_runner(build_task2) == "codex"
+    assert build_task2["shift"] > store.load_task(review_id)["shift"]
+
+    # 第二轮通过：manual 收工 awaiting_merge
+    (wt / "canary.txt").write_text("r1\nr2\n", encoding="utf-8")
+    _go_idle(tid, window_id="@1")
+    _write_handover(tid, "第二轮写完了。\nNEXT: done", shift=build_task2["shift"])
+    scheduler.tick(cfg, NOW)
+    review2_id = store.read_status(tid)["successor_id"]
+    review2_task = store.load_task(review2_id)
+    review2_task["run_at"] = scheduler.to_iso(NOW)
+    store.atomic_write_json(store.task_dir(review2_id) / "task.json", review2_task)
+    scheduler.tick(cfg, NOW)
+
+    _go_idle(review2_id, window_id="@3")
+    review_file2 = store.task_dir(review2_id) / "review-2.md"
+    review_file2.write_text("都过了。\n\nNEXT: done", encoding="utf-8")
+    store.update_status(review2_id, review_verdict="done", review_file=str(review_file2),
+                        review_recorded_round=2)
+    scheduler.tick(cfg, NOW)
+    assert store.read_status(review2_id)["state"] == "awaiting_merge"
+    assert store.read_status(tid)["state"] == "chained"
 
 
 def test_review_pipeline_codex_build_codex_review_full_cycle(tmp_path, monkeypatch):
@@ -2945,18 +3184,25 @@ def _setup_fix_intent_pipeline(tmp_path, monkeypatch):
 
 
 def _assert_fix_intent_reconciled_safely(fakes, cfg, tid, review_id, before_send_keys_count):
-    """5 个切点共用的断言：这一 tick 不重发/不新起返工，且第二次 tick 不
-    重复告警（只在第一次发现时开一次提醒窗）。"""
+    """5 个切点共用的断言：这一 tick 不重发/不新起返工，build 与 review
+    两边**都**要显示告警（不是只有先被 `_check_running` 巡检到的那一个），
+    且第二次 tick 不重复告警（提醒窗口只开一次，但两边的 state 各自持续
+    保持 needs_attention）。
+
+    协调者自查补充：早期版本这里用的是 or 不是 and——只要求"build 或
+    review 有一个转 needs_attention 就行"，掩盖了"提醒窗口只开一次"跟
+    "把这个任务自己标成 needs_attention"没有分开处理导致的真实缺口：先被
+    处理到的那个任务被标了，另一个因为 `pending_fix_intent_noted` 已经
+    是 True 就直接安静跳过、自己的 state 从头到尾没被设过
+    needs_attention，操作者盯着这一个任务的卡片完全看不出异常。"""
     review_before = dict(store.read_status(review_id))
     build_before = dict(store.read_status(tid))
     scheduler.tick(cfg, NOW)
     assert len(fakes.send_keys_calls) == before_send_keys_count  # 没有任何新的投递
     notice_count_after_first = len(fakes.notice_calls)
-    assert notice_count_after_first >= 1  # 至少有一边被开了提醒窗
-    assert (
-        store.read_status(tid).get("state") == "needs_attention"
-        or store.read_status(review_id).get("state") == "needs_attention"
-    )
+    assert notice_count_after_first == 1  # 提醒窗口只开一次（不是两次）
+    assert store.read_status(tid).get("state") == "needs_attention"  # build 也要显示告警
+    assert store.read_status(review_id).get("state") == "needs_attention"  # review 也要
     # 再跑一轮：不重复开提醒窗、不重复重发。
     scheduler.tick(cfg, NOW)
     assert len(fakes.send_keys_calls) == before_send_keys_count
@@ -2969,6 +3215,62 @@ def _assert_fix_intent_reconciled_safely(fakes, cfg, tid, review_id, before_send
         assert review_after.get(key) == review_before.get(key), key
     for key in ("round", "shift", "checkpoint_sha", "checkpoint_history"):
         assert build_after.get(key) == build_before.get(key), key
+
+
+def test_check_running_fails_closed_when_coordinator_task_missing(monkeypatch):
+    """S7.2 兼容尾巴 2：task.json 的 pipeline_id 指向一个不存在的任务时
+    （数据损坏/坏字段），`_check_running` 要在最开头就 fail-closed 到
+    needs_attention，不能让后面任何 `_update_coordinator()` 调用（散布在
+    审稿流水线各处）凭空建出只有 status.json 的幽灵 coordinator 目录。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    task = store.load_task(tid)
+    task["pipeline_id"] = "20260101-000000-dead"  # 从未存在过的 id
+    store.atomic_write_json(store.task_dir(tid) / "task.json", task)
+    store.update_status(tid, state="idle", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention"
+    assert "coordinator" in status["error"] or "不存在" in status["error"]
+    assert not (store.home() / "tasks" / "20260101-000000-dead").is_dir()  # 没建出幽灵目录
+    assert len(fakes.notice_calls) == 1
+
+    scheduler.tick(CONFIG, NOW)  # 再跑一轮：不重复开提醒窗
+    assert len(fakes.notice_calls) == 1
+    assert not (store.home() / "tasks" / "20260101-000000-dead").is_dir()
+
+
+def test_try_launch_blocks_second_task_when_pipeline_already_working(monkeypatch):
+    """S7.2 兼容尾巴 4：这是 Sol 两轮审查都用来验证阻断四的直接反例——同
+    一条 pipeline 已经有一个任务 `working`，另一个同 pipeline 的任务到点
+    尝试起跑，必须被拦（postponed，不是被放行成第二个 launching）。以前
+    S7.1③的验收单只自称"同 pipeline 互斥拦第二班"，但实际新增测试只覆盖
+    了"held+对侧角色起跑"的放行路径，从没有一条测试真正构造过"已经
+    working、再起第二班"这个最直接的场景。"""
+    fakes = Fakes(monkeypatch)
+    working_id = make_task(title="正在跑的第一班")
+    store.update_status(
+        working_id, state="working", window_id="@1", pane_pid=1,
+        last_event_at=scheduler.to_iso(NOW),
+    )
+
+    second_id = make_task(title="同流水线第二班")
+    second_task = store.load_task(second_id)
+    second_task["pipeline_id"] = working_id  # 手动挂进同一条 pipeline
+    second_task["run_at"] = scheduler.to_iso(NOW)  # 到点
+    store.atomic_write_json(store.task_dir(second_id) / "task.json", second_task)
+
+    scheduler.tick(CONFIG, NOW)
+
+    assert second_id not in fakes.launch_calls  # 没有被放行成第二个 launching
+    second_status = store.read_status(second_id)
+    assert second_status["state"] == "postponed"
+    events = (store.task_dir(second_id) / "events.log").read_text(encoding="utf-8")
+    assert working_id in events and "正在跑" in events
+    # 第一班本身没被这个检查动到
+    assert store.read_status(working_id)["state"] == "working"
 
 
 def test_pending_fix_intent_crash_recovery_checkpoint_1_and_2_intent_before_and_after_send(

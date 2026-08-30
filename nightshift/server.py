@@ -1122,9 +1122,17 @@ class _Handler(BaseHTTPRequestHandler):
         碰 held/reviewing/waiting_wakeup 等流程状态。
 
         S7.1 阻断六：以前循环里 `target` 被反复覆盖，只对遍历到的最后一个
-        匹配成员生效——"暂停保活"应该原子作用于这条流水线**当前所有**在
-        等保活的成员（同一时刻可能一边 held 一边 waiting_background），不能
-        只顾一边、放过另一边继续被戳。
+        匹配成员生效——"暂停保活"应该对这条流水线**当前所有**在等保活的
+        成员都独立生效（同一时刻可能一边 held 一边 waiting_background），
+        不能只顾一边、放过另一边继续被戳。
+
+        S7.2 阻断八：多个目标各自是独立任务、独立的 status.json/锁文件，
+        跨文件没有真正的事务——"原子作用于所有目标"这句话本身就是过度
+        承诺。改成对每个目标独立尝试、独立捕获失败：`store.update_status`
+        理论上只在磁盘满/权限损坏这类环境问题下才会抛异常，但不能假装
+        不会发生——失败的目标如实列进 `failed_targets`，响应状态码用
+        207（部分成功，标准 HTTP 语义就是给"多目标操作里有的成功有的
+        失败"用的）而不是假装全部 200 成功。
         """
         pipeline_id = self._resolve_pipeline(task_id)
         if pipeline_id is None:
@@ -1141,12 +1149,26 @@ class _Handler(BaseHTTPRequestHandler):
         ]
         if not targets:
             return self._send_json(409, {"error": "当前没有在等保活的班"})
+        paused_targets: list[str] = []
+        failed_targets: list[str] = []
         for target in targets:
-            store.update_status(target, keepalive_paused=paused)
-            store.append_event(target, f"保活{'暂停' if paused else '恢复'}（网页按钮）")
-        logger.info("网页%s保活：%s", "暂停" if paused else "恢复", "、".join(targets))
+            try:
+                store.update_status(target, keepalive_paused=paused)
+                store.append_event(target, f"保活{'暂停' if paused else '恢复'}（网页按钮）")
+                paused_targets.append(target)
+            except OSError as exc:
+                failed_targets.append(target)
+                logger.warning("保活%s写盘失败：%s（%s）",
+                                "暂停" if paused else "恢复", target, exc)
+        logger.info("网页%s保活：%s", "暂停" if paused else "恢复", "、".join(paused_targets))
+        status_code = 200 if not failed_targets else 207
         return self._send_json(
-            200, {"ok": True, "keepalive_paused": paused, "targets": targets}
+            status_code,
+            {
+                "ok": not failed_targets, "keepalive_paused": paused,
+                "targets": paused_targets, "paused_targets": paused_targets,
+                "failed_targets": failed_targets,
+            },
         )
 
     def _api_pipeline_review_now(self, task_id: str) -> None:
@@ -1176,37 +1198,50 @@ class _Handler(BaseHTTPRequestHandler):
         """跳过审稿：直接收工按 merge policy 分流；只在 build 已 checkpoint、
         尚无 done verdict 的边界允许（held 等审稿、审稿还没起跑/还在等额度）。
 
-        S7.1 阻断六：review 真的在 working（正在跑）时必须拒绝——"边审边
-        合并"是明确不允许的组合；`_finalize_done` 的返回信息（合并成功/
-        失败）要透传给响应体，不能悄悄吞掉失败原因（跳过审稿这个动作本身
-        成功与否，跟自动合并成不成功是两件事——前者成功用 200，后者的
-        结果放进 `merge_ok`/`actions` 字段，不伪装成"全部顺利"）。
+        S7.1 阻断六：`_finalize_done` 的返回信息（合并成功/失败）要透传给
+        响应体，不能悄悄吞掉失败原因。
+
+        S7.2 阻断八：以前只拦 review==working；launching/waiting_background/
+        waiting_wakeup/held/idle 全都能继续跳过——只要 review 已经起跑过、
+        或者已经有 verdict 落盘，就不再是"还没起跑、可以安全跳过"的边界，
+        一律拒绝（不止 working 这一种活跃态）。scheduled/postponed（真正
+        还没起跑）的 review 要**全部**取消，不假设只有一个。合并失败时
+        （`merge_ok=False`）响应状态码也要用 409，`ok` 字段不能还是
+        true——跳过审稿这个动作本身"成功"跟自动合并"成功"是两件事，但
+        客户端不该先读到 `ok:true` 再去猜第二个字段。
         """
         pipeline_id = self._resolve_pipeline(task_id)
         if pipeline_id is None:
             return
+        # review 只要不是"还没起跑"（scheduled/postponed）就一律拒绝——
+        # launching/working/waiting_background/waiting_wakeup/held/idle
+        # 任何一种都意味着这一班已经真的动过了，跳过审稿会丢掉它的进度
+        # 或者跟它打架。
+        _NOT_YET_STARTED = ("scheduled", "postponed")
         build_item = None
-        pending_review = None
+        pending_reviews: list[tuple[dict, dict]] = []
         for item in self._pipeline_members(pipeline_id):
-            t, s = item["task"], item["status"]
-            if store.role_of(t) == "review" and s.get("state") == "working":
-                return self._send_json(
-                    409, {"error": "审稿正在进行，不能跳过（先等它完事或用\"我来看\"叫停）"}
-                )
+            t, s = item["task"], item["status"] or {}
+            state = s.get("state")
+            if store.role_of(t) == "review":
+                if state in _NOT_YET_STARTED:
+                    pending_reviews.append((t, s))
+                elif state is not None:
+                    return self._send_json(
+                        409,
+                        {"error": f"审稿已经{state}，不能跳过（先等它完事或用\"我来看\"叫停）"},
+                    )
             if (
-                store.role_of(t) == "build" and s.get("state") == "held"
+                store.role_of(t) == "build" and state == "held"
                 and s.get("checkpoint_done")
             ):
                 build_item = (t, s)
-            if store.role_of(t) == "review" and s.get("state") in ("scheduled", "postponed"):
-                pending_review = (t, s)
         if build_item is None:
             return self._send_json(
                 409, {"error": "没有已存档、等审稿的施工班可以跳过审稿"}
             )
         t, _ = build_item
-        if pending_review is not None:
-            rt, _ = pending_review
+        for rt, _rs in pending_reviews:
             store.update_status(rt["id"], state="cancelled", last_event_at=store.utc_now_iso())
             store.append_event(rt["id"], "网页：跳过审稿，本班取消")
         cfg = store.load_config()
@@ -1216,8 +1251,9 @@ class _Handler(BaseHTTPRequestHandler):
         merge_ok = store.read_status(t["id"]).get("state") != "needs_attention"
         store.append_event(t["id"], "网页：跳过审稿，直接按 merge policy 收工")
         logger.info("网页跳过审稿：%s → %s", pipeline_id, t["id"])
+        status_code = 200 if merge_ok else 409
         return self._send_json(
-            200, {"ok": True, "task_id": t["id"], "merge_ok": merge_ok, "actions": actions}
+            status_code, {"ok": merge_ok, "task_id": t["id"], "merge_ok": merge_ok, "actions": actions}
         )
 
     def _api_pipeline_fix_now(self, task_id: str) -> None:

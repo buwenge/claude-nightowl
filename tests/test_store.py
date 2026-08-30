@@ -436,6 +436,21 @@ def test_review_config_rejects_bad_config_level_values():
     with pytest.raises(store.ConfigInvalid, match="max_rounds"):
         store.review_config(task, bad_rounds_zero)
 
+    # S7.2 兼容尾巴 1：以前用 int(max_rounds) 会悄悄接受这三类本该拒绝的
+    # 值——True（bool 是 int 子类，int(True)==1）、1.5（截断成 1）、"5"
+    # （数字字符串）；跟 validate_task 的任务级严格口径对齐后都要拒绝。
+    bad_rounds_bool = dict(CONFIG, review={"max_rounds": True})
+    with pytest.raises(store.ConfigInvalid, match="max_rounds"):
+        store.review_config(task, bad_rounds_bool)
+
+    bad_rounds_float = dict(CONFIG, review={"max_rounds": 1.5})
+    with pytest.raises(store.ConfigInvalid, match="max_rounds"):
+        store.review_config(task, bad_rounds_float)
+
+    bad_rounds_str_num = dict(CONFIG, review={"max_rounds": "5"})
+    with pytest.raises(store.ConfigInvalid, match="max_rounds"):
+        store.review_config(task, bad_rounds_str_num)
+
     bad_quota = dict(CONFIG, review={"on_no_quota": "explode"})
     with pytest.raises(store.ConfigInvalid, match="on_no_quota"):
         store.review_config(task, bad_quota)
