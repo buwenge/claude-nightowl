@@ -1609,8 +1609,13 @@ def test_pipeline_action_404_on_unknown_task(authed):
 def test_pipeline_hold_pings_alive_windows_and_is_idempotent(authed, monkeypatch):
     build_id, review_id = make_review_pipeline(authed)
     sent = []
+
+    def fake_send_keys(wid, text):
+        sent.append((wid, text))
+        return subprocess.CompletedProcess([], 0)
+
     monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
-    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: sent.append((wid, text)))
+    monkeypatch.setattr(launcher, "send_keys", fake_send_keys)
 
     status, _, body = authed.request("POST", f"/api/tasks/{review_id}/hold")
     assert status == 200 and body["hold_requested"] is True
@@ -1630,7 +1635,9 @@ def test_pipeline_hold_marks_review_member_awaiting_verdict_false(authed, monkey
     review_awaiting_verdict 这个概念），不该被凭空加上。"""
     build_id, review_id = make_review_pipeline(authed)
     monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
-    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: None)
+    monkeypatch.setattr(
+        launcher, "send_keys", lambda wid, text: subprocess.CompletedProcess([], 0)
+    )
 
     status, _, body = authed.request("POST", f"/api/tasks/{review_id}/hold")
     assert status == 200 and body["hold_requested"] is True
@@ -1643,7 +1650,9 @@ def test_pipeline_hold_blocks_next_review_verdict_routing(authed, monkeypatch):
     from nightshift import scheduler
     build_id, review_id = make_review_pipeline(authed, review_state="idle")
     monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
-    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: None)
+    monkeypatch.setattr(
+        launcher, "send_keys", lambda wid, text: subprocess.CompletedProcess([], 0)
+    )
 
     status, _, _ = authed.request("POST", f"/api/tasks/{review_id}/hold")
     assert status == 200
@@ -1663,7 +1672,9 @@ def test_pipeline_continue_after_hold_reevaluates_blocked_band(authed, monkeypat
     from datetime import datetime, timezone
     build_id, review_id = make_review_pipeline(authed, review_state="idle")
     monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
-    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: None)
+    monkeypatch.setattr(
+        launcher, "send_keys", lambda wid, text: subprocess.CompletedProcess([], 0)
+    )
     authed.request("POST", f"/api/tasks/{review_id}/hold")
     review_file = store.task_dir(review_id) / "review-1.md"
     review_file.write_text("都过了。\n\nNEXT: done", encoding="utf-8")

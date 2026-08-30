@@ -2537,6 +2537,93 @@ def test_review_pipeline_mixed_cc_build_codex_review(tmp_path, monkeypatch):
     assert store.effective_runner(store.load_task(tid)) == "claude"
 
 
+def test_review_pipeline_codex_build_codex_review_full_cycle(tmp_path, monkeypatch):
+    """S7.1 阻断四 Part B/两个 Codex 组合端到端：施工=审稿都是 Codex——
+    以前只测过"一家 Codex + 一家 Claude"的混合组合，纯 Codex×Codex 这条
+    (阻断四同 pipeline 互斥 + effective_runner 权威源 + shift 单调) 没有
+    任何覆盖。走一轮完整：build 收工起同轮 review（额度走 codex 分片）→
+    review fix 原地捎话返工（① 的 held 复用 + shift 单调）→ 第二轮 done →
+    manual 收工 awaiting_merge，全程两班顶层 runner 与 effective_runner
+    都应该是 codex，没有一次误查 claude 分片。"""
+    fakes = Fakes(monkeypatch)
+    codex_calls: list[int] = []
+    monkeypatch.setattr(
+        quota, "fetch_usage_codex",
+        lambda config, timeout=15.0: codex_calls.append(1) or dict(fakes.usage),
+    )
+
+    def _no_claude_fetch(config, timeout=120):
+        raise AssertionError("纯 Codex×Codex 流水线不该查 claude 额度分片")
+
+    monkeypatch.setattr(quota, "fetch_usage_claude", _no_claude_fetch)
+    proj = _make_repo(tmp_path)
+    cfg = dict(REVIEW_CODEX_CONFIG)
+    cfg["projects"] = {"demo": str(proj), "other": str(proj / "nope")}
+    tid = store.create_task({
+        "title": "codex 流水线", "project": "demo", "runner": "codex",
+        "model": "gpt-5.6-luna", "effort": "high", "run_at": scheduler.to_iso(NOW),
+        "task_text": "正文", "prompt_final": "提示词",
+        "review": {"enabled": True, "runner": "codex", "model": "gpt-5.6-luna", "effort": "high"},
+    }, cfg)
+    build1_shift = store.load_task(tid)["shift"]
+    wt = _register_tree(proj, tid, "codex 流水线")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "写完了。\nNEXT: done")
+
+    scheduler.tick(cfg, NOW)
+    build_status = store.read_status(tid)
+    assert build_status["state"] == "held"
+    review_id = build_status["successor_id"]
+    review_task = store.load_task(review_id)
+    assert review_task["role"] == "review"
+    assert store.effective_runner(review_task) == "codex"
+    assert store.load_task(review_id)["shift"] > build1_shift  # 单调
+
+    review_task["run_at"] = scheduler.to_iso(NOW)  # 真实墙钟 → 拨回可被判到点
+    store.atomic_write_json(store.task_dir(review_id) / "task.json", review_task)
+    scheduler.tick(cfg, NOW)
+    review_status = store.read_status(review_id)
+    assert review_status["state"] == "launching"
+    assert review_status["quota_at_launch"]["quota_source"] == "codex"
+    assert len(codex_calls) >= 1
+    assert fakes.launch_calls == [review_id]  # build 仍 held，同 pipeline 互斥没有拦住对侧起跑
+
+    # 审稿退回：build 仍 held → 原地捎话返工（① 两阶段提交 + shift 领号）
+    _go_idle(review_id, window_id="@2")
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("退回。\n\nNEXT: fix", encoding="utf-8")
+    store.update_status(review_id, review_verdict="fix", review_file=str(review_file),
+                        review_recorded_round=1)
+    scheduler.tick(cfg, NOW)
+    build_status2 = store.read_status(tid)
+    assert build_status2["state"] == "working"
+    build_task2 = store.load_task(tid)
+    assert build_task2["round"] == 2
+    assert store.effective_runner(build_task2) == "codex"
+    assert build_task2["shift"] > store.load_task(review_id)["shift"]  # 复用也领新号
+
+    # 第二轮通过：manual 收工 awaiting_merge
+    (wt / "canary.txt").write_text("r1\nr2\n", encoding="utf-8")
+    _go_idle(tid, window_id="@1")
+    _write_handover(tid, "第二轮写完了。\nNEXT: done", shift=build_task2["shift"])
+    scheduler.tick(cfg, NOW)
+    review2_id = store.read_status(tid)["successor_id"]
+    review2_task = store.load_task(review2_id)
+    review2_task["run_at"] = scheduler.to_iso(NOW)
+    store.atomic_write_json(store.task_dir(review2_id) / "task.json", review2_task)
+    scheduler.tick(cfg, NOW)
+
+    _go_idle(review2_id, window_id="@3")
+    review_file2 = store.task_dir(review2_id) / "review-2.md"
+    review_file2.write_text("都过了。\n\nNEXT: done", encoding="utf-8")
+    store.update_status(review2_id, review_verdict="done", review_file=str(review_file2),
+                        review_recorded_round=2)
+    scheduler.tick(cfg, NOW)
+    assert store.read_status(review2_id)["state"] == "awaiting_merge"
+    assert store.read_status(tid)["state"] == "chained"  # build 被正常敲停、标 chained（不是 needs_attention）
+
+
 def test_held_keepalive_paused_skips_and_interval_by_runner(tmp_path, monkeypatch):
     """held 状态也走保活；keepalive_paused 时不戳；按 runner 的间隔（claude
     50 分钟）判断是否到点，不是一律戳。"""

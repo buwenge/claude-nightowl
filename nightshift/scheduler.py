@@ -248,7 +248,45 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
             f"目录未信任，请先手动在该目录开一次 claude：{project_path}",
         )
 
-    # b. 同目录不并跑：开第二个窗口两边抢文件系统，纯坏事。
+    # b. 同 pipeline 互斥（S7.1 阻断四 Part B）：以前只要候选与对方都是
+    # worktree=true 就无条件放行，不比较是不是同一条 pipeline——同 pipeline
+    # 内部本该"一个 held（角色 A）+ 对侧角色新班要起跑"这一种组合并存，任何
+    # 其它组合（对方真的在跑、或对方是同角色 held）都是状态异常，必须先在
+    # 这里挡住，不能被下面 c 段"两边都是 worktree就放行"的跨 pipeline 逻辑
+    # 顺带放过。
+    candidate_pid = store.pipeline_id_of(task)
+    candidate_role = store.role_of(task)
+    if not candidate_pid:  # pipeline_id_of 理论上总有兜底值，防御性 fail-closed
+        return _fail_now(task, config, now, "算不出这一班所属的 pipeline_id，拒绝起跑")
+    for other in store.list_tasks():
+        other_task = other["task"]
+        if other_task["id"] == task_id:
+            continue
+        other_pid = store.pipeline_id_of(other_task)
+        if not other_pid or other_pid != candidate_pid:
+            continue
+        other_state = (other["status"] or {}).get("state")
+        if other_state in ("launching", "working", "waiting_background"):
+            reason = f"同流水线任务 {other_task['id']} 正在跑（{other_state}）"
+            return _postpone(task, status, config, now, reason, notify=False)
+        if other_state == "held" and store.role_of(other_task) == candidate_role:
+            # 正常流程里同一条 pipeline 同一时刻只会有一个角色 held 着等对侧——
+            # 走到"同角色也 held"说明状态机别处出了问题，不能当放行处理。
+            reason = (
+                f"同流水线已有 held 的同角色（{candidate_role}）任务 "
+                f"{other_task['id']}，疑似状态异常"
+            )
+            store.update_status(
+                task_id, state="needs_attention", error=reason,
+                last_event_at=to_iso(now),
+            )
+            store.append_event(task_id, reason)
+            launcher.open_notice_window(task, "(需要人工)", [reason], config)
+            return [f"{task_id} 同流水线状态异常 → needs_attention"]
+        # 其余情况（对方是对侧角色的 held，或对方是终态）不拦，交给下面
+        # c 段按项目目录做跨 pipeline 判断。
+
+    # c. 同目录不并跑：开第二个窗口两边抢文件系统，纯坏事。
     # S5 起：两个 worktree=true 的流水线各在各的树里施工，互不相干，允许并跑；
     # 只要候选或正在跑的一方是 worktree=false（一期老路径，直接在项目目录），
     # 仍按一期同目录锁推迟
@@ -264,7 +302,7 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
             reason = f"同目录任务 {other['task']['id']} 还在跑"
             return _postpone(task, status, config, now, reason, notify=False)
 
-    # c. 额度：只查这一班自己的 runner，查不到一律不放行（fail-closed）；
+    # d. 额度：只查这一班自己的 runner，查不到一律不放行（fail-closed）；
     # Claude 额度坏了不能拦 Codex 起跑，反之亦然
     usage, err = _fetch_and_record_usage(runner, config, now)
     if usage is None:
@@ -277,7 +315,7 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
             _apply_review_no_quota_policy(task, config, now)
         return _postpone(task, status, config, now, reason)
 
-    # d. 全过 → 起跑（launcher.launch 自己会先落盘 launching 再碰 tmux）
+    # e. 全过 → 起跑（launcher.launch 自己会先落盘 launching 再碰 tmux）
     store.update_status(
         task_id,
         quota_at_launch={
@@ -1474,7 +1512,8 @@ def _check_review_idle(
         return _review_done(task, config, now)
     if verdict == "pending":
         return _review_pending(task, config, now)
-    return _review_fix(task, config, now)  # fix，或 hook 已经归一过的非法值
+    actions, _ok = _review_fix(task, config, now)  # fix，或 hook 已经归一过的非法值
+    return actions
 
 
 def _review_done(review_task: dict, config: dict, now: datetime) -> list[str]:
@@ -1486,6 +1525,12 @@ def _review_done(review_task: dict, config: dict, now: datetime) -> list[str]:
     `review_task.get("parent_id")`）——review 是 pending release 出来的
     第 2、3…个审稿任务时，parent_id 指向上一个 review，不是 build，旧写法
     会摸错任务、build 永久 held 泄漏窗口/保活。
+
+    S7.1 阻断六：叫停 build 的 send-keys 若失败，不能假装它已经停了——build
+    标 needs_attention（而不是 chained），让人工确认那扇仍可能在跑的窗口，
+    不悄悄放过随后可能发生的合并/删树风险。review 自己该走的
+    `_finalize_done` 仍然照常走（审稿通过是既成事实，不因为"敲个招呼没敲
+    成功"而回滚）。
     """
     task_id = review_task["id"]
     current = _current_build(review_task)
@@ -1493,13 +1538,27 @@ def _review_done(review_task: dict, config: dict, now: datetime) -> list[str]:
         parent_task, parent_status = current
         parent_id = parent_task["id"]
         window_id = parent_status.get("window_id")
+        stop_failed = False
         if window_id and launcher.window_alive(str(window_id), config):
             text = config.get("review_stop_build_text") or DEFAULT_REVIEW_STOP_BUILD_TEXT
-            launcher.send_keys(str(window_id), text)
-            store.append_event(parent_id, "审稿已通过（NEXT: done），已敲停施工班")
-        store.update_status(
-            parent_id, state="chained", successor_id=task_id, last_event_at=to_iso(now)
-        )
+            proc = launcher.send_keys(str(window_id), text)
+            if proc.returncode != 0:
+                # S7.1 阻断六：send-keys 失败不能假装 build 已经停了——它可能
+                # 还在跑，这时候把它标 chained 会让人以为可以放心合并/删树。
+                stop_failed = True
+            else:
+                store.append_event(parent_id, "审稿已通过（NEXT: done），已敲停施工班")
+        if stop_failed:
+            reason = "审稿已通过，但没能让仍在跑的施工窗口停下（send-keys 失败），请手动确认/关闭"
+            store.update_status(
+                parent_id, state="needs_attention", error=reason, last_event_at=to_iso(now)
+            )
+            store.append_event(parent_id, reason)
+            launcher.open_notice_window(parent_task, "(需要人工)", [reason], config)
+        else:
+            store.update_status(
+                parent_id, state="chained", successor_id=task_id, last_event_at=to_iso(now)
+            )
     _update_coordinator(review_task, pipeline_phase="done")
     store.append_event(task_id, "审稿通过（NEXT: done）")
     return _finalize_done(review_task, config, now)
@@ -1577,10 +1636,16 @@ def _review_pending(review_task: dict, config: dict, now: datetime) -> list[str]
     return [f"{task_id} 审稿 pending → 另起 {new_review_id}"]
 
 
-def _review_fix(review_task: dict, config: dict, now: datetime) -> list[str]:
+def _review_fix(review_task: dict, config: dict, now: datetime) -> tuple[list[str], bool]:
     """审稿 NEXT: fix：记一次 fix_count，起下一轮 build 返工——若合格 held
     build 会话仍活着，直接 send-keys 完整意见继续（不新开窗口）；否则造
     新的 build 班。两条路径都留下不覆盖的 round/checkpoint 审计。
+
+    S7.1 阻断六：返回值从 `list[str]` 扩成 `(actions, ok)`——`ok=False`
+    专指"原地捎话失败、这一轮返工没能真正投递出去"（此时这一班转
+    needs_attention，没有产生下一轮 build）；`ok=True` 覆盖"捎话成功"与
+    "新起了一个 build 班"两种正常完成路径。`_api_pipeline_fix_now` 靠这个
+    判断该回 200 还是 409，不能再假设调用完就是成功。
 
     S7.1 阻断一：原地唤醒 held build 这条路径改成两阶段提交——send-keys
     之前只落一个可丢弃的 `pending_fix_intent` 标记，不动 fix_count/build
@@ -1643,7 +1708,7 @@ def _review_fix(review_task: dict, config: dict, now: datetime) -> list[str]:
                 )
                 store.append_event(task_id, reason)
                 launcher.open_notice_window(review_task, "(需要人工)", [reason], config)
-                return [f"{task_id} 返工投递失败 → needs_attention"]
+                return [f"{task_id} 返工投递失败 → needs_attention"], False
             # 阶段二：成功，一次性提交所有正式字段。
             # 同一个 build task id 复用进下一轮：checkpoint 相关字段要归零才能
             # 让 _checkpoint_shift/_check_idle_chain 重新跑一遍；归零前先把上一
@@ -1673,7 +1738,7 @@ def _review_fix(review_task: dict, config: dict, now: datetime) -> list[str]:
                 parent_id, f"审稿退回（第 {round_} 轮），已捎话继续第 {next_round} 轮返工（同一会话）"
             )
             store.append_event(task_id, f"审稿退回，已捎话给仍 held 着的施工班第 {next_round} 轮")
-            return [f"{task_id} 审稿 fix → 捎话继续（第 {next_round} 轮）"]
+            return [f"{task_id} 审稿 fix → 捎话继续（第 {next_round} 轮）"], True
 
     prompt = store.render_review_fix_prompt(
         config, review_task, round_=next_round, review_text=review_text,
@@ -1687,7 +1752,7 @@ def _review_fix(review_task: dict, config: dict, now: datetime) -> list[str]:
         round_limit_override=False,
     )
     store.append_event(task_id, f"审稿退回 → 新起第 {next_round} 轮返工班 {build_id}")
-    return [f"{task_id} 审稿 fix → 新起返工班 {build_id}"]
+    return [f"{task_id} 审稿 fix → 新起返工班 {build_id}"], True
 
 
 # ---------- 额度刷新（零开销原则） ----------

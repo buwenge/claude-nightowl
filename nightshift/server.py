@@ -100,6 +100,12 @@ _DISCARD_STATES = (
     "awaiting_merge", "needs_attention", "failed", "cancelled",
     "chain_exhausted", "exited",
 )
+# S7.1 阻断六：一条流水线所有成员都落在这些状态时，判定"已经彻底收尾，
+# 没有任何东西可以再 hold"——只用于 _api_pipeline_hold 的活跃态校验，跟
+# 上面几组"能不能编辑/能不能删/能不能合并"的语义各自独立，不要混用。
+# 故意不含 needs_attention/awaiting_merge/exited/chained：这几个状态下
+# 仍可能有一扇活窗口、或流水线里另一个成员还活着，"我来看"仍有意义。
+_PIPELINE_WRAPPED_STATES = ("finished", "merged", "discarded", "cancelled", "chain_exhausted")
 # config 缺 stop_background_text 时的兜底（与 config.example.json 保持一致）
 DEFAULT_STOP_BACKGROUND_TEXT = (
     "来自nightshift：请立刻用 TaskStop 停掉所有后台任务和子 agent，"
@@ -983,13 +989,27 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _resolve_pipeline(self, task_id: str) -> str | None:
         """流水线任一成员 task id → coordinator id（pipeline_id）；任务不
-        存在发 404 并返回 None。六个控制 action 共用这一步解析。"""
+        存在发 404 并返回 None。六个控制 action 共用这一步解析。
+
+        S7.1 阻断六：算出 pipeline_id 后还要确认它真的对应一个存在的
+        task——不校验的话，坏/过期的 pipeline_id 字段会让后续任意一个
+        `store.update_status(pipeline_id, ...)` 凭空建出一个只有
+        status.json、没有 task.json 的"幽灵 coordinator"目录。
+        """
         try:
             task = store.load_task(task_id)
         except (OSError, ValueError):
             self._send_json(404, {"error": "任务不存在"})
             return None
-        return store.pipeline_id_of(task)
+        pipeline_id = store.pipeline_id_of(task)
+        try:
+            store.load_task(pipeline_id)
+        except (OSError, ValueError):
+            self._send_json(
+                404, {"error": f"流水线 coordinator 任务 {pipeline_id} 不存在"}
+            )
+            return None
+        return pipeline_id
 
     def _pipeline_members(self, pipeline_id: str) -> list[dict]:
         return [
@@ -998,17 +1018,28 @@ class _Handler(BaseHTTPRequestHandler):
         ]
 
     def _api_pipeline_hold(self, task_id: str) -> None:
-        """我来看：幂等设置 pipeline hold，向当前活窗口各敲一次 hold_text。"""
+        """我来看：幂等设置 pipeline hold，向当前活窗口各敲一次 hold_text。
+
+        S7.1 阻断六：流水线所有成员都已经彻底收尾（`_PIPELINE_WRAPPED_
+        STATES`）时拒绝——没有什么可"停在这里"的；send-keys 真失败的窗口
+        不计入 pinged，事件文案要如实反映"敲了几个"而不是"看到几个活窗口"。
+        """
         pipeline_id = self._resolve_pipeline(task_id)
         if pipeline_id is None:
             return
+        members = self._pipeline_members(pipeline_id)
+        if members and all(
+            (item["status"] or {}).get("state") in _PIPELINE_WRAPPED_STATES
+            for item in members
+        ):
+            return self._send_json(409, {"error": "这条流水线已经收尾，没有可以\"我来看\"的班"})
         coordinator = store.read_status(pipeline_id)
         cfg = store.load_config()
         if not coordinator.get("hold_requested"):
             store.update_status(pipeline_id, hold_requested=True)
             text = cfg.get("hold_text") or "来自nightshift：工头要来看，停在这里别再动代码；有人问再答。"
             pinged = []
-            for item in self._pipeline_members(pipeline_id):
+            for item in members:
                 t, s = item["task"], item["status"] or {}
                 wid = s.get("window_id")
                 if wid and launcher.window_alive(str(wid), cfg):
@@ -1017,8 +1048,9 @@ class _Handler(BaseHTTPRequestHandler):
                         # 先落 review_awaiting_verdict=False，接下来的 Stop
                         # 按控制 turn 处理，不会被误记成协议缺失→fix。
                         store.update_status(t["id"], review_awaiting_verdict=False)
-                    launcher.send_keys(str(wid), text)
-                    pinged.append(str(wid))
+                    proc = launcher.send_keys(str(wid), text)
+                    if proc.returncode == 0:
+                        pinged.append(str(wid))
             store.append_event(
                 pipeline_id,
                 f"我来看：已请求，敲了 {len(pinged)} 个活窗口" if pinged
@@ -1074,7 +1106,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _api_pipeline_keepalive(self, task_id: str) -> None:
         """暂停/恢复保活：只改运行期暂停位（status.keepalive_paused），不
-        碰 held/reviewing/waiting_wakeup 等流程状态。"""
+        碰 held/reviewing/waiting_wakeup 等流程状态。
+
+        S7.1 阻断六：以前循环里 `target` 被反复覆盖，只对遍历到的最后一个
+        匹配成员生效——"暂停保活"应该原子作用于这条流水线**当前所有**在
+        等保活的成员（同一时刻可能一边 held 一边 waiting_background），不能
+        只顾一边、放过另一边继续被戳。
+        """
         pipeline_id = self._resolve_pipeline(task_id)
         if pipeline_id is None:
             return
@@ -1084,17 +1122,19 @@ class _Handler(BaseHTTPRequestHandler):
         paused = data.get("paused")
         if not isinstance(paused, bool):
             return self._send_json(400, {"error": "paused 必须是布尔值"})
-        target = None
-        for item in self._pipeline_members(pipeline_id):
-            t, s = item["task"], item["status"]
-            if s.get("state") in ("held", "waiting_background"):
-                target = t["id"]
-        if target is None:
+        targets = [
+            item["task"]["id"] for item in self._pipeline_members(pipeline_id)
+            if (item["status"] or {}).get("state") in ("held", "waiting_background")
+        ]
+        if not targets:
             return self._send_json(409, {"error": "当前没有在等保活的班"})
-        store.update_status(target, keepalive_paused=paused)
-        store.append_event(target, f"保活{'暂停' if paused else '恢复'}（网页按钮）")
-        logger.info("网页%s保活：%s", "暂停" if paused else "恢复", target)
-        return self._send_json(200, {"ok": True, "keepalive_paused": paused})
+        for target in targets:
+            store.update_status(target, keepalive_paused=paused)
+            store.append_event(target, f"保活{'暂停' if paused else '恢复'}（网页按钮）")
+        logger.info("网页%s保活：%s", "暂停" if paused else "恢复", "、".join(targets))
+        return self._send_json(
+            200, {"ok": True, "keepalive_paused": paused, "targets": targets}
+        )
 
     def _api_pipeline_review_now(self, task_id: str) -> None:
         """现在就审：只对因审稿方额度被推迟（postponed）的审稿班跳过等待
@@ -1122,6 +1162,12 @@ class _Handler(BaseHTTPRequestHandler):
     def _api_pipeline_skip_review(self, task_id: str) -> None:
         """跳过审稿：直接收工按 merge policy 分流；只在 build 已 checkpoint、
         尚无 done verdict 的边界允许（held 等审稿、审稿还没起跑/还在等额度）。
+
+        S7.1 阻断六：review 真的在 working（正在跑）时必须拒绝——"边审边
+        合并"是明确不允许的组合；`_finalize_done` 的返回信息（合并成功/
+        失败）要透传给响应体，不能悄悄吞掉失败原因（跳过审稿这个动作本身
+        成功与否，跟自动合并成不成功是两件事——前者成功用 200，后者的
+        结果放进 `merge_ok`/`actions` 字段，不伪装成"全部顺利"）。
         """
         pipeline_id = self._resolve_pipeline(task_id)
         if pipeline_id is None:
@@ -1130,6 +1176,10 @@ class _Handler(BaseHTTPRequestHandler):
         pending_review = None
         for item in self._pipeline_members(pipeline_id):
             t, s = item["task"], item["status"]
+            if store.role_of(t) == "review" and s.get("state") == "working":
+                return self._send_json(
+                    409, {"error": "审稿正在进行，不能跳过（先等它完事或用\"我来看\"叫停）"}
+                )
             if (
                 store.role_of(t) == "build" and s.get("state") == "held"
                 and s.get("checkpoint_done")
@@ -1147,12 +1197,15 @@ class _Handler(BaseHTTPRequestHandler):
             store.update_status(rt["id"], state="cancelled", last_event_at=store.utc_now_iso())
             store.append_event(rt["id"], "网页：跳过审稿，本班取消")
         cfg = store.load_config()
-        scheduler._finalize_done(
+        actions = scheduler._finalize_done(
             t, cfg, datetime.now(timezone.utc), skip_review=True
         )
+        merge_ok = store.read_status(t["id"]).get("state") != "needs_attention"
         store.append_event(t["id"], "网页：跳过审稿，直接按 merge policy 收工")
         logger.info("网页跳过审稿：%s → %s", pipeline_id, t["id"])
-        return self._send_json(200, {"ok": True, "task_id": t["id"]})
+        return self._send_json(
+            200, {"ok": True, "task_id": t["id"], "merge_ok": merge_ok, "actions": actions}
+        )
 
     def _api_pipeline_fix_now(self, task_id: str) -> None:
         """直接返工：不等审稿，带用户给的非空 instruction（或复用这一轮已有
@@ -1220,8 +1273,16 @@ class _Handler(BaseHTTPRequestHandler):
             review_recorded_round=round_,
         )
         store.append_event(rt["id"], "网页：不等审稿，直接按给定意见返工（fix-now）")
-        actions = scheduler._review_fix(store.load_task(rt["id"]), cfg, datetime.now(timezone.utc))
+        actions, fix_ok = scheduler._review_fix(
+            store.load_task(rt["id"]), cfg, datetime.now(timezone.utc)
+        )
         logger.info("网页直接返工：%s → %s", pipeline_id, rt["id"])
+        if not fix_ok:
+            # S7.1 阻断六：_review_fix 内部已经把这一班标成 needs_attention，
+            # 不能假装返工投递成功了——回 409 让前端如实展示失败。
+            return self._send_json(
+                409, {"error": "返工意见没能投递成功，请看任务详情", "actions": actions}
+            )
         return self._send_json(200, {"ok": True, "task_id": rt["id"], "actions": actions})
 
     def _api_delete(self, task_id: str) -> None:

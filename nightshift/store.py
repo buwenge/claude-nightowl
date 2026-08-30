@@ -22,6 +22,7 @@ from .context import context_limit_for
 
 __all__ = [
     "CODEX_BACKGROUND_INSTRUCTION",
+    "ConfigInvalid",
     "ConfigMissing",
     "ENDED_STATES",
     "ON_NO_QUOTA_VALUES",
@@ -73,6 +74,14 @@ RUNNERS = ("claude", "codex")
 
 class ConfigMissing(Exception):
     """数据目录里没有 config.json。"""
+
+
+class ConfigInvalid(Exception):
+    """config.json（或 task.review）里的审稿配置值类型/取值不对——S7.1
+    非阻断尾巴：以前 config.review.max_rounds/on_no_quota/merge_policy 没有
+    统一校验，坏值会一路传到 scheduler 里 int(...)/字符串比较才炸，报错
+    完全看不出是哪个 pipeline 哪份配置的问题。review_config() 在合并出
+    最终视图时就地校验、就地报出人话原因。"""
 
 
 # 任务状态全集（设计稿 §3 状态机 + S5② 工作树收尾）
@@ -303,14 +312,36 @@ def review_config(task: dict, config: dict) -> dict:
             return cfg_review[key]
         return _REVIEW_CONFIG_DEFAULTS.get(key)
 
+    max_rounds = pick("max_rounds")
+    on_no_quota = pick("on_no_quota")
+    merge_policy = pick("merge_policy")
+    # S7.1 非阻断尾巴：坏值就地报出人话原因，不要让它一路传到 scheduler
+    # 里某个 int(...)/字符串比较才炸——那时完全看不出是哪份配置的问题。
+    try:
+        max_rounds_int = int(max_rounds)
+    except (TypeError, ValueError):
+        raise ConfigInvalid(
+            f"review.max_rounds 必须是正整数，读到 {max_rounds!r}"
+        ) from None
+    if max_rounds_int <= 0:
+        raise ConfigInvalid(f"review.max_rounds 必须是正整数，读到 {max_rounds!r}")
+    if on_no_quota not in ON_NO_QUOTA_VALUES:
+        raise ConfigInvalid(
+            f"review.on_no_quota 只认 {'/'.join(ON_NO_QUOTA_VALUES)}，读到 {on_no_quota!r}"
+        )
+    if merge_policy not in _MERGE_POLICIES:
+        raise ConfigInvalid(
+            f"review.merge_policy 只认 {'/'.join(_MERGE_POLICIES)}，读到 {merge_policy!r}"
+        )
+
     return {
         "enabled": bool(task_review.get("enabled", False)),
         "runner": task_review.get("runner"),
         "model": task_review.get("model"),
         "effort": task_review.get("effort"),
-        "max_rounds": pick("max_rounds"),
-        "on_no_quota": pick("on_no_quota"),
-        "merge_policy": pick("merge_policy"),
+        "max_rounds": max_rounds_int,
+        "on_no_quota": on_no_quota,
+        "merge_policy": merge_policy,
         "criteria_text": pick("criteria_text"),
     }
 
@@ -840,6 +871,28 @@ def build_prompt(
 
 # ---------- S7：审稿 / 返工提示词渲染 ----------
 
+# S7.1 非阻断尾巴：config["review_template"]/config["review_fix_template"]
+# 以前是直接索引——旧生产 config（S7 上线前部署的）缺这两个键时实测
+# KeyError('review_template')。开工令要求代码自带 fallback，不能只靠部署
+# 人工补键；内容原样抄自 config.example.json 的同名字段，不重新措辞。
+DEFAULT_REVIEW_TEMPLATE = (
+    "你在无人值守的定时会话里做代码审查，项目工作树 {project_path}"
+    "（分支基准 {base_ref}）。任务：{title}\n\n{task}\n\n只读审查，不许改代码、"
+    "不许 git commit。看改动请跑：{diff_command}\n\n施工班交接：\n{build_handover}"
+    "\n\n{previous_review}这是第 {round} 轮审稿。通过标准：\n{criteria}\n\n"
+    "{stop_build_hint}审完把完整意见写成本次最终回复的正文（不要写文件、不要用"
+    " shell 重定向），最后一个非空行严格写成三选一：`NEXT: done`（通过）、"
+    "`NEXT: fix`（退回，正文说清改什么/为什么/是小改还是重写）或 `NEXT: pending`"
+    "（额度到线意见没写完，不计本轮）。"
+)
+DEFAULT_REVIEW_FIX_TEMPLATE = (
+    "你在无人值守的定时会话里工作，项目目录 {project_path}。任务：{title}\n\n"
+    "{task}\n\n这是第 {round} 轮返工，审稿意见如下：\n{review}\n\n"
+    "{worktree_instruction}先核对审稿意见里说的问题，逐条确认改完再收尾。没有人"
+    "在场：遇到问题按合理判断继续，不要停下来等确认。完成或换班时照常写交接，"
+    "末行写 NEXT: done 或 NEXT: continue。"
+)
+
 
 def render_review_prompt(
     config: dict, task: dict, *, base_ref: str, diff_command: str,
@@ -854,7 +907,7 @@ def render_review_prompt(
     review = review_config(task, config)
     criteria = review.get("criteria_text") or config.get("review_criteria_text") or ""
     return render(
-        config["review_template"],
+        config.get("review_template") or DEFAULT_REVIEW_TEMPLATE,
         task=task["task_text"],
         title=task["title"],
         project_path=config["projects"][task["project"]],
@@ -874,7 +927,7 @@ def render_review_fix_prompt(
     """渲染返工班的提示词（config.review_fix_template）：原任务书 + 第几轮
     返工 + 完整审稿意见 + 工作树安全前言（返工班永远是工作树任务）。"""
     return render(
-        config["review_fix_template"],
+        config.get("review_fix_template") or DEFAULT_REVIEW_FIX_TEMPLATE,
         task=task["task_text"],
         title=task["title"],
         project_path=config["projects"][task["project"]],

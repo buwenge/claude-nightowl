@@ -420,6 +420,51 @@ def test_review_config_defaults_and_overrides():
     assert merged2["max_rounds"] == 1  # task 显式给的优先于 config
 
 
+def test_review_config_rejects_bad_config_level_values():
+    """S7.1 非阻断尾巴：config.review 的坏值要在 review_config() 合并时就
+    地报出人话原因（ConfigInvalid），不能一路传到 scheduler 里某个
+    int(...)/字符串比较才炸——那时完全看不出是哪份配置的问题。task.review
+    本身仍由 validate_task 在创建时挡住（这里测的是 config 级默认值）。"""
+    task = make_task(review={"enabled": True, "runner": "claude",
+                              "model": "claude-fable-5", "effort": "high"})
+
+    bad_rounds = dict(CONFIG, review={"max_rounds": "five"})
+    with pytest.raises(store.ConfigInvalid, match="max_rounds"):
+        store.review_config(task, bad_rounds)
+
+    bad_rounds_zero = dict(CONFIG, review={"max_rounds": 0})
+    with pytest.raises(store.ConfigInvalid, match="max_rounds"):
+        store.review_config(task, bad_rounds_zero)
+
+    bad_quota = dict(CONFIG, review={"on_no_quota": "explode"})
+    with pytest.raises(store.ConfigInvalid, match="on_no_quota"):
+        store.review_config(task, bad_quota)
+
+    bad_policy = dict(CONFIG, review={"merge_policy": "yolo"})
+    with pytest.raises(store.ConfigInvalid, match="merge_policy"):
+        store.review_config(task, bad_policy)
+
+
+def test_render_review_prompts_fall_back_when_config_missing_template_keys():
+    """S7.1 非阻断尾巴：旧生产 config 没有 review_template/review_fix_template
+    两个键时，以前是 config["review_template"] 直接索引，实测
+    KeyError('review_template')；改成 .get(...) or DEFAULT_xxx 后不该再炸，
+    且渲染出的正文要能看到任务标题（证明确实走了兜底模板而不是空字符串）。"""
+    task = make_task(title="没有模板键也要能审")
+    prompt = store.render_review_prompt(
+        CONFIG, task, base_ref="abc123", diff_command="git diff abc123..HEAD",
+        build_handover="交接内容", previous_review="", round_=1,
+    )
+    assert "没有模板键也要能审" in prompt
+    assert "NEXT: done" in prompt
+
+    fix_prompt = store.render_review_fix_prompt(
+        CONFIG, task, round_=2, review_text="退回：改一下命名",
+    )
+    assert "没有模板键也要能审" in fix_prompt
+    assert "退回：改一下命名" in fix_prompt
+
+
 def test_effective_runner_model_effort_by_role():
     task = {
         "id": "x", "runner": "claude", "model": "claude-fable-5", "effort": "high",
