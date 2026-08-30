@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,7 +25,10 @@ from pathlib import Path
 from . import store
 from .context import context_limit_for, read_context_tokens
 
-__all__ = ["alarm_plan", "handle_event", "handover_path", "main", "warn_threshold"]
+__all__ = [
+    "alarm_plan", "handle_event", "handover_path", "main",
+    "review_file_path", "warn_threshold",
+]
 
 # 五小时额度到线：停下等刷新（缓存闹钟）；周额度到线：收尾交接。文案在 config 里可改。
 QUOTA_PAUSE_TEXT = (
@@ -42,6 +46,12 @@ QUOTA_WRAPUP_TEXT = (
     "现在收尾：把已完成/未完成/下一步写进 {handover_path}，末行写 NEXT: done（本周不再续班，交接留给下次）；"
     "{commit_step}然后停下。"
 )
+# S7：审稿班（role=review）额度到线收尾，跟 build 的收尾话术不同——
+# 写进最终回复正文、末行 NEXT: pending，不叫它写交接文件或 commit。
+DEFAULT_REVIEW_WRAPUP_TEXT = (
+    "[nightshift] 审稿额度只剩 {week_left}%（线 {week_line_left}%）{model_note}，一时半会儿刷新不了。"
+    "现在把已经看到的意见写进本次最终回复正文，末行写 NEXT: pending（本轮不计数），然后停下。"
+)
 # 闹钟规矩：50 分钟一个（缓存 TTL 约 1 小时），尾数补一个短的，再加几分钟缓冲
 ALARM_UNIT_MINUTES = 50
 ALARM_BUFFER_MINUTES = 3
@@ -58,7 +68,7 @@ def _context_limit(task: dict, config: dict) -> int:
     limit = (task.get("guards") or {}).get("context_limit_tokens")
     if limit:
         return int(limit)
-    return context_limit_for(task.get("model", ""), config, runner="claude")
+    return context_limit_for(store.effective_model(task), config, runner="claude")
 
 
 def warn_threshold(task: dict, config: dict) -> int:
@@ -159,7 +169,7 @@ def _other_model_notes(task: dict, config: dict, status: dict) -> list[tuple[str
     if usage is None:
         return []
     claude_rc = store.runner_config(config).get("claude") or {}
-    own = claude_rc.get("models", {}).get(task.get("model", ""), {}).get("usage_label")
+    own = claude_rc.get("models", {}).get(store.effective_model(task), {}).get("usage_label")
     warned = set(status.get("other_model_warned") or [])
     out = []
     for label, pct in (usage.get("per_model") or {}).items():
@@ -193,7 +203,7 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
     session_pct = usage.get("session_pct")
     week_all_pct = usage.get("week_all_pct")
     claude_rc = store.runner_config(config).get("claude") or {}
-    label = claude_rc.get("models", {}).get(task.get("model", ""), {}).get("usage_label")
+    label = claude_rc.get("models", {}).get(store.effective_model(task), {}).get("usage_label")
     per_model = usage.get("per_model") or {}
     model_pct = per_model.get(label) if label else None
 
@@ -201,15 +211,26 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
     model_hit = isinstance(model_pct, int) and model_pct >= model_max
     if week_hit or model_hit:
         model_note = f"，{label} 单独周线剩 {100 - model_pct}%（线 {100 - model_max}%）" if model_hit else ""
-        text = store.render(
-            config.get("quota_wrapup_text") or QUOTA_WRAPUP_TEXT,
-            week_left=("?" if week_all_pct is None else 100 - week_all_pct),
-            week_line_left=100 - weekly_max,
-            model_line_left=100 - model_max,
-            model_note=model_note,
-            handover_path=str(handover_path(task)),
-            commit_step=_commit_step(task),
-        )
+        if store.role_of(task) == "review":
+            # S7：审稿班收尾话术不一样——写进最终回复正文、末行 NEXT: pending，
+            # 不叫它写 handover_path/commit（那是 build 角色的收尾协议）。
+            text = store.render(
+                config.get("review_wrapup_text") or DEFAULT_REVIEW_WRAPUP_TEXT,
+                week_left=("?" if week_all_pct is None else 100 - week_all_pct),
+                week_line_left=100 - weekly_max,
+                model_line_left=100 - model_max,
+                model_note=model_note,
+            )
+        else:
+            text = store.render(
+                config.get("quota_wrapup_text") or QUOTA_WRAPUP_TEXT,
+                week_left=("?" if week_all_pct is None else 100 - week_all_pct),
+                week_line_left=100 - weekly_max,
+                model_line_left=100 - model_max,
+                model_note=model_note,
+                handover_path=str(handover_path(task)),
+                commit_step=_commit_step(task),
+            )
         return "wrapup", text, {}
 
     if isinstance(session_pct, int) and session_pct >= session_max:
@@ -353,6 +374,84 @@ def _post_tool_use_refresh(task: dict, status: dict, payload: dict) -> str | Non
     return "\n\n".join(inject) if inject else None
 
 
+# ---------- S7：审稿意见文件协议（只读班如何交付文件） ----------
+
+_RE_REVIEW_NEXT = re.compile(r"^NEXT:\s*(done|fix|pending)\s*$")
+
+
+def review_file_path(task: dict) -> Path:
+    """审稿班这一轮的意见文件路径：task_dir(审稿 task id)/review-<round>.md
+    ——由 Stop hook 在沙箱外原子落盘，reviewer 自己不调用 Write、不用 shell
+    重定向，不写 NIGHTSHIFT_HOME。"""
+    return store.task_dir(task["id"]) / f"review-{store.round_of(task)}.md"
+
+
+def _parse_review_verdict(text: str) -> tuple[str, bool]:
+    """最终回复正文最后非空行严格三选一：done=通过，fix=退回，
+    pending=意见未完（不计轮数）。没写 NEXT、空消息或未知值一律保守按
+    fix——协议缺失时的安全默认，绝不能被当 done 放行。
+
+    返回 (verdict, protocol_ok)；protocol_ok=False 时调用方要在 events.log
+    记一笔"协议缺失，保守按 fix"。
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return "fix", False
+    m = _RE_REVIEW_NEXT.match(lines[-1])
+    if not m:
+        return "fix", False
+    return m.group(1), True
+
+
+def _handle_review_stop(task: dict, payload: dict, now: str) -> None:
+    """审稿班（role=review，Claude 或 Codex 皆同一套）的 Stop：把最终回复
+    正文原子落成 review-<round>.md，解析末行 NEXT 记 review_verdict，state
+    转 idle/waiting_wakeup——跟 build 共用同一套 idle 语义，具体下一步（起
+    返工班/合并/告栏）由调度器 tick 时按 role=review 分流决定，hook 本身
+    只管落盘事实，不做流程判断。
+
+    幂等：这一轮已经记过 verdict 就不再重复覆盖文件/verdict——CC 对一次
+    残缺响应会静默重试（同一 turn 两次 Stop），第二次不该覆盖已确认的结果，
+    调度器也只该在 verdict 从"无"变为"有"的那次 tick 里推进一次轮次。
+    """
+    task_id = task["id"]
+    round_ = store.round_of(task)
+    status_now = store.read_status(task_id)
+    if status_now.get("review_recorded_round") == round_ and status_now.get("review_verdict"):
+        store.append_event(
+            task_id, f"hook Stop(review) 第 {round_} 轮已记过 verdict，忽略重复 Stop"
+        )
+        return None
+
+    text = payload.get("last_assistant_message") or ""
+    verdict, protocol_ok = _parse_review_verdict(text)
+    path = review_file_path(task)
+    store.atomic_write_text(path, text if text.strip() else "（空消息，无审稿正文）\n")
+
+    fields = {
+        "last_message": text[:2000],
+        "stuck": False,
+        "last_event_at": now,
+        "review_verdict": verdict,
+        "review_file": str(path),
+        "review_recorded_round": round_,
+    }
+    fields["state"] = "waiting_wakeup" if status_now.get("quota_paused_until") else "idle"
+
+    def clear_stuck_cycle_review(status: dict) -> None:
+        status.update(fields)
+        status.pop("auto_interrupted", None)
+        status.pop("stuck_since", None)
+
+    store.modify_status(task_id, clear_stuck_cycle_review)
+    note = "" if protocol_ok else "（协议缺失：没写合法 NEXT，保守按 fix）"
+    store.append_event(
+        task_id,
+        f"hook Stop(review) 第 {round_} 轮 → verdict={verdict}{note}，state={fields['state']}",
+    )
+    return None
+
+
 def handle_event(task_id: str, event: str, payload: dict) -> str | None:
     """按事件类型更新 status.json / events.log，返回要回注的文案（通常 None）。
 
@@ -361,7 +460,9 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
     """
     task = store.load_task(task_id)
     now = store.utc_now_iso()
-    runner = task.get("runner") or "claude"
+    # S7：审稿角色可能跟顶层 build runner 不同（task.review.runner），事件
+    # 分派一律按这一班自己的有效工人，不能只看 task["runner"]。
+    runner = store.effective_runner(task)
 
     if event == "SessionStart":
         # Claude 不挂这个事件（launcher 起跑前已用 --session-id 预先分配好，
@@ -442,6 +543,11 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
         store.append_event(
             task_id, f"hook {event} subagents={status['subagents_running']}"
         )
+
+    elif event == "Stop" and store.role_of(task) == "review":
+        # S7：审稿角色不分 Claude/Codex，Stop 一律走审稿意见文件协议
+        # （落 review-<round>.md + 记 review_verdict），不进 build 那两支。
+        return _handle_review_stop(task, payload, now)
 
     elif event == "Stop" and runner == "codex":
         # Codex 的 Stop payload 没有 background_tasks/session_crons（那是

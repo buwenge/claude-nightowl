@@ -171,11 +171,21 @@ def test_codex_resume_thread_id_cases(tmp_path):
     task = store.load_task(task_id)
     assert launcher.codex_resume_thread_id(task) is None  # 首班没有 parent_id
 
+    # S7：role_shift == 1（缺省，或角色轮转的第一班）天然不要求 resume——
+    # 即便手滑给了 parent_id，也不该去查它
     task["parent_id"] = "nonexistent-parent"
+    assert launcher.codex_resume_thread_id(task) is None
+
+    # role_shift > 1 才是"同角色续班"，这时才要求 resume 父班的 thread_id
+    task["role_shift"] = 2
     assert launcher.codex_resume_thread_id(task) is None  # 父班没登记 thread_id
 
     store.update_status("nonexistent-parent", thread_id="thread-abc")
     assert launcher.codex_resume_thread_id(task) == "thread-abc"
+
+    # 旧任务（没有 role_shift 字段）退回 S6 老规则：有 parent_id 就必须 resume
+    legacy = {k: v for k, v in task.items() if k != "role_shift"}
+    assert launcher.codex_resume_thread_id(legacy) == "thread-abc"
 
 
 def make_task_codex(project_path: str | None = None, **over):
@@ -302,6 +312,7 @@ def test_launch_codex_resume_fail_closed_without_parent_thread_id(tmp_path, monk
     task_id, config = make_task_codex(project_path=str(proj))
     task = store.load_task(task_id)
     task["parent_id"] = "some-parent-without-thread"
+    task["role_shift"] = 2  # S7：role_shift > 1 才代表"同角色续班"，要求 resume
     store.atomic_write_json(store.task_dir(task_id) / "task.json", task)
     # 判失败仍会走既有的失败提醒窗口流程（碰 tmux 开个通知窗），这里只假它
     monkeypatch.setattr(
@@ -755,3 +766,95 @@ def test_launch_codex_untrusted_claude_json_does_not_block(tmux_session, codex_e
     task_id, config = make_task_codex(project_path=str(codex_env["proj"]))
     status = launcher.launch(task_id, config)
     assert status["state"] == "launching"
+
+
+# ---------- S7：审稿角色的只读命令与有效工人 ----------
+
+
+def _make_review_task(base_task_id: str, config: dict, *, review_runner: str, review_model: str, review_effort: str):
+    task = store.load_task(base_task_id)
+    task["role"] = "review"
+    task["round"] = 1
+    task["review"] = {
+        "enabled": True, "runner": review_runner, "model": review_model,
+        "effort": review_effort, "max_rounds": 5, "on_no_quota": "release",
+        "merge_policy": "manual", "criteria_text": "",
+    }
+    return task
+
+
+def test_write_task_files_review_claude_gets_readonly_tools(tmp_path):
+    task_id, config = make_task(project_path="/home/user/projects/demo")
+    review_task = _make_review_task(
+        task_id, config, review_runner="claude",
+        review_model="claude-fable-5", review_effort="high",
+    )
+    launcher.write_task_files(review_task, config, "review-session-id")
+    d = store.task_dir(task_id)
+    run_sh = (d / "run.sh").read_text(encoding="utf-8")
+    assert "--tools 'Read,Glob,Grep,Bash'" in run_sh
+    assert "--disallowedTools 'Write,Edit,NotebookEdit'" in run_sh
+    for pattern in ("Bash(git diff *)", "Bash(git log *)", "Bash(git show *)",
+                    "Bash(git status *)", "Bash(python3 -m pytest *)"):
+        assert pattern in run_sh
+    assert "--permission-mode auto" in run_sh
+    # Claude 角色不论 build/review 都要写 settings.json（hook 走 per-task 配置）
+    assert (d / "settings.json").is_file()
+
+    # build 角色（同一个任务，role 恢复默认）不带任何只读工具面参数
+    build_task = store.load_task(task_id)
+    launcher.write_task_files(build_task, config, "build-session-id")
+    build_run_sh = (d / "run.sh").read_text(encoding="utf-8")
+    assert "--tools " not in build_run_sh
+    assert "--allowedTools" not in build_run_sh
+    assert "--disallowedTools" not in build_run_sh
+
+
+def test_codex_command_review_role_uses_read_only_sandbox():
+    task = {
+        "id": "20260830-000000-aaaa", "title": "T", "project": "demo",
+        "runner": "codex", "model": "gpt-5.6-luna", "effort": "high",
+        "role": "review", "round": 1,
+        "review": {
+            "enabled": True, "runner": "codex", "model": "gpt-5.6-luna",
+            "effort": "xhigh", "max_rounds": 5, "on_no_quota": "release",
+            "merge_policy": "manual", "criteria_text": "",
+        },
+    }
+    cmd = launcher._codex_command(task, CODEX_CONFIG, "/work/tree", None)
+    assert "--sandbox read-only" in cmd
+    assert "--sandbox workspace-write" not in cmd
+    assert "--add-dir" not in cmd
+    assert "-m 'gpt-5.6-luna'" in cmd
+    assert "model_reasoning_effort=\"xhigh\"" in cmd  # 有效档位取自 review.effort
+
+    build_task = {**task, "role": "build"}
+    build_cmd = launcher._codex_command(build_task, CODEX_CONFIG, "/work/tree", None)
+    assert "--sandbox workspace-write" in build_cmd
+    assert "model_reasoning_effort=\"high\"" in build_cmd  # build 用顶层 effort
+
+
+def test_write_task_files_review_codex_skips_settings_json(tmp_path):
+    """Codex 审稿班同样走固定 nightowl profile，不写 per-task settings.json，
+    即便顶层 build runner 是 Claude（混合流水线：CC 施工 + Codex 审稿）。"""
+    task_id, config = make_task(project_path="/home/user/projects/demo")  # 顶层 runner=claude
+    review_task = _make_review_task(
+        task_id, config, review_runner="codex",
+        review_model="gpt-5.6-luna", review_effort="high",
+    )
+    review_task["review"]["runner"] = "codex"
+    config = {**config, "runners": CODEX_CONFIG["runners"]}
+    launcher.write_task_files(review_task, config, None)
+    d = store.task_dir(task_id)
+    assert not (d / "settings.json").exists()
+
+
+def test_codex_resume_thread_id_cross_role_never_resumes():
+    """S7：跨角色（build round2 的父班是 review round1）永远不 resume，
+    即便父班（角色不同）真的登记过一个 Codex thread_id。"""
+    store_home_task = {
+        "id": "child", "parent_id": "review-parent",
+        "role": "build", "round": 2, "role_shift": 1,  # 角色轮转：role_shift 恒为 1
+    }
+    store.update_status("review-parent", thread_id="review-thread-xyz")
+    assert launcher.codex_resume_thread_id(store_home_task) is None

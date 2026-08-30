@@ -681,6 +681,138 @@ def test_unknown_event_only_logs():
     assert "Notification" in events
 
 
+# ---------- S7：审稿意见文件协议（Stop → review-<round>.md） ----------
+
+
+def make_review_task(*, runner: str = "claude", round_: int = 1, **over) -> str:
+    """建一个 role=review 的任务：先走 store.create_task 的正常校验拿到一个
+    合法的 worktree=true + review.enabled=true 任务，再手工把 role/round
+    补上（create_task 本身不认这两个字段，是流水线调度器写的）。"""
+    config = dict(CONFIG)
+    if runner == "codex":
+        config["runners"] = {
+            "claude": {"models": CONFIG["models"], "efforts": CONFIG["efforts"]},
+            "codex": {"models": {"gpt-5.6-luna": {"context_limit": None}},
+                      "efforts": ["low", "medium", "high", "xhigh"]},
+        }
+        store.atomic_write_json(store.home() / "config.json", config)
+    task = {
+        "title": "审稿任务",
+        "project": "demo",
+        "model": "claude-fable-5",
+        "effort": "high",
+        "run_at": "2026-08-27T18:00:00Z",
+        "task_text": "正文",
+        "prompt_final": "完整提示词",
+        "review": {
+            "enabled": True, "runner": runner,
+            "model": "gpt-5.6-luna" if runner == "codex" else "claude-fable-5",
+            "effort": "high",
+        },
+    }
+    task.update(over)
+    task_id = store.create_task(task, config)
+    data = store.load_task(task_id)
+    data["role"] = "review"
+    data["round"] = round_
+    store.atomic_write_json(store.task_dir(task_id) / "task.json", data)
+    return task_id
+
+
+def test_stop_review_writes_review_file_and_verdict_done():
+    task_id = make_review_task()
+    text = "看过了，改动都对，测试也过。\n\nNEXT: done"
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["state"] == "idle"
+    assert status["review_verdict"] == "done"
+    assert status["review_recorded_round"] == 1
+    review_path = Path(status["review_file"])
+    assert review_path == store.task_dir(task_id) / "review-1.md"
+    assert review_path.read_text(encoding="utf-8") == text
+
+
+def test_stop_review_fix_verdict_and_file_content():
+    task_id = make_review_task(round_=2)
+    text = "有个 bug：边界条件没处理。\n改法：加个 if。\n\nNEXT: fix"
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["review_verdict"] == "fix"
+    assert status["review_file"] == str(store.task_dir(task_id) / "review-2.md")
+    assert Path(status["review_file"]).read_text(encoding="utf-8") == text
+
+
+def test_stop_review_missing_next_defaults_to_fix():
+    task_id = make_review_task()
+    text = "看完了，大体没问题，但是忘了写 NEXT 那一行。"
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["review_verdict"] == "fix"  # 协议缺失，保守按 fix
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "协议缺失" in events
+
+
+def test_stop_review_empty_message_defaults_to_fix():
+    task_id = make_review_task()
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": ""}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["review_verdict"] == "fix"
+    assert Path(status["review_file"]).is_file()
+
+
+def test_stop_review_pending_verdict():
+    task_id = make_review_task()
+    text = "额度快到线了，还没看完。\n\nNEXT: pending"
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc.returncode == 0
+    assert store.read_status(task_id)["review_verdict"] == "pending"
+
+
+def test_stop_review_idempotent_duplicate_stop_does_not_overwrite():
+    """CC 对一次残缺响应会静默重试（同一 turn 两次 Stop）：第二次不该覆盖
+    已经记过的 verdict/文件内容（moving CLAUDE.md 条目 84 的同款风险）。"""
+    task_id = make_review_task()
+    first = "第一次的意见。\n\nNEXT: done"
+    proc1 = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": first}))
+    assert proc1.returncode == 0
+    assert store.read_status(task_id)["review_verdict"] == "done"
+
+    second = "重试后不一样的意见，不该生效。\n\nNEXT: fix"
+    proc2 = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": second}))
+    assert proc2.returncode == 0
+    status = store.read_status(task_id)
+    assert status["review_verdict"] == "done"  # 第一次的结果没被覆盖
+    review_path = Path(status["review_file"])
+    assert review_path.read_text(encoding="utf-8") == first
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "忽略重复 Stop" in events
+
+
+def test_stop_review_codex_uses_same_protocol():
+    task_id = make_review_task(runner="codex")
+    text = "Codex 审稿意见。\n\nNEXT: fix"
+    proc = run_codex_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["review_verdict"] == "fix"
+    assert status["state"] == "idle"
+    assert Path(status["review_file"]).read_text(encoding="utf-8") == text
+
+
+def test_stop_build_role_never_writes_review_file():
+    """role=build（缺省）的普通任务走原生 Stop 分支，不产生 review 文件。"""
+    task_id = make_task()
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": "干完了"}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert "review_verdict" not in status
+    assert not (store.task_dir(task_id) / "review-1.md").exists()
+
+
 def test_silence_on_empty_stdin():
     task_id = make_task()
     proc = run_hook(task_id, "Stop", "")

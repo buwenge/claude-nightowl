@@ -13,6 +13,9 @@ from pathlib import Path
 from . import store, worktree
 
 __all__ = [
+    "REVIEW_ALLOWED_TOOLS",
+    "REVIEW_DISALLOWED_TOOLS",
+    "REVIEW_TOOLS",
     "capture_pane",
     "claude_bin",
     "close_windows",
@@ -31,6 +34,18 @@ __all__ = [
     "workdir_for",
     "write_task_files",
 ]
+
+# S7：审稿班（无论 Claude 还是 Codex）的只读工具面。Claude 用 --tools 整体
+# 收窄可见工具集 + --allowedTools 只放行只读文件工具与参数受限的
+# git diff/log/show/status、pytest；再用 --disallowedTools 明确挡
+# Write/Edit/NotebookEdit——双保险，不靠单一机制。
+REVIEW_TOOLS = "Read,Glob,Grep,Bash"
+REVIEW_ALLOWED_TOOLS = (
+    "Read", "Glob", "Grep",
+    "Bash(git diff *)", "Bash(git log *)", "Bash(git show *)", "Bash(git status *)",
+    "Bash(python3 -m pytest *)",
+)
+REVIEW_DISALLOWED_TOOLS = "Write,Edit,NotebookEdit"
 
 # 窗口 id 只认 tmux 的 @N 形状：杜绝任何模糊目标（会话名/窗口名通配）
 _WINDOW_ID_RE = re.compile(r"^@\d+$")
@@ -67,11 +82,31 @@ def codex_bin(config: dict) -> str:
     return os.environ.get("NIGHTSHIFT_CODEX_BIN") or rc.get("bin", "codex")
 
 
+def _requires_codex_resume(task: dict) -> bool:
+    """这一班是否要求 resume 父班的 Codex thread（S7：跨角色永远新会话，
+    只有同角色续班才 resume）。
+
+    role_shift 字段存在（S7 起新建的任务）时按"role_shift > 1"判断——
+    只有 create_same_role_successor 会把这个数字往上推，角色轮转
+    （create_cross_role_successor）永远从 1 起，天然不要求 resume。
+    旧任务（S7 之前落盘，没有这个字段）退回 S6 的老规则：只要有
+    parent_id 就必须 resume，不能因为新字段缺失被误判成"角色轮转第一班"
+    从而悄悄开一个没有上下文的新会话。
+    """
+    if "role_shift" in task:
+        return int(task.get("role_shift") or 1) > 1
+    return bool(task.get("parent_id"))
+
+
 def codex_resume_thread_id(task: dict) -> str | None:
-    """同角色续班要不要 resume 同一个 Codex thread：只有这一班是某个父班的
-    后继（task.parent_id 存在）时才查；父班没登记 thread_id（没起过、
+    """同角色续班要不要 resume 同一个 Codex thread：`_requires_codex_resume`
+    判否就直接返回 None（这一班天然该起新会话，不是异常——role_shift 只有
+    create_same_role_successor 会推进，天然保证父班同角色，不需要额外
+    再查一次父班 task.json 的 role）；判是但父班没登记 thread_id（没起过、
     Claude 父班、或还没等到 SessionStart）一律返回 None，调用方据此
     fail-closed，不能悄悄开一个没有上下文的新会话。"""
+    if not _requires_codex_resume(task):
+        return None
     parent_id = task.get("parent_id")
     if not parent_id:
         return None
@@ -131,12 +166,26 @@ def workdir_for(task: dict, config: dict) -> str:
 
 
 def _claude_command(task: dict, config: dict, session_id: str) -> str:
-    """Claude Code 的命令行，字节级保持一期以来的样子（S6 不许动）。"""
+    """Claude Code 的命令行。build 角色字节级保持一期以来的样子（S6 不许
+    动，effective_model/effective_effort 对 build 等价于 task['model']/
+    task['effort']，不改变输出）；review 角色额外插入只读工具面三件套
+    （--tools 收窄可见工具、--allowedTools 只放行只读文件工具与参数受限的
+    git diff/log/show/status/pytest、--disallowedTools 明确挡
+    Write/Edit/NotebookEdit），--permission-mode auto 与其余参数顺序不变。
+    """
     d = store.task_dir(task["id"])
-    return " ".join([
+    parts = [
         _sq(claude_bin(config)),
-        f"--model {_sq(task['model'])}",
-        f"--effort {_sq(task['effort'])}",
+        f"--model {_sq(store.effective_model(task))}",
+        f"--effort {_sq(store.effective_effort(task))}",
+    ]
+    if store.role_of(task) == "review":
+        parts += [
+            f"--tools {_sq(REVIEW_TOOLS)}",
+            f"--allowedTools {_sq(','.join(REVIEW_ALLOWED_TOOLS))}",
+            f"--disallowedTools {_sq(REVIEW_DISALLOWED_TOOLS)}",
+        ]
+    parts += [
         "--permission-mode auto",
         f"--name {_sq(config['window_prefix'] + task['title'])}",
         f"--session-id {_sq(session_id)}",
@@ -144,25 +193,30 @@ def _claude_command(task: dict, config: dict, session_id: str) -> str:
         # 提示词必须整体包在双引号里：裸 $(cat …) 会被 shell 按空白切词、
         # 展开 $ 与通配符，多行任务内容会打散成一堆参数。
         f"\"$(cat {_sq(d / 'prompt.txt')})\"",
-    ])
+    ]
+    return " ".join(parts)
 
 
 def _codex_command(task: dict, config: dict, workdir: str, resume_thread_id: str | None) -> str:
     """Codex 的命令行（开工令 S6②样例）：resume_thread_id 给了就 resume
-    同一个 thread（同角色续班），否则起一个全新会话。"""
+    同一个 thread（同角色续班），否则起一个全新会话。build 角色沙箱固定
+    workspace-write（字节级不变）；review 角色固定 --sandbox read-only——
+    不用 --add-dir（会给额外目录写权限，不是只读挂载），也不靠它交审稿
+    文件（Stop hook 在沙箱外原子落盘，见 hook.py）。"""
     d = store.task_dir(task["id"])
     rc = store.runner_config(config).get("codex") or {}
     profile = rc.get("profile", "nightowl")
     trust_override = f'projects."{workdir}".trust_level="trusted"'
-    effort_override = f'model_reasoning_effort="{task["effort"]}"'
+    effort_override = f'model_reasoning_effort="{store.effective_effort(task)}"'
+    sandbox = "read-only" if store.role_of(task) == "review" else "workspace-write"
     parts = [_sq(codex_bin(config))]
     if resume_thread_id:
         parts += ["resume", _sq(resume_thread_id)]
     parts += [
         f"-C {_sq(workdir)}",
-        "--sandbox workspace-write",
+        f"--sandbox {sandbox}",
         "--ask-for-approval never",
-        f"-m {_sq(task['model'])}",
+        f"-m {_sq(store.effective_model(task))}",
         f"-c {_sq(effort_override)}",
         f"-c {_sq(trust_override)}",
         f"--profile {_sq(profile)}",
@@ -185,7 +239,9 @@ def run_sh_text(
     d = store.task_dir(task["id"])
     workdir = workdir_for(task, config)
     repo_root = Path(__file__).resolve().parent.parent
-    runner = task.get("runner") or "claude"
+    # S7：审稿班可能跟施工班用不同的 runner（task.review.runner），命令行/
+    # 环境导出一律按这一班自己的有效工人，不能只看顶层 build runner。
+    runner = store.effective_runner(task)
     lines = [
         "#!/bin/bash",
         f"# nightshift 任务 {task['id']}：{task['title']}",
@@ -231,9 +287,16 @@ def _prompt_text(task: dict) -> str:
     永远且只会出现一次这段协议。
     """
     text = task["prompt_final"]
-    if worktree.wants_worktree(task) and store.WORKTREE_INSTRUCTION not in text:
+    # S7：工作树安全前言只对 build 角色追加——review 角色本来就只读、不
+    # commit，review_template 自己的措辞已经说清楚，硬套"调度器会打存档点"
+    # 这句反而误导（审稿班不产生存档点）。
+    if (
+        worktree.wants_worktree(task)
+        and store.role_of(task) == "build"
+        and store.WORKTREE_INSTRUCTION not in text
+    ):
         text = store.WORKTREE_INSTRUCTION + "\n\n" + text
-    if (task.get("runner") or "claude") == "codex" and store.CODEX_BACKGROUND_INSTRUCTION not in text:
+    if store.effective_runner(task) == "codex" and store.CODEX_BACKGROUND_INSTRUCTION not in text:
         text = store.CODEX_BACKGROUND_INSTRUCTION + "\n\n" + text
     return text
 
@@ -252,7 +315,7 @@ def write_task_files(
     d.mkdir(parents=True, exist_ok=True)
     # 上一轮窗口留下的 exit_code 先删：那是旧工人的死讯，不能拿来误判新窗口
     (d / "exit_code").unlink(missing_ok=True)
-    if (task.get("runner") or "claude") != "codex":
+    if store.effective_runner(task) != "codex":
         store.atomic_write_json(d / "settings.json", hook_settings(task["id"]))
     store.atomic_write_text(d / "prompt.txt", _prompt_text(task))
     run_sh = d / "run.sh"
@@ -298,7 +361,9 @@ def launch(task_id: str, config: dict) -> dict:
     """
     task = store.load_task(task_id)
     project_path = config["projects"][task["project"]]
-    runner = task.get("runner") or "claude"
+    # S7：这一班自己的有效工人（review 角色可能跟顶层 build runner 不同），
+    # 信任检查/session 生成方式/thread 记账全部按它来，不能只看 task["runner"]。
+    runner = store.effective_runner(task)
 
     # ① 目录没信任过，交互式 claude 会卡在信任问答 → 直接判失败。
     # 只查主项目路径：信任预检不要求工作树单独出现在 ~/.claude.json 里。
@@ -333,7 +398,7 @@ def launch(task_id: str, config: dict) -> dict:
     # ①'' S6：Codex 同角色续班要 resume 父班的 thread；父班没留下 thread_id
     # 就 fail-closed（不能悄悄开一个没有上下文的新会话）。
     resume_thread_id = None
-    if runner == "codex" and task.get("parent_id"):
+    if runner == "codex" and _requires_codex_resume(task):
         resume_thread_id = codex_resume_thread_id(task)
         if not resume_thread_id:
             reason = (
