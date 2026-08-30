@@ -1667,6 +1667,39 @@ def test_pipeline_hold_send_failure_does_not_mark_awaiting_verdict_false(authed,
     assert "hold 控制消息投递失败" in events
 
 
+def test_pipeline_hold_fast_stop_before_send_returns_still_treated_as_control(
+    authed, monkeypatch
+):
+    """S7.3 阻断二反例：假 send_keys 在"返回"之前就同步触发了 review 的
+    Stop（模拟真实世界里 send-keys 系统调用返回与目标会话真的处理完/发出
+    Stop 之间没有硬先后保证——旧写法"send 成功后才落
+    review_awaiting_verdict=False"在这个窗口里是错的：Stop 抢先到达时看到
+    的还是 awaiting=True，会把这句"收到，我停下"的控制回复错当协议缺失，
+    保守记成 verdict=fix。S7.3 把 awaiting_verdict/control_kind 挪到 send
+    之前落盘后，这条 Stop 应该被正确识别成控制 turn，state 转 held，
+    verdict 不会被设成 fix。"""
+    from nightshift import hook
+
+    build_id, review_id = make_review_pipeline(authed, review_state="working")
+
+    def fake_send_keys(wid, text):
+        if wid == "@2":  # review 窗口：模拟它立刻回一句不含 NEXT 的确认
+            hook.handle_event(
+                review_id, "Stop", {"last_assistant_message": "收到，我停下"},
+            )
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(launcher, "send_keys", fake_send_keys)
+
+    status, _, body = authed.request("POST", f"/api/tasks/{review_id}/hold")
+    assert status == 200 and body["hold_requested"] is True
+    review_status = store.read_status(review_id)
+    assert review_status["state"] == "held"
+    assert review_status.get("review_verdict") != "fix"
+    assert "review_verdict" not in review_status
+
+
 def test_pipeline_hold_blocks_next_review_verdict_routing(authed, monkeypatch):
     """先按"我来看"，再让审稿给出 done：下一 tick 应该被拦在 held，不直接合并。"""
     from nightshift import scheduler
@@ -1711,6 +1744,62 @@ def test_pipeline_continue_after_hold_reevaluates_blocked_band(authed, monkeypat
     assert store.read_status(review_id)["state"] == "idle"
     scheduler.tick(store.load_config(), datetime.now(timezone.utc))
     assert store.read_status(review_id)["state"] == "awaiting_merge"  # 真的往下走了
+
+
+def test_pipeline_continue_hold_mid_review_sends_resume_and_recovers(
+    authed, monkeypatch
+):
+    """S7.3 阻断三反例：review 被"我来看"中途拦住、还没有 verdict——继续
+    不能只是拨回 idle（`_check_review_idle` 一看 `review_verdict is None`
+    就直接 `return None`，永久停在 idle）。要用 `send_review_control` 真正
+    发一句"继续"文案让它接着干活：send 成功后 state 变 working、
+    `review_awaiting_verdict` 恢复 True（供接下来的 Stop 正确解析成正式
+    verdict），不是简单地拨回 idle 让旧 handover/交接状态决定命运。"""
+    build_id, review_id = make_review_pipeline(authed, review_state="held")
+    store.update_status(
+        review_id, held_reason="我来看：工头要来看，已停在这里",
+        review_awaiting_verdict=False, review_control_kind="hold",
+    )
+    store.update_status(build_id, hold_requested=True)
+
+    sent = []
+
+    def fake_send_keys(wid, text):
+        sent.append((wid, text))
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(launcher, "send_keys", fake_send_keys)
+
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/continue")
+    assert status == 200 and body["resumed"] is True
+    assert len(sent) == 1 and sent[0][0] == "@2"
+    assert "NEXT" in sent[0][1]
+    review_status = store.read_status(review_id)
+    assert review_status["state"] == "working"
+    assert review_status["review_awaiting_verdict"] is True
+
+
+def test_pipeline_continue_hold_mid_review_send_failure_returns_409(
+    authed, monkeypatch
+):
+    """继续中途暂停的 reviewer 时 send-keys 失败：不能假装"继续"成功了，
+    要返回非 2xx，state 保持 held 不动（不悄悄改成 working）。"""
+    build_id, review_id = make_review_pipeline(authed, review_state="held")
+    store.update_status(
+        review_id, held_reason="我来看：工头要来看，已停在这里",
+        review_awaiting_verdict=False, review_control_kind="hold",
+    )
+    store.update_status(build_id, hold_requested=True)
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(
+        launcher, "send_keys",
+        lambda wid, text: subprocess.CompletedProcess([], 1, "", "失败"),
+    )
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/continue")
+    assert status == 409
+    review_status = store.read_status(review_id)
+    assert review_status["state"] == "held"
 
 
 def test_pipeline_continue_without_hold_or_round_limit_409(authed):
@@ -1767,6 +1856,88 @@ def test_pipeline_review_now_only_targets_postponed_reviewer(authed):
     build_id2, review_id2 = make_review_pipeline(authed, review_state="working")
     status, _, body = authed.request("POST", f"/api/tasks/{build_id2}/review-now")
     assert status == 409
+
+
+def _add_review_generation(build_id: str, *, round_: int, shift: int, state: str) -> str:
+    """在一条已存在的流水线上再挂一个 role=review 的任务（模拟第二轮/
+    pending-release 产生的又一代 review），供 S7.3 阻断四的反例复用。"""
+    build_task = store.load_task(build_id)
+    review_task = {
+        "title": build_task["title"], "project": build_task["project"],
+        "runner": build_task["runner"], "model": build_task["model"],
+        "effort": build_task["effort"], "run_at": "2026-08-28T18:00:00Z",
+        "task_text": build_task["task_text"], "prompt_final": "REVIEW",
+        "review": dict(build_task["review"]), "worktree": True,
+    }
+    review_id = store.create_task(review_task, store.load_config())
+    data = store.load_task(review_id)
+    data.update({
+        "role": "review", "round": round_, "role_shift": 1,
+        "parent_id": build_id, "pipeline_id": build_id, "shift": shift,
+    })
+    store.atomic_write_json(store.task_dir(review_id) / "task.json", data)
+    store.update_status(review_id, state=state, window_id="@3", pane_pid=3)
+    return review_id
+
+
+def test_pipeline_skip_review_ignores_historical_chained_review(authed):
+    """S7.3 阻断四反例（返修令原文 `skip_historical_review chained 1`）：
+    第一轮 review 已经 `chained`（历史记录，shift 更小），build 进入第二轮
+    后新起的 review 是 `scheduled`（shift 更大，"当前一代"）——skip-review
+    应该能成功，不该被第一轮那条永久存在的历史记录挡住。"""
+    build_id, review1_id = make_review_pipeline(authed, review_state="scheduled")
+    store.update_status(review1_id, state="chained")  # 第一轮已经走完
+    review2_id = _add_review_generation(
+        build_id, round_=2, shift=4, state="scheduled"
+    )
+    store.update_status(build_id, successor_id=review2_id)
+
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/skip-review")
+    assert status == 200, body
+    assert store.read_status(review2_id)["state"] == "cancelled"
+    assert store.read_status(review1_id)["state"] == "chained"  # 历史记录没被碰
+
+
+def test_pipeline_skip_review_ignores_historical_review_after_pending_release(authed):
+    """S7.3 阻断四反例：pending release 之后同一轮出现"旧 chained + 新
+    postponed"两条 review 记录（round 相同，shift 不同）——skip-review 应该
+    只看 shift 更大的那条（当前一代），历史那条不参与判断，也不会被取消。"""
+    build_id, review1_id = make_review_pipeline(authed, review_state="scheduled")
+    store.update_status(review1_id, state="chained")  # pending release 后旧记录
+    review2_id = _add_review_generation(
+        build_id, round_=1, shift=3, state="postponed"
+    )
+    store.update_status(build_id, successor_id=review2_id)
+
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/skip-review")
+    assert status == 200, body
+    assert store.read_status(review2_id)["state"] == "cancelled"
+    assert store.read_status(review1_id)["state"] == "chained"
+
+
+def test_pipeline_skip_review_still_rejects_current_held_with_history_present(authed):
+    """回归：历史记录存在不该让"当前一代 held"被误放行——阻断四只收窄
+    遍历范围，不改变阻断八已经建立的"活跃态一律拒绝"规则。"""
+    build_id, review1_id = make_review_pipeline(authed, review_state="scheduled")
+    store.update_status(review1_id, state="chained")
+    review2_id = _add_review_generation(build_id, round_=2, shift=4, state="held")
+    store.update_status(build_id, successor_id=review2_id)
+
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/skip-review")
+    assert status == 409, body
+    assert store.read_status(review2_id)["state"] == "held"  # 没被悄悄取消
+
+
+def test_pipeline_skip_review_still_rejects_current_working_with_history_present(authed):
+    """回归：working 同理。"""
+    build_id, review1_id = make_review_pipeline(authed, review_state="scheduled")
+    store.update_status(review1_id, state="chained")
+    review2_id = _add_review_generation(build_id, round_=2, shift=4, state="working")
+    store.update_status(build_id, successor_id=review2_id)
+
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/skip-review")
+    assert status == 409, body
+    assert store.read_status(review2_id)["state"] == "working"
 
 
 def test_pipeline_skip_review_cancels_pending_review_and_finalizes(authed):

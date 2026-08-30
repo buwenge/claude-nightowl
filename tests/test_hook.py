@@ -956,7 +956,7 @@ def test_stop_review_file_write_failure_leaves_verdict_unset_and_retryable():
     assert "review_verdict" not in status
     assert "review_verdict_final" not in status
     assert "review_recorded_round" not in status
-    assert "review_file_claim_round" not in status  # 失败后 claim 标记已清掉
+    assert "review_file_claim" not in status  # 失败后 claim 标记已清掉
     events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
     assert "写审稿文件失败" in events
     assert "本轮可重试" in events
@@ -968,6 +968,76 @@ def test_stop_review_file_write_failure_leaves_verdict_unset_and_retryable():
     assert status2["review_verdict"] == "done"
     assert status2["review_verdict_final"] is True
     assert Path(status2["review_file"]).read_text(encoding="utf-8") == text
+
+
+def test_stop_review_fresh_claim_still_blocks_concurrent_stop():
+    """S7.3 阻断一反例（未过期对照组）：手工放一个"刚刚"claim（claimed_at
+    是现在），紧接着送一个合法 NEXT: done 的 Stop——必须仍按 duplicate
+    处理，不写文件、不落 verdict。锁住"没过期时不能被新的过期判断误放行"，
+    防止这次改动引入相反方向的新 bug。"""
+    task_id = make_review_task()
+    now = store.utc_now_iso()
+    store.update_status(
+        task_id, review_file_claim={"round": 1, "token": "old-token", "claimed_at": now},
+    )
+    text = "本该被挡住的意见。\n\nNEXT: done"
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert "review_verdict" not in status
+    assert not (store.task_dir(task_id) / "review-1.md").is_file()
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "忽略重复 Stop" in events
+
+
+def test_stop_review_stale_claim_after_claim_before_write_crash_recovers():
+    """S7.3 阻断一反例（切点①：claim 落盘之后、写文件之前崩溃）：手工放一个
+    "40 秒前"（超过 30 秒过期阈值）的 claim，目标文件不存在（模拟上一次
+    在这一步之后就死了，从没写过文件）。下一次 Stop 必须能正常写文件、
+    正常落 verdict——不能像返修令描述的那样永远停在
+    state=working, verdict=None, claim 卡住。"""
+    task_id = make_review_task()
+    stale_at = (
+        datetime.now(timezone.utc) - timedelta(seconds=40)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.update_status(
+        task_id,
+        review_file_claim={"round": 1, "token": "dead-token", "claimed_at": stale_at},
+    )
+    assert not (store.task_dir(task_id) / "review-1.md").is_file()
+    text = "过期 claim 之后重新处理的意见。\n\nNEXT: done"
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["review_verdict"] == "done"
+    assert status["review_recorded_round"] == 1
+    assert "review_file_claim" not in status
+    assert Path(status["review_file"]).read_text(encoding="utf-8") == text
+
+
+def test_stop_review_stale_claim_after_write_before_commit_crash_recovers():
+    """S7.3 阻断一反例（切点②：写文件之后、commit 之前崩溃）：手工放一个
+    过期 claim，且目标文件已经存在（模拟上一次真的写完了文件，但在
+    commit verdict 那一步之前就死了）。下一次 Stop 重新 claim、重新走
+    一遍——旧文件内容会被这次 Stop 的正文覆盖，这是预期行为（不是从半途
+    恢复，是干净地重做一遍），最终 verdict 与新文件内容要对得上。"""
+    task_id = make_review_task()
+    review_path = store.task_dir(task_id) / "review-1.md"
+    review_path.write_text("上一次死掉前已经写好但没提交的旧内容", encoding="utf-8")
+    stale_at = (
+        datetime.now(timezone.utc) - timedelta(seconds=40)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.update_status(
+        task_id,
+        review_file_claim={"round": 1, "token": "dead-token-2", "claimed_at": stale_at},
+    )
+    text = "重新处理后的新意见。\n\nNEXT: fix"
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["review_verdict"] == "fix"
+    assert "review_file_claim" not in status
+    assert review_path.read_text(encoding="utf-8") == text
 
 
 def test_stop_review_concurrent_stop_accepts_only_one_verdict():

@@ -14,6 +14,7 @@ import logging.handlers
 import re
 import sys
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -56,6 +57,13 @@ DEFAULT_CODEX_RESUME_TEXT = (
 # pending 三选一，不能沿用 build 那句"从刚才停下的地方继续"（不成协议）。
 DEFAULT_REVIEW_RESUME_TEXT = (
     "来自nightshift：额度应已刷新，请继续完成这一轮审稿——"
+    "结束时仍然只用 NEXT: done / NEXT: fix / NEXT: pending 三选一。"
+)
+# S7.3 阻断三："我来看"中途暂停一个还没给出 verdict 的 reviewer，"继续"要
+# 真正让它接着干活——不是额度刷新，不能沿用 DEFAULT_REVIEW_RESUME_TEXT
+# 那句"额度应已刷新"（说法不对）。
+DEFAULT_REVIEW_HOLD_RESUME_TEXT = (
+    "来自nightshift：工头看完了，继续这一轮审稿——"
     "结束时仍然只用 NEXT: done / NEXT: fix / NEXT: pending 三选一。"
 )
 # 交接文件末行的换班指令（设计稿 §4.4）
@@ -1030,17 +1038,19 @@ def _check_running(
             return []
         text = config.get("review_resume_text") or DEFAULT_REVIEW_RESUME_TEXT
         # S7.2 阻断五.3：resume 不是控制 turn（接下来期待一份真正的
-        # verdict），success_fields 把 review_awaiting_verdict=True 跟
-        # quota_resume_sent/state 一起放进"成功才落盘"的那组字段——以前
-        # 是先落 awaiting_verdict=True 再 send，send 失败时这个字段已经被
-        # 污染，导致失败期间任何一次控制回复（比如误触发的保活）都会被
-        # 当成正式 verdict 尝试解析。
+        # verdict）；S7.3 阻断二：awaiting_verdict=True 必须在 send 之前
+        # 落盘（放进 pre_send_fields），否则 Stop 抢在 send 返回前到达时
+        # 看到的仍是旧值，会被当成协议缺失误判——不是"send 失败污染状态"
+        # 这一种竞态，是"send 成功但落盘还没跟上"这一种，S7.2 的"send 后
+        # 才落盘"顺序本身就不够。quota_resume_sent/state 这些不参与"下一
+        # 次 Stop 怎么解释"判断的字段留在 success_only_fields，且只在这次
+        # 投递没被 hook 抢先消费时才应用。
         sent = send_review_control(
             task_id, str(window_id), text, kind="resume",
-            success_fields={
-                "review_awaiting_verdict": True, "quota_resume_sent": True,
-                "quota_paused_until": None, "state": "working",
-                "last_event_at": to_iso(now),
+            pre_send_fields={"review_awaiting_verdict": True},
+            success_only_fields={
+                "quota_resume_sent": True, "quota_paused_until": None,
+                "state": "working", "last_event_at": to_iso(now),
             },
             failure_note="，未能叫醒它继续",
         )
@@ -1085,26 +1095,25 @@ def _check_running(
         return []
 
     text = rc.get("keepalive_text") or DEFAULT_KEEPALIVE_TEXT
-    keepalive_fields = {
-        "last_keepalive_at": to_iso(now),
-        "keepalive_count": int(status.get("keepalive_count") or 0) + 1,
-    }
+    # S7.1 阻断二：保活探针不是要求正式 verdict 的回复——review 角色要让
+    # review_awaiting_verdict=False + review_control_kind="keepalive" 在
+    # send 之前就生效（S7.3 阻断二：不能等 send 成功后才落盘，否则 Stop
+    # 抢在落盘之前到达仍会被误判协议缺失、记成 fix；build 角色没有这套
+    # awaiting_verdict 概念，pre_send_fields 留空）；last_keepalive_at/
+    # keepalive_count 这类不参与"下一次 Stop 怎么解释"判断的计数字段留在
+    # success_only_fields，只在确认送达后才落盘。
+    pre_send_fields: dict = {}
     if store.role_of(task) == "review":
-        # S7.1 阻断二：保活探针不是要求正式 verdict 的回复——发送成功后落
-        # review_awaiting_verdict=False + review_control_kind="keepalive"，
-        # 让接下来的 Stop 走控制 turn 分支，不会被 _parse_review_verdict
-        # 判协议缺失、误记成 fix；kind 供 _handle_review_stop 决定 Stop
-        # 之后要不要改 state（keepalive 保持原样不动）。
-        keepalive_fields["review_awaiting_verdict"] = False
-        keepalive_fields["review_control_kind"] = "keepalive"
-    # S7.2 阻断五.2：以前先 send-keys、不检查返回值就照样落
-    # last_keepalive_at/keepalive_count（build 与 review 都受影响）；review
-    # 还会额外把 review_awaiting_verdict 提前置 False——send 真失败时状态
-    # 已经被污染（build：计数虚增；review：下一次真实 Stop 会被误当控制
-    # turn 吞掉）。统一走 send_review_control：只有确认送达才落盘计数/标记。
+        pre_send_fields = {
+            "review_awaiting_verdict": False, "review_control_kind": "keepalive",
+        }
     sent = send_review_control(
         task_id, str(window_id), text, kind="keepalive",
-        success_fields=keepalive_fields,
+        pre_send_fields=pre_send_fields,
+        success_only_fields={
+            "last_keepalive_at": to_iso(now),
+            "keepalive_count": int(status.get("keepalive_count") or 0) + 1,
+        },
         failure_note="（计数/控制标记均未落盘，下一 tick 会重试）",
     )
     if sent:
@@ -1419,26 +1428,66 @@ DEFAULT_REVIEW_STOP_BUILD_TEXT = (
 
 def send_review_control(
     task_id: str, window_id: str, text: str, *, kind: str,
-    success_fields: dict, failure_note: str = "",
+    pre_send_fields: dict, success_only_fields: dict | None = None,
+    failure_note: str = "",
 ) -> bool:
-    """review 控制消息统一投递：先 send-keys，成功了才把 `success_fields`
-    一次性落盘；失败时什么持久状态都不碰，只记 events。
+    """review 控制/恢复消息的统一投递。
 
     S7.2 阻断五.2/5.3：keepalive/hold/resume 三处以前都是"先落状态字段
     （awaiting_verdict/control_kind/计数器），再 send-keys"——send 失败时
     状态已经被污染（keepalive 计数虚增却什么都没发出去；resume 把
     awaiting_verdict 提前置 True，没回滚，导致下一次任何控制回复都可能被
-    误解析成正式 verdict）。统一收进这一个 helper，倒转顺序：只有确认
-    送达才提交状态，失败保持"这次投递等于没发生"，下一 tick 自然会重试。
+    误解析成正式 verdict）。S7.2 把顺序倒转成"send 成功才落状态"，但这
+    还不够。
+
+    S7.3 阻断二：真实世界里 send-keys 这个系统调用"返回"和"目标会话真的
+    处理完、已经开始新一轮直到发出 Stop"这两件事之间没有硬先后保证（测试
+    环境里更是可以让假 send_keys 同步触发 Stop 回调）——如果 Stop 抢在
+    我们落盘 `review_awaiting_verdict=False`（或 resume 场景的 True）
+    之前到达，Stop 看到的仍是旧值，会把这次控制/恢复回复解析错。
+
+    改法：`pre_send_fields`——那些"决定下一次 Stop 该怎么解释"的字段
+    （控制 turn 是 awaiting_verdict=False+control_kind=kind；resume 是
+    awaiting_verdict=True）——必须在 send-keys **之前**原子落盘，堵住这个
+    竞态窗口。send 失败时精确回滚到 send 之前的值。`success_only_fields`
+    （计数器/时间戳这类不参与"下一次 Stop 怎么解释"判断的字段）仍然只在
+    send 确认成功后才落盘，且要用 `delivery_id` 核验这次投递还没被 hook
+    抢先消费——`_handle_review_stop` 的 `do_claim` 处理任何 Stop 时都会
+    清掉 `review_control_delivery`，如果我们发现它已经不是自己那份
+    delivery_id，说明 hook 已经先一步做出了判断（可能已经把 state 从
+    held 推进到 idle 了），这时候不能再用 `success_only_fields`（比如
+    resume 的 `state="working"`）把 hook 已经推进的结果覆盖回去。
     """
+    prior = store.read_status(task_id)
+    prior_values = {k: prior.get(k) for k in pre_send_fields}
+    delivery_id = uuid.uuid4().hex
+    store.update_status(task_id, review_control_delivery=delivery_id, **pre_send_fields)
     proc = launcher.send_keys(str(window_id), text)
     if proc.returncode != 0:
+        def rollback(status: dict) -> None:
+            if status.get("review_control_delivery") != delivery_id:
+                return  # 已经被后来者/hook 动过，不要把不再是"我们的"状态回滚回去
+            for key, value in prior_values.items():
+                if value is None:
+                    status.pop(key, None)
+                else:
+                    status[key] = value
+            status.pop("review_control_delivery", None)
+
+        store.modify_status(task_id, rollback)
         store.append_event(
             task_id,
             f"{kind} 控制消息投递失败（returncode={proc.returncode}）{failure_note}",
         )
         return False
-    store.update_status(task_id, **success_fields)
+
+    def finalize(status: dict) -> None:
+        if status.get("review_control_delivery") != delivery_id:
+            return  # hook 已经先消费掉了，success_only_fields 不再适用
+        status.pop("review_control_delivery", None)
+        status.update(success_only_fields or {})
+
+    store.modify_status(task_id, finalize)
     return True
 
 

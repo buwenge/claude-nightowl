@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -428,6 +429,11 @@ def _post_tool_use_refresh(task: dict, status: dict, payload: dict) -> str | Non
 
 _RE_REVIEW_NEXT = re.compile(r"^NEXT:\s*(done|fix|pending)\s*$")
 
+# S7.3 阻断一：review file claim 的过期阈值。真实 hook 进程是 ~100ms 量级完成
+# （见模块顶部说明），30 秒足够跟"另一个 Stop 还没写完文件"的正常并发区分开，
+# 又不会让真崩溃卡太久没人接手。
+_REVIEW_CLAIM_STALE_SECONDS = 30
+
 
 def review_file_path(task: dict) -> Path:
     """审稿班这一轮的意见文件路径：task_dir(审稿 task id)/review-<round>.md
@@ -507,6 +513,11 @@ def _handle_review_stop(task: dict, payload: dict, now: str) -> None:
     claim: dict = {}
 
     def do_claim(status: dict) -> None:
+        # S7.3 阻断二：任何一次 Stop 都算"消费掉了"上一个还没收尾的
+        # send_review_control 投递意图——不管这次 Stop 最终判成 control 还是
+        # claimed，都不该让发送方后续的 finalize 步骤覆盖这次已经做出的
+        # 判断（见 scheduler.send_review_control 的 delivery_id 核验）。
+        status.pop("review_control_delivery", None)
         if not status.get("review_awaiting_verdict", True):
             claim["kind"] = "control"
             control_kind = status.get("review_control_kind")
@@ -527,14 +538,35 @@ def _handle_review_stop(task: dict, payload: dict, now: str) -> None:
         if status.get("review_recorded_round") == round_ and verdict_final:
             claim["kind"] = "duplicate"
             return
-        if status.get("review_file_claim_round") == round_:
-            # 已经有别的 Stop 在写这一轮的文件、还没提交完——当重复处理，
-            # 不并发写两份内容可能不同的文件（atomic_write_text 的 nonce
-            # 只保证不撞文件名，不保证两份内容谁该赢）。
-            claim["kind"] = "duplicate"
-            return
+        # S7.3 阻断一：claim 从裸整数换成带 token/claimed_at 的字典——裸整数
+        # 一旦落盘、hook 进程在写文件之前就崩溃，永远不会被清掉，后续所有
+        # Stop 都会被当"正在处理中"挡住，谁都不会真正写文件/落 verdict。
+        # 加一个过期判断：claim 超过 _REVIEW_CLAIM_STALE_SECONDS 还没收尾，
+        # 视为上一个 claim 者已经崩溃/消失，允许这次 Stop 重新 claim、
+        # 重新走一遍完整流程（不尝试从半途恢复——这次 Stop 自己的 payload
+        # 就是完整正文，直接重做一遍比"猜上一次写到哪了"更可靠）。
+        existing = status.get("review_file_claim") or {}
+        if existing.get("round") == round_:
+            claimed_at = existing.get("claimed_at")
+            stale = True
+            if claimed_at:
+                try:
+                    age = datetime.fromisoformat(now) - datetime.fromisoformat(claimed_at)
+                    stale = age >= timedelta(seconds=_REVIEW_CLAIM_STALE_SECONDS)
+                except ValueError:
+                    stale = True
+            if not stale:
+                # 已经有别的 Stop 在写这一轮的文件、还没提交完，且还没过期
+                # ——当重复处理，不并发写两份内容可能不同的文件
+                # （atomic_write_text 的 nonce 只保证不撞文件名，不保证两份
+                # 内容谁该赢）。
+                claim["kind"] = "duplicate"
+                return
         claim["kind"] = "claimed"
-        status["review_file_claim_round"] = round_
+        claim["token"] = uuid.uuid4().hex
+        status["review_file_claim"] = {
+            "round": round_, "token": claim["token"], "claimed_at": now,
+        }
 
     store.modify_status(task_id, do_claim)
 
@@ -561,13 +593,24 @@ def _handle_review_stop(task: dict, payload: dict, now: str) -> None:
         # update_status 是合并语义，传 None 会把键留在 status 里，跟"从没
         # claim 过"不是同一份 JSON），净效果等于没变；同一轮后续 Stop 可以
         # 重新 claim、重新尝试写文件。
-        store.modify_status(task_id, lambda status: status.pop("review_file_claim_round", None))
+        store.modify_status(task_id, lambda status: status.pop("review_file_claim", None))
         store.append_event(
             task_id, f"hook Stop(review) 写审稿文件失败：{exc!r}，本轮可重试"
         )
         return None
 
+    commit_result: dict = {}
+
     def do_commit(status: dict) -> None:
+        # S7.3 阻断一：提交前核验这个 claim 还是不是"我们的"——极端情况下
+        # 这次写文件写了很久，同时另一个更晚到达的 Stop 因为看到 claim 过期
+        # 又重新 claim 了一次，两边不能都以为自己是当前处理者。token 不匹配
+        # 说明已经被取代，这次写文件白做了，不提交（不算错误，只是这次
+        # Stop 的结果被让位给了后来者）。
+        current_claim = status.get("review_file_claim") or {}
+        if current_claim.get("token") != claim.get("token"):
+            commit_result["superseded"] = True
+            return
         status["review_verdict"] = verdict
         status["review_file"] = str(path)
         status["review_recorded_round"] = round_
@@ -575,11 +618,16 @@ def _handle_review_stop(task: dict, payload: dict, now: str) -> None:
         status["state"] = "idle"
         status["last_message"] = text[:2000]
         status["last_event_at"] = now
-        status.pop("review_file_claim_round", None)
+        status.pop("review_file_claim", None)
         status.pop("auto_interrupted", None)
         status.pop("stuck_since", None)
 
     updated = store.modify_status(task_id, do_commit)
+    if commit_result.get("superseded"):
+        store.append_event(
+            task_id, f"hook Stop(review) 第 {round_} 轮 claim 已被更新的一次取代，未提交"
+        )
+        return None
     note = "" if protocol_ok else "（协议缺失：没写合法 NEXT，保守按 fix）"
     store.append_event(
         task_id,

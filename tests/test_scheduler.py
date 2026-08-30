@@ -2279,6 +2279,76 @@ def test_review_quota_resume_send_failure_does_not_pollute_awaiting_verdict(monk
     assert "resume 控制消息投递失败" in events
 
 
+def test_review_keepalive_fast_stop_before_send_returns_still_treated_as_control(
+    monkeypatch,
+):
+    """S7.3 阻断二反例：假 send_keys 在"返回"之前就同步触发了 review 的
+    Stop（模拟真实世界里 send-keys 系统调用返回与目标会话真的处理完/发出
+    Stop 之间没有硬先后保证）。保活探针的 review_awaiting_verdict=False/
+    review_control_kind=keepalive 必须在 send 之前落盘——旧写法"send 成功
+    后才落盘"在这个窗口里是错的：这次 Stop 会被误判协议缺失、记成
+    verdict=fix。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_review_task()
+    data = store.load_task(tid)
+    data["role"] = "review"
+    store.atomic_write_json(store.task_dir(tid) / "task.json", data)
+    stale = scheduler.to_iso(NOW - timedelta(minutes=51))
+    store.update_status(
+        tid, state="held", window_id="@5", pane_pid=NO_PID,
+        last_event_at=stale, review_awaiting_verdict=True,
+    )
+
+    from nightshift import hook
+
+    def fake_send_keys(wid, text):
+        hook.handle_event(tid, "Stop", {"last_assistant_message": "收到，我等着"})
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(launcher, "send_keys", fake_send_keys)
+    scheduler.tick(REVIEW_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status.get("review_verdict") != "fix"
+    assert "review_verdict" not in status
+
+
+def test_review_quota_resume_fast_stop_before_send_returns_captured_as_verdict(
+    monkeypatch,
+):
+    """S7.3 阻断二反例：resume 发送时假 send_keys 在返回之前同步触发一个
+    带真实 NEXT:done 的 Stop（模拟真实世界的竞态）。resume 的
+    review_awaiting_verdict=True 必须在 send 之前落盘，这样这次抢先到达
+    的 Stop 才会被正确当成正式 verdict 解析、记下来，不会被吞掉；且
+    finalize 阶段的 success_only_fields（state=working 等）不能把 Stop
+    已经推进的更准确的结果（state=idle + verdict=done）覆盖回去。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_review_task()
+    data = store.load_task(tid)
+    data["role"] = "review"
+    store.atomic_write_json(store.task_dir(tid) / "task.json", data)
+    store.update_status(
+        tid, state="held", window_id="@5", pane_pid=NO_PID,
+        review_awaiting_verdict=False,
+        quota_paused_until=scheduler.to_iso(NOW - timedelta(minutes=1)),
+        quota_resume_sent=False,
+    )
+
+    from nightshift import hook
+
+    def fake_send_keys(wid, text):
+        hook.handle_event(
+            tid, "Stop",
+            {"last_assistant_message": "额度刷新了，继续看。\n\nNEXT: done"},
+        )
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(launcher, "send_keys", fake_send_keys)
+    scheduler.tick(REVIEW_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status.get("review_verdict") == "done"
+    assert status["state"] == "idle"
+
+
 def test_review_pipeline_fix_then_done_reuses_held_session(tmp_path, monkeypatch):
     """held 会话还活着：fix 直接捎话续第 2 轮，不新开窗口；第 2 轮 done →
     manual 收工 awaiting_merge。全程 fix_count/round/checkpoint 历史正确。"""

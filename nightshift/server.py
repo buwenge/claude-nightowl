@@ -1045,15 +1045,16 @@ class _Handler(BaseHTTPRequestHandler):
                 if not (wid and launcher.window_alive(str(wid), cfg)):
                     continue
                 if store.role_of(t) == "review":
-                    # S7.2 阻断五.2/阻断八：hold_text 不要求正式 verdict，
-                    # 统一走 send_review_control——只有 send 真的成功才落
-                    # review_awaiting_verdict=False + review_control_kind=
-                    # "hold"（供 Stop 之后正确恢复成 held，见阻断五.1）；
-                    # 以前是先落 False 再 send，send 失败时状态已经被污染
-                    # （真实 verdict 的 Stop 也会被误当控制 turn 吞掉）。
+                    # S7.2 阻断五.2/阻断八 + S7.3 阻断二：hold_text 不要求
+                    # 正式 verdict——review_awaiting_verdict=False +
+                    # review_control_kind="hold" 必须在 send 之前原子落盘
+                    # （放进 pre_send_fields），不能等 send 成功后才落：
+                    # 真实世界/测试环境里 Stop 都可能抢在这一步落盘之前
+                    # 到达，看到的仍是旧值会被误判协议缺失、记成 fix（供
+                    # Stop 之后正确恢复成 held，见阻断五.1）。
                     sent = scheduler.send_review_control(
                         t["id"], str(wid), text, kind="hold",
-                        success_fields={
+                        pre_send_fields={
                             "review_awaiting_verdict": False,
                             "review_control_kind": "hold",
                         },
@@ -1075,7 +1076,29 @@ class _Handler(BaseHTTPRequestHandler):
     def _api_pipeline_continue(self, task_id: str) -> None:
         """继续：清 hold_requested 并执行一个 resume_action——要么是从
         "我来看"恢复（重新评估被拦下的那一班），要么是从返工轮数上限恢复
-        （放行一轮，不永久取消上限）。两者都找不到就 409。"""
+        （放行一轮，不永久取消上限）。两者都找不到就 409。
+
+        S7.3 阻断三：review 被"我来看"拦住时要区分两种情况——已经有
+        done/fix verdict、只是分流前被拦住的，回 idle 让
+        `_check_review_idle` 重新分流既有结果，不用碰模型；**还没有
+        verdict、是中途被打断的**，单纯拨回 idle 没有用
+        （`_check_review_idle` 一看 `review_verdict is None` 就直接
+        `return None`，不会有任何后续动作，永久停在 idle）——要用
+        `send_review_control`（resume 语义）真正发一句"继续"让它接着干活，
+        失败要返回非 2xx，不能假装"继续"这个动作成功了。
+
+        build 侧同一类风险（网页"我来看" ping 一个正在干活的 build 时，
+        build 没有 review 那套 `review_control_kind`/`awaiting_verdict`
+        状态跟踪，Stop 回来后可能被普通 build 协议误判）是已知的、类似
+        但**没有具体反例**的缺口——`_hold_blocks()` 目前只在
+        `_start_review_round`（build 已经收工、要起审稿的边界，交接早已
+        写好）与 `_check_review_idle`（review verdict 路由边界）这两处
+        调用，build 从未在"中途"被这条 scheduler 级 hold 拦截过，所以这
+        条 continue 分支对 build 目前恒安全；但 HTTP hold API 对 build 的
+        ping 是直接 `send_keys`，不会让 build 转入 `state=="held"`，也就
+        不会走到这里——这个不对称本身是留着没补的缺口，不在这次 S7.3 的
+        四个具体反例范围内，不在这里动手重写。
+        """
         pipeline_id = self._resolve_pipeline(task_id)
         if pipeline_id is None:
             return
@@ -1091,11 +1114,33 @@ class _Handler(BaseHTTPRequestHandler):
                 store.append_event(pipeline_id, "继续：已清\"我来看\"请求")
                 logger.info("网页继续（我来看）：%s（无阻塞班）", pipeline_id)
                 return self._send_json(200, {"ok": True, "resumed": False})
-            t, _ = blocked
+            t, s = blocked
             if store.role_of(t) == "build":
                 store.update_status(t["id"], state="idle", chain_checked=False)
-            else:
+            elif store.read_status(t["id"]).get("review_verdict") is not None:
+                # 已经有 verdict，只是分流前被拦住——回 idle 重新分流既有
+                # 结果，不用发消息给模型。
                 store.update_status(t["id"], state="idle")
+            else:
+                # 中途暂停，还没有 verdict——真正让它继续干活。
+                window_id = s.get("window_id")
+                cfg = store.load_config()
+                if not (window_id and launcher.window_alive(str(window_id), cfg)):
+                    return self._send_json(
+                        409, {"error": "继续失败：审稿窗口已经不在了，需要人工处理"}
+                    )
+                text = cfg.get("review_hold_resume_text") or scheduler.DEFAULT_REVIEW_HOLD_RESUME_TEXT
+                sent = scheduler.send_review_control(
+                    t["id"], str(window_id), text, kind="resume",
+                    pre_send_fields={"review_awaiting_verdict": True},
+                    success_only_fields={
+                        "state": "working", "last_event_at": store.utc_now_iso(),
+                    },
+                )
+                if not sent:
+                    return self._send_json(
+                        409, {"error": "继续失败：没能让审稿会话恢复（send-keys 失败）"}
+                    )
             store.append_event(t["id"], "继续：清\"我来看\"请求，重新评估这一班的下一步")
             logger.info("网页继续（我来看）：%s → %s", pipeline_id, t["id"])
             return self._send_json(200, {"ok": True, "resumed": True, "task_id": t["id"]})
@@ -1209,30 +1254,53 @@ class _Handler(BaseHTTPRequestHandler):
         （`merge_ok=False`）响应状态码也要用 409，`ok` 字段不能还是
         true——跳过审稿这个动作本身"成功"跟自动合并"成功"是两件事，但
         客户端不该先读到 `ok:true` 再去猜第二个字段。
+
+        S7.3 阻断四：上面这条状态矩阵以前遍历的是这条 pipeline **所有**
+        role=review 的成员——第一轮 review 完成后会永久留下一条 `chained`
+        历史记录，第二轮 build 收工、新一轮 review 明明是 scheduled，却被
+        这条永久存在的历史记录挡住。改成只看"当前一代 review"：用 shift
+        （S7.1①起在同一条 pipeline 内全局单调唯一）挑出 review 角色里
+        shift 最大的那一组——pending release 场景下同一轮可能有两个
+        review 记录（旧的 chained + 新的 postponed），两者 shift 不同，
+        取更大的那个即可。历史（shift 更小的）review 记录只作审计，不参与
+        这次 action 的状态判断，也不会被这次调用取消。
         """
         pipeline_id = self._resolve_pipeline(task_id)
         if pipeline_id is None:
             return
+        members = self._pipeline_members(pipeline_id)
+        review_items = [
+            item for item in members if store.role_of(item["task"]) == "review"
+        ]
+        current_reviews: list[tuple[dict, dict]] = []
+        if review_items:
+            current_shift = max(
+                int(item["task"].get("shift") or 1) for item in review_items
+            )
+            current_reviews = [
+                (item["task"], item["status"] or {}) for item in review_items
+                if int(item["task"].get("shift") or 1) == current_shift
+            ]
         # review 只要不是"还没起跑"（scheduled/postponed）就一律拒绝——
         # launching/working/waiting_background/waiting_wakeup/held/idle
         # 任何一种都意味着这一班已经真的动过了，跳过审稿会丢掉它的进度
-        # 或者跟它打架。
+        # 或者跟它打架。只看当前一代，历史记录不参与判断。
         _NOT_YET_STARTED = ("scheduled", "postponed")
-        build_item = None
         pending_reviews: list[tuple[dict, dict]] = []
-        for item in self._pipeline_members(pipeline_id):
-            t, s = item["task"], item["status"] or {}
+        for t, s in current_reviews:
             state = s.get("state")
-            if store.role_of(t) == "review":
-                if state in _NOT_YET_STARTED:
-                    pending_reviews.append((t, s))
-                elif state is not None:
-                    return self._send_json(
-                        409,
-                        {"error": f"审稿已经{state}，不能跳过（先等它完事或用\"我来看\"叫停）"},
-                    )
+            if state in _NOT_YET_STARTED:
+                pending_reviews.append((t, s))
+            elif state is not None:
+                return self._send_json(
+                    409,
+                    {"error": f"审稿已经{state}，不能跳过（先等它完事或用\"我来看\"叫停）"},
+                )
+        build_item = None
+        for item in members:
+            t, s = item["task"], item["status"] or {}
             if (
-                store.role_of(t) == "build" and state == "held"
+                store.role_of(t) == "build" and s.get("state") == "held"
                 and s.get("checkpoint_done")
             ):
                 build_item = (t, s)
