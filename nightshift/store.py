@@ -20,6 +20,7 @@ from pathlib import Path
 from .context import context_limit_for
 
 __all__ = [
+    "CODEX_BACKGROUND_INSTRUCTION",
     "ConfigMissing",
     "ENDED_STATES",
     "RUNNERS",
@@ -98,6 +99,17 @@ WORKTREE_INSTRUCTION = (
     "只在当前工作树里施工，不要切回主签出目录；不要 git commit，"
     "调度器会在每班收工后替你打存档点。完成或换班时照常写交接，"
     "末行写 NEXT: done 或 NEXT: continue。"
+)
+# S6.1 A1：Codex 任务提示词里的运行时安全前言（F12）——真机靶测证实这条协议
+# 只靠手工 prompt 才走通，nightshift 自己创建的任务原本完全没有告诉 Codex
+# 要走这条路；跟 WORKTREE_INSTRUCTION 同一个模式，launcher._prompt_text()
+# 保证运行时兜底追加一次，不依赖生产 config.prompt_template 人工同步。
+CODEX_BACKGROUND_INSTRUCTION = (
+    "长任务统一用 `python3 -m nightshift.background_runner start -- <程序> <参数...>` "
+    "起：这个 wrapper 自己会留在前台，靠 Codex 的后台终端/yield 机制让这次工具调用先"
+    "返回。拿到 running 的 session/process id 后不要再 poll 它，等 nightshift 调度器"
+    "主动把结果敲给你再继续。禁止裸用 `&`/`nohup`/`setsid`，禁止自己 fork 脱离——"
+    "那样起的后台进程在这次工具调用判定完成时会被沙箱一并回收，永远不会跑完。"
 )
 # review.merge_policy 只认这两个值（S7 扩写同一个 review 对象，不做二次迁移）
 _MERGE_POLICIES = ("manual", "auto")
@@ -450,7 +462,9 @@ def create_successor(parent_task: dict, handover_text: str | None, config: dict)
             handover=handover,
             title=parent_task["title"],
             project_path=config["projects"][parent_task["project"]],
-            context_limit=context_limit_for(parent_task["model"], config),
+            context_limit=_context_limit_text(
+                parent_task["model"], config, parent_task.get("runner") or "claude"
+            ),
             worktree_instruction=(
                 WORKTREE_INSTRUCTION if worktree_enabled(parent_task) else ""
             ),
@@ -559,22 +573,30 @@ def render(template: str, **vars) -> str:
     return out
 
 
+def _context_limit_text(model: str, config: dict, runner: str) -> str:
+    """{context_limit} 占位符的人话版本：S6.1 B3——Codex 模型查不到稳定水位
+    时如实说"暂无稳定水位来源"，不能把 None 写进模板变成字面的 "None"，
+    更不能悄悄套 Claude 的 default_context_limit 冒充一个假数字。"""
+    limit = context_limit_for(model, config, runner=runner)
+    return str(limit) if limit is not None else "暂无稳定水位来源"
+
+
 def build_prompt(
     config: dict, title: str, project: str, model: str, task_text: str,
-    worktree: bool = False,
+    worktree: bool = False, runner: str = "claude",
 ) -> str:
     """按 config.prompt_template 渲染最终提示词。
 
     网页 /api/preview 与 CLI cmd_add 共用这一套占位符
     （{task} {title} {project_path} {context_limit} {worktree_instruction}），
     保证所见即所发。工作树任务把 {worktree_instruction} 渲染成运行时安全前言；
-    老式任务渲染成空串。
+    老式任务渲染成空串。{context_limit} 按 runner 对应的模型表查（S6.1 B3）。
     """
     return render(
         config["prompt_template"],
         task=task_text,
         title=title,
         project_path=config["projects"][project],
-        context_limit=context_limit_for(model, config),
+        context_limit=_context_limit_text(model, config, runner),
         worktree_instruction=WORKTREE_INSTRUCTION if worktree else "",
     )

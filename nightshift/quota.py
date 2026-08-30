@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
@@ -106,12 +107,17 @@ def fetch_usage_claude(config: dict, timeout: int = 120) -> dict:
         with open(fake_path, encoding="utf-8") as f:
             return parse_usage(f.read())
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    # S6.1 B3：统一从 runner_config 取 bin/probe_model，不再单独读顶层
+    # config["claude_bin"]/config["probe_model"]——两处配置一旦不同会出现
+    # "校验按新表、实际查额度按旧表"的分裂；兼容视图从顶层键合成，旧
+    # config 行为不变。
+    rc = runner_config(config).get("claude") or {}
     cmd = [
-        config["claude_bin"],
+        rc.get("bin", "claude"),
         "-p",
         "/usage",
         "--model",
-        config["probe_model"],
+        rc.get("probe_model"),
         "--tools",
         "",
     ]
@@ -351,17 +357,37 @@ def load_quota_file() -> dict:
 
 def write_quota_runner(runner: str, payload: dict) -> dict:
     """只更新一家（claude/codex）的分片，另一家原样保留——一家刷新失败
-    不能覆盖另一家最后一次的好数据。返回写盘后的整份内容。"""
-    data = load_quota_file()
-    data[runner] = payload
-    atomic_write_json(home() / "quota.json", data)
-    return data
+    不能覆盖另一家最后一次的好数据。返回写盘后的整份内容。
+
+    S6.1 A6：scheduler 主线程与网页手动刷新（ThreadingHTTPServer 的请求
+    线程）会并发调用这个函数，读旧值→改一家→原子替换这整段必须在同一把
+    `.quota.lock` 的 flock 里完成，否则两个线程交错读到同一份旧值、各自
+    只改自己那一家再各自写回，后写的会把先写的那一家覆盖丢掉（lost
+    update）——只改 atomic_write_json 的临时文件名消不掉这个问题，那只是
+    消掉两个线程抢同一个临时文件名的异常，读改写本身仍然没有互斥。
+    """
+    ensure_dirs()
+    with open(home() / ".quota.lock", "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            data = load_quota_file()
+            data[runner] = payload
+            atomic_write_json(home() / "quota.json", data)
+            return data
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def check_guards(usage: dict, model: str, config: dict, guards: dict) -> tuple[bool, str]:
+def check_guards(
+    usage: dict, model: str, config: dict, guards: dict, runner: str = "claude",
+) -> tuple[bool, str]:
     """额度门槛判定：五小时线、七日 all models 线、任务模型自己的单模型周线。
 
     全过返回 (True, "")；任一超线返回 (False, 中文原因)。
+
+    S6.1 B3：`usage_label` 查找必须按 `runner` 对应的模型表，不能只看顶层
+    `config.models`（那只是 Claude 的兼容视图）——Codex 任务传自己的
+    `runner="codex"` 就不会被 Claude 那张表误判。
     """
     session_max = guards["session_pct_max"]
     week_max = guards["weekly_pct_max"]
@@ -371,7 +397,8 @@ def check_guards(usage: dict, model: str, config: dict, guards: dict) -> tuple[b
         return False, f"五小时额度 {session_pct}% 超线 {session_max}%"
     if week_all_pct is not None and week_all_pct > week_max:
         return False, f"七日额度 {week_all_pct}% 超线 {week_max}%"
-    label = config.get("models", {}).get(model, {}).get("usage_label")
+    rc = runner_config(config).get(runner) or {}
+    label = rc.get("models", {}).get(model, {}).get("usage_label")
     model_max = guards.get("model_weekly_pct_max", week_max)
     if label and label in usage.get("per_model", {}):
         pct = usage["per_model"][label]

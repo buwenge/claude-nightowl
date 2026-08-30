@@ -137,12 +137,18 @@ def _tail_lines(path: Path, count: int) -> list[str]:
 
 
 def _background_summary(task_id: str) -> dict:
-    """S6④：F12 后台项摘要——运行中 / 已完成待通知的数量，给卡片一眼看的数字。"""
+    """S6④：F12 后台项摘要——运行中 / 已完成待通知的数量，给卡片一眼看的数字。
+
+    S6.1 A3：finished_pending 也要算上 stopped——stop 请求处理完之后落的是
+    state=stopped，不是 finished，只数 finished 会让"停后台"操作完之后卡片
+    上的数字看起来像没有任何待处理项，跟 scheduler 那边"stopped 也要通知"
+    的口径对不上。
+    """
     registry = background_runner.load_registry(task_id)
     running = sum(1 for r in registry.values() if r.get("state") == "running")
     finished_pending = sum(
         1 for r in registry.values()
-        if r.get("state") == "finished" and r.get("notification_state") != "notified"
+        if r.get("state") in ("finished", "stopped") and r.get("notification_state") != "notified"
     )
     return {"running": running, "finished_pending": finished_pending}
 
@@ -591,9 +597,10 @@ class _Handler(BaseHTTPRequestHandler):
         cfg = store.load_config()
         if project not in (cfg.get("projects") or {}):
             return self._send_json(400, {"error": f"project 不在 config.projects 里：{project}"})
+        runner = data.get("runner") if data.get("runner") in store.RUNNERS else "claude"
         prompt = store.build_prompt(
             cfg, title, str(project), str(model or ""), task_text,
-            worktree=bool(data.get("worktree")),
+            worktree=bool(data.get("worktree")), runner=runner,
         )
         return self._send_json(200, {"prompt_final": prompt})
 
@@ -638,7 +645,9 @@ class _Handler(BaseHTTPRequestHandler):
         }
         if task["runner"] == "codex":
             out["background_summary"] = _background_summary(task_id)
-            out["background_items"] = list(background_runner.load_registry(task_id).values())
+            # S6.1 B1：不把整份 registry 原样透传出去——里面的 argv_summary/
+            # output_tail/result_path/sandbox_pid 都可能带敏感内容，前端根本
+            # 没用到这份明细，只需要 background_summary 那两个数字。
         return self._send_json(200, out)
 
     def _api_create_task(self) -> None:

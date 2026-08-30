@@ -50,8 +50,15 @@ _HOOK_EVENTS = (
 
 
 def claude_bin(config: dict) -> str:
-    """要用的 claude 可执行文件；环境变量 NIGHTSHIFT_CLAUDE_BIN 优先（测试用）。"""
-    return os.environ.get("NIGHTSHIFT_CLAUDE_BIN") or config["claude_bin"]
+    """要用的 claude 可执行文件；环境变量 NIGHTSHIFT_CLAUDE_BIN 优先（测试用）。
+
+    S6.1 B3：统一从 `store.runner_config(config)["claude"]` 取，不再单独读
+    顶层 `config["claude_bin"]`——两处配置一旦不同会出现"校验按新表、启动
+    按旧表"的分裂；`runner_config` 的兼容视图本来就是从顶层键合成的，旧
+    config 行为不变。
+    """
+    rc = store.runner_config(config).get("claude") or {}
+    return os.environ.get("NIGHTSHIFT_CLAUDE_BIN") or rc.get("bin", "claude")
 
 
 def codex_bin(config: dict) -> str:
@@ -216,10 +223,18 @@ def _prompt_text(task: dict) -> str:
     工作树任务保证带上运行时安全前言（不要 commit、只在工作树施工）：
     模板经 {worktree_instruction} 渲染过就已有这句；用户用 --prompt-file
     给的全文若漏了它，在这里补上——前言只追加、绝不改用户正文。
+
+    S6.1 A1：Codex 任务同样保证带上 F12 后台协议前言（用 background_runner
+    wrapper、不要裸 fork/nohup）——这是运行时兜底，跟 worktree 那条同一个
+    模式：不管 config.prompt_template/chain_template 有没有同步更新，也不管
+    是新会话/续班/用户自己 --prompt-file 给的全文，Codex 任务的 prompt.txt
+    永远且只会出现一次这段协议。
     """
     text = task["prompt_final"]
     if worktree.wants_worktree(task) and store.WORKTREE_INSTRUCTION not in text:
         text = store.WORKTREE_INSTRUCTION + "\n\n" + text
+    if (task.get("runner") or "claude") == "codex" and store.CODEX_BACKGROUND_INSTRUCTION not in text:
+        text = store.CODEX_BACKGROUND_INSTRUCTION + "\n\n" + text
     return text
 
 
@@ -324,6 +339,24 @@ def launch(task_id: str, config: dict) -> dict:
             reason = (
                 "Codex 续班找不到父班登记的 thread_id，"
                 "拒绝悄悄开一个没有上下文的新会话"
+            )
+            store.append_event(task_id, f"启动被拦：{reason}")
+            status = store.update_status(
+                task_id, state="failed", error=reason,
+                last_event_at=store.utc_now_iso(),
+            )
+            open_failure_window(task, reason, config)
+            return status
+        # S6.1 A7：父班窗口必须先确认不在了才能 resume 同一个 thread——
+        # _chain_continue 续班时已经尝试关过父窗，但关闭可能失败（tmux 抽风/
+        # 窗口刚好在被别的东西占用）；这里是最后一道防线，宁可这一班启动
+        # 失败也不让父窗和这个新窗口同时持有同一个 Codex thread（两开）。
+        parent_status = store.read_status(task["parent_id"])
+        parent_window_id = parent_status.get("window_id")
+        if parent_window_id and window_alive(str(parent_window_id), config):
+            reason = (
+                f"父班窗口 {parent_window_id} 仍然存活，"
+                "拒绝在新窗口 resume 同一个 Codex thread（防止两开）"
             )
             store.append_event(task_id, f"启动被拦：{reason}")
             status = store.update_status(

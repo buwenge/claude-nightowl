@@ -68,7 +68,7 @@ def cmd_add(args) -> int:
     else:
         prompt_final = store.build_prompt(
             config, args.title, args.project, args.model, task_text,
-            worktree=not args.no_worktree,
+            worktree=not args.no_worktree, runner=args.runner,
         )
 
     task = {

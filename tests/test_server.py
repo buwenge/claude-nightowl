@@ -1003,19 +1003,53 @@ def test_task_detail_and_list_expose_background_summary_for_codex(authed, ns_hom
         "task_text": "正文", "prompt_final": "提示词",
     })
     task_id = body["id"]
+    # S6.1 A3：finished_pending 也要算上 stopped（bg-4）
     background_runner.modify_registry(task_id, lambda d: d.update({
         "bg-1": {"state": "running"},
         "bg-2": {"state": "finished", "notification_state": "pending"},
         "bg-3": {"state": "finished", "notification_state": "notified"},
+        "bg-4": {"state": "stopped", "notification_state": "pending"},
     }))
     status, _, detail = authed.request("GET", f"/api/tasks/{task_id}")
     assert status == 200
-    assert detail["background_summary"] == {"running": 1, "finished_pending": 1}
-    assert len(detail["background_items"]) == 3
+    assert detail["background_summary"] == {"running": 1, "finished_pending": 2}
 
     status, _, items = authed.request("GET", "/api/tasks")
     item = next(i for i in items if i["task"]["id"] == task_id)
-    assert item["background_summary"] == {"running": 1, "finished_pending": 1}
+    assert item["background_summary"] == {"running": 1, "finished_pending": 2}
+
+
+def test_task_detail_does_not_leak_raw_background_registry(authed, ns_home):
+    """S6.1 B1：任务详情只返回 background_summary（两个数字），绝不原样透传
+    整份 registry——argv/output_tail/result_path 都可能带敏感内容，前端也
+    没用到这份明细。放一个 canary secret 进登记簿，断言响应体里找不到它，
+    也确认 background_items 这个键彻底不存在了。"""
+    from nightshift import background_runner
+    cfg = store.load_config()
+    cfg["runners"] = {
+        "codex": {"bin": "codex", "models": {"gpt-5.6-luna": {"context_limit": None}},
+                  "efforts": ["low", "medium", "high", "xhigh"]},
+    }
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "Codex泄密检查", "project": "demo", "runner": "codex",
+        "model": "gpt-5.6-luna", "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+    })
+    task_id = body["id"]
+    canary = "CANARY-SECRET-do-not-leak-9f3a"
+    background_runner.modify_registry(task_id, lambda d: d.update({
+        "bg-1": {
+            "state": "finished", "notification_state": "pending",
+            "argv_summary": canary, "output_tail": canary,
+            "result_path": f"/root/.nightshift/tasks/{task_id}/background/{canary}.log",
+            "sandbox_pid": 12345,
+        },
+    }))
+    status, _, detail = authed.request("GET", f"/api/tasks/{task_id}")
+    assert status == 200
+    assert "background_items" not in detail
+    assert canary not in json.dumps(detail, ensure_ascii=False)
 
     # Claude 任务不该带这个键（没有后台登记簿这个概念）
     claude_id = make_task(authed, "普通claude任务")

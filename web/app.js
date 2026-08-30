@@ -268,8 +268,15 @@ function renderQuotaRunner(box, label, entry) {
     return;
   }
   var usage = entry.usage;
-  if (typeof usage.session_pct === "number") section.appendChild(remainRow("五小时", usage.session_pct, usage.session_resets));
-  if (typeof usage.week_all_pct === "number") section.appendChild(remainRow("七日（全部模型）", usage.week_all_pct, usage.week_all_resets));
+  var hasSession = typeof usage.session_pct === "number";
+  var hasWeekAll = typeof usage.week_all_pct === "number";
+  if (hasSession) section.appendChild(remainRow("五小时", usage.session_pct, usage.session_resets));
+  if (hasWeekAll) section.appendChild(remainRow("七日（全部模型）", usage.week_all_pct, usage.week_all_resets));
+  // S6.1 C3：两个窗口都没数（比如 Codex 账号返回的字段认不出）不能只剩一句
+  // "几分钟前查的"，那看起来像正常、只是没数据——要明说查不到/认不出。
+  if (!hasSession && !hasWeekAll) {
+    section.appendChild(el("p", { class: "hint", text: "窗口数据未提供/认不出" }));
+  }
   var per = usage.per_model || {};
   var perResets = usage.per_model_resets || {};
   Object.keys(per).forEach(function (name) {
@@ -739,7 +746,13 @@ function closeScreen() {
 
 /* ---------- 新建页 ---------- */
 
-function modelLimit(model) {
+function modelLimit(model, runner) {
+  runner = runner || "claude";
+  if (CFG && CFG.runners && CFG.runners[runner]) {
+    var rmodels = CFG.runners[runner].models || {};
+    if (rmodels[model]) return rmodels[model].context_limit;
+  }
+  // 旧后端没有 CFG.runners 时退回顶层 Claude 兼容表
   return CFG && CFG.models && CFG.models[model] ?
     CFG.models[model].context_limit : null;
 }
@@ -752,8 +765,11 @@ function currentModel() {
 function recalcWarnDefault() {
   if (WARN_EDITED) return;
   var ratio = CFG && CFG.guards ? CFG.guards.context_warn_ratio : null;
-  var limit = modelLimit(currentModel());
-  if (ratio && limit) $("f-warntokens").value = Math.round(ratio * limit);
+  var limit = modelLimit(currentModel(), currentRunner());
+  // S6.1 C2：Codex 模型没有稳定水位来源（limit 是 null）时清空这个字段，
+  // 不能让切换 runner 前自动带出来的 Claude token 数留在表单里——那个数字
+  // 对 Codex 任务永远不会生效，暗带着容易让人以为已经设了警戒线。
+  $("f-warntokens").value = (ratio && limit) ? Math.round(ratio * limit) : "";
 }
 
 function schedulePreview() {
@@ -1217,7 +1233,7 @@ function start() {
     api("POST", "./api/quota/refresh").then(function (data) {
       renderQuota(data || {}); banner("额度已重新查询");
     }).catch(function () {}).then(function () {
-      btn.disabled = false; btn.textContent = "重新查额度";
+      btn.disabled = false; btn.textContent = "都刷新";
     });
   });
   // 手机切回来（WebView 的 visibilitychange 不一定可靠）也拉一次

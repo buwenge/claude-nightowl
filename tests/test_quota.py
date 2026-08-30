@@ -107,6 +107,22 @@ def test_check_guards_model_line_over_but_all_not():
     assert ok
 
 
+def test_check_guards_usage_label_looked_up_by_runner_not_top_level_models():
+    """S6.1 B3：usage_label 必须按 runner 对应的模型表查——传 runner="codex"
+    时，就算顶层 config.models 里恰好有一个同名 usage_label 命中，也不该
+    被那张 Claude 兼容表污染；Codex 自己的 models 表里没配就不做单模型线。"""
+    usage = usage_fixture()
+    usage["per_model"]["Fable"] = 97  # 顶层 CONFIG.models 里 claude-fable-5 → Fable
+    config = {
+        **CONFIG,
+        "runners": {
+            "codex": {"models": {"gpt-5.6-luna": {}}, "efforts": []},  # 没配 usage_label
+        },
+    }
+    ok, _ = check_guards(usage, "gpt-5.6-luna", config, GUARDS, runner="codex")
+    assert ok  # 没被顶层 Claude 表的 Fable 误伤
+
+
 def test_fetch_usage_with_fake_claude(tmp_path, monkeypatch):
     # 先坐实环境里确实有 CLAUDECODE，fetch_usage 必须把它摘掉
     monkeypatch.setenv("CLAUDECODE", "1")
@@ -138,6 +154,37 @@ def test_fetch_usage_with_fake_claude(tmp_path, monkeypatch):
     assert all(not line.startswith("CLAUDECODE=") for line in env_lines)
     assert usage["session_pct"] == 13
     assert usage["per_model"] == {"Fable": 35}
+
+
+def test_fetch_usage_claude_prefers_runners_table_over_stale_top_level(tmp_path):
+    """S6.1 B3：config.runners.claude 存在时是唯一权威源——顶层 claude_bin/
+    probe_model 就算还留着旧值也不能被用，否则"校验按新表、实际查额度按
+    旧表"两处配置分裂，没人能保证它们一直同步。"""
+    fake = tmp_path / "fake_probe.sh"
+    args_file = tmp_path / "args.txt"
+    fake.write_text(
+        "#!/bin/bash\n"
+        f"printf '%s\\n' \"$@\" > '{args_file}'\n"
+        f"cat '{FIXTURES / 'usage_output.txt'}'\n",
+        encoding="utf-8",
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+
+    config = {
+        **CONFIG,
+        "claude_bin": "/should/not/be/used",  # 顶层留着一个假的、过时的值
+        "probe_model": "should-not-be-used",
+        "runners": {
+            "claude": {
+                "bin": str(fake), "probe_model": "the-real-probe-model",
+                "models": CONFIG["models"], "efforts": [],
+            },
+        },
+    }
+    usage = fetch_usage_claude(config)
+    args = args_file.read_text(encoding="utf-8").splitlines()
+    assert args == ["-p", "/usage", "--model", "the-real-probe-model", "--tools", ""]
+    assert usage["session_pct"] == 13
 
 
 def test_fetch_usage_nonzero_exit(tmp_path):
@@ -314,3 +361,34 @@ def test_write_quota_runner_does_not_clobber_the_other():
     data = load_quota_file()
     assert data["claude"]["usage"]["session_pct"] == 1
     assert data["codex"]["error"] == "查不到"
+
+
+def test_write_quota_runner_concurrent_threads_do_not_lose_updates(tmp_path, monkeypatch):
+    """S6.1 A6：scheduler 主线程与网页手动刷新线程会并发调用；两个线程各自
+    反复写各自那家分片，不许有任何一次写丢失（lost update），也不许因为
+    临时文件名撞车而炸异常。"""
+    import threading
+
+    monkeypatch.setenv("NIGHTSHIFT_HOME", str(tmp_path))
+    errors: list[Exception] = []
+    rounds = 30
+
+    def hammer(runner: str):
+        try:
+            for i in range(rounds):
+                write_quota_runner(
+                    runner, {"usage": {"session_pct": i}, "fetched_at": f"t{i}", "error": None}
+                )
+        except Exception as exc:  # pragma: no cover - 断言在主线程做，这里只留痕
+            errors.append(exc)
+
+    t1 = threading.Thread(target=hammer, args=("claude",))
+    t2 = threading.Thread(target=hammer, args=("codex",))
+    t1.start(); t2.start()
+    t1.join(timeout=30); t2.join(timeout=30)
+
+    assert not errors, errors
+    data = load_quota_file()
+    # 最终两家都在、都是各自最后一轮写的值——没有一家被另一家的写入顶掉/丢失
+    assert data["claude"]["usage"]["session_pct"] == rounds - 1
+    assert data["codex"]["usage"]["session_pct"] == rounds - 1

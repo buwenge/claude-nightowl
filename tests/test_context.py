@@ -97,3 +97,23 @@ def test_context_limit_for():
     }
     assert context_limit_for("m-big", config) == 500000
     assert context_limit_for("m-unknown", config) == 200000
+
+
+def test_context_limit_for_codex_no_default_fallback():
+    """S6.1 B3：Codex（或任何非 claude runner）查不到时必须如实返回 None，
+    不能悄悄套 Claude 的 default_context_limit 冒充一个已知水位——那正是
+    "Codex 没有稳定水位来源"这件事本身要传达的信息。"""
+    config = {
+        "models": {"m-big": {"context_limit": 500000}},  # 顶层 Claude 兼容表
+        "default_context_limit": 200000,
+        "runners": {
+            "codex": {"models": {"gpt-5.6-luna": {"context_limit": None}}},
+        },
+    }
+    # Codex 自己的模型表里配了 null：如实返回 None
+    assert context_limit_for("gpt-5.6-luna", config, runner="codex") is None
+    # Codex 模型表里压根没有这个模型：同样 None，不退到顶层 Claude 表/default
+    assert context_limit_for("m-unknown", config, runner="codex") is None
+    # Claude 默认 runner 行为不变
+    assert context_limit_for("m-big", config, runner="claude") == 500000
+    assert context_limit_for("m-unknown", config, runner="claude") == 200000

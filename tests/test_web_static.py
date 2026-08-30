@@ -100,3 +100,32 @@ def test_css_has_runner_chip_and_quota_runner_block():
     css = (WEB / "style.css").read_text(encoding="utf-8")
     for piece in ("runner-chip", "quota-runner"):
         assert piece in css, piece
+
+
+# ---------- S6.1 C1-C3：前端尾巴 ----------
+
+
+def test_quota_refresh_button_text_consistent():
+    """C1：初始文案与请求完成后 JS 改回去的文案必须是同一句，不能一个
+    "都刷新"一个"重新查额度"。"""
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'id="btn-requery" class="ghost">都刷新<' in html
+    assert 'btn.textContent = "都刷新"' in js
+    assert "重新查额度" not in js
+
+
+def test_model_limit_is_runner_aware_and_clears_stale_warn_tokens():
+    """C2：runner 切到 context_limit=null 的模型时，没手改过警戒线就该清空
+    表单里刚才带来的数字，不能留一个永远不会生效的 token 数。"""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "function modelLimit(model, runner)" in js
+    assert "modelLimit(currentModel(), currentRunner())" in js
+    assert '$("f-warntokens").value = (ratio && limit) ? Math.round(ratio * limit) : "";' in js
+
+
+def test_quota_shows_explicit_unknown_when_both_windows_missing():
+    """C3：两个窗口字段都没数时要明说，不能只剩一句"几分钟前查的"看起来
+    像正常有数据。"""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "窗口数据未提供/认不出" in js

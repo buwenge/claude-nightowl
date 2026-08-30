@@ -126,6 +126,24 @@ def test_build_prompt_known_placeholders():
     assert out == old
 
 
+def test_build_prompt_codex_no_context_limit_renders_human_text():
+    """S6.1 B3：Codex 模型查不到稳定水位时，{context_limit} 要渲染成人话
+    "暂无稳定水位来源"，不能是字面的 "None"，也不能悄悄套顶层
+    default_context_limit 冒充一个假数字。"""
+    config = dict(CONFIG)
+    config["prompt_template"] = "上限 {context_limit}\n{task}"
+    config["default_context_limit"] = 200000
+    config["runners"] = {
+        "codex": {"models": {"gpt-5.6-luna": {"context_limit": None}}},
+    }
+    out = store.build_prompt(
+        config, "标题A", "demo", "gpt-5.6-luna", "正文B", runner="codex",
+    )
+    assert out == "上限 暂无稳定水位来源\n正文B"
+    assert "None" not in out
+    assert "200000" not in out  # 不能悄悄套 Claude 的 default
+
+
 def _worker(task_id: str, tag: str, count: int) -> None:
     for i in range(count):
         store.update_status(task_id, **{f"{tag}_{i}": i})
@@ -601,3 +619,17 @@ def test_create_successor_copies_runner():
     store.atomic_write_json(store.task_dir(parent2_id) / "task.json", task2)
     succ2 = store.load_task(store.create_successor(task2, "交接", RUNNERS_CONFIG))
     assert succ2["runner"] == "claude"
+
+
+def test_create_successor_codex_context_limit_placeholder_is_human_text():
+    """S6.1 B3：Codex 续班渲染 {context_limit} 时也要按 runner 的模型表查、
+    查不到写人话，不能是字面 "None" 或悄悄借用 Claude 的 default。"""
+    config = {**RUNNERS_CONFIG, "chain_template": "上限 {context_limit}\n{task} 第 {shift} 班 {handover}"}
+    parent_id = store.create_task(
+        make_task(runner="codex", model="gpt-5.6-luna", effort="high"), config
+    )
+    succ = store.load_task(store.create_successor(
+        store.load_task(parent_id), "交接", config))
+    assert succ["prompt_final"].startswith("上限 暂无稳定水位来源\n")
+    assert "None" not in succ["prompt_final"]
+    assert "1000000" not in succ["prompt_final"]  # 不能借用 default_context_limit

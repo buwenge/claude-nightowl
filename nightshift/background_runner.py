@@ -201,11 +201,18 @@ def cmd_start(argv: list[str]) -> int:
     if len(argv_summary) > _ARGV_SUMMARY_MAX:
         argv_summary = argv_summary[:_ARGV_SUMMARY_MAX] + "…"
 
+    # S6.1 A4：登记时把当时的 thread_id 也记下来。窗口 id 理论上可能被换掉
+    # 的任务复用（同一个 @N 编号先后属于不同任务/session），scheduler 通知
+    # 前要拿它跟 status.json 当前的 thread_id 对答案，不能只信 window_alive——
+    # 那只能证明"这个窗口号还在"，证明不了"这个窗口现在跑的还是当初那个会话"。
+    thread_id_at_start = store.read_status(task_id).get("thread_id")
+
     def register(data: dict) -> None:
         data[background_id] = {
             "task_id": task_id,
             "background_id": background_id,
             "sandbox_pid": None,  # 仅诊断：只在起跑这次 PID namespace 里有意义，不可跨 exec kill()
+            "thread_id_at_start": thread_id_at_start,
             "argv_summary": argv_summary,
             "started_at": started_at,
             "heartbeat_at": started_at,

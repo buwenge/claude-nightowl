@@ -256,7 +256,7 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
     if usage is None:
         return _postpone(task, status, config, now, f"额度查不到（fail-closed）：{err}")
     ok, reason = quota.check_guards(
-        usage, task["model"], config, task.get("guards") or {}
+        usage, task["model"], config, task.get("guards") or {}, runner=runner
     )
     if not ok:
         return _postpone(task, status, config, now, reason)
@@ -430,20 +430,47 @@ def _check_codex_quota_pause(
     就 send-keys 叫停、转 waiting_wakeup 并记 quota_paused_until；没到线/
     查不到都返回 None（None ≠ "没发生"，只是"这次没什么可做"，调用方按
     正常流程继续走）。查不到刷新时间就按最长（5 小时）估一个，不卡死。
+
+    S6.1 B2：
+    - 等号不拦——跟 `quota.check_guards` 的 `>` 语义统一，只有真超线才停；
+    - 分片过期（`fetched_at` 早于一个刷新周期）或它自己记的 `session_resets`
+      已经 <= now（意味着这份百分比早该被新一轮刷新覆盖）都不按这份旧快照
+      叫停，交给本 tick 末尾的 `_maybe_refresh_quota` 去刷新，不能拿着一份
+      本该作废的旧数字先停下再马上因为刷出新数字被恢复；
+    - send-keys 真的失败就不能假装已经停下了：不写 waiting_wakeup，留在
+      working 让下一 tick 重试。
     """
     task_id = task["id"]
     guards = task.get("guards") or {}
     session_max = guards.get("session_pct_max")
     if session_max is None:
         return None
-    usage = (quota.load_quota_file().get("codex") or {}).get("usage")
+    slice_ = quota.load_quota_file().get("codex") or {}
+    usage = slice_.get("usage")
     if not isinstance(usage, dict):
         return None
     session_pct = usage.get("session_pct")
-    if not isinstance(session_pct, int) or session_pct < session_max:
+    if not isinstance(session_pct, int) or session_pct <= session_max:
         return None
 
+    fetched_at = slice_.get("fetched_at")
+    sch = config.get("scheduler") or {}
+    refresh_after = timedelta(minutes=sch.get("quota_refresh_minutes", 30))
+    if fetched_at:
+        try:
+            if now - parse_iso(fetched_at) >= refresh_after:
+                return None  # 分片过期，等这轮末尾刷新，不按旧快照叫停
+        except ValueError:
+            return None  # 时间戳都认不出，更不敢信这份快照
+
     resets_at = usage.get("session_resets")
+    if resets_at:
+        try:
+            if parse_iso(resets_at) <= now:
+                return None  # 这份快照自己说的刷新时间都已经过了，肯定过期
+        except ValueError:
+            pass
+
     try:
         paused_until_dt = parse_iso(resets_at) if resets_at else now + timedelta(hours=5)
     except ValueError:
@@ -455,7 +482,14 @@ def _check_codex_quota_pause(
         session_line_left=100 - session_max,
         resets_at=resets_at or "未知时间",
     )
-    launcher.send_keys(window_id, text)
+    proc = launcher.send_keys(window_id, text)
+    if proc.returncode != 0:
+        store.append_event(
+            task_id,
+            f"Codex 五小时额度到线（{session_pct}%）但 send-keys 失败"
+            f"（returncode={proc.returncode}），未能让它停下，留在 working 下 tick 重试",
+        )
+        return [f"{task_id} Codex 额度到线但叫停失败"]
     store.update_status(
         task_id,
         state="waiting_wakeup",
@@ -497,48 +531,92 @@ def _background_heartbeat_stale(rec: dict, now: datetime, config: dict) -> bool:
 
 
 def _reconcile_codex_background(
-    task: dict, status: dict, config: dict, now: datetime, window_id: str
+    task: dict, status: dict, config: dict, now: datetime, window_id: str, alive: bool,
 ) -> list[str] | None:
     """核对这个 codex 任务的后台登记簿（background_runner.py）。
 
-    - 有已完成且未通知的项：核对窗口还在（核不对就 needs_attention + 告警，
-      绝不敲错窗口），对它 send-keys 一次"读取并继续"，标记已通知——同一
-      completion 只敲一次；
-    - 有登记中的 running 项但心跳超时：原 wrapper 大概率丢了（沙箱/窗口没了、
-      进程被杀），转 needs_attention + 单次告警，不能永远卡 waiting_background；
-    - 没有已完成待通知的项、心跳也正常，但还有登记中的 running 项：state 摁回
-      waiting_background（不许 idle/存档/换班），只在真的需要纠正时才动，
-      已经是 waiting_background 就不重复写盘/不短路，好让保活戳照常生效；
-    - 都没有：返回 None，交回调用方按原状态机走（多半是没有后台项，或者
-      后台项都完成且已通知完——那才轮到真正的 idle/收尾）。
+    S6.1 A3/A4 修正（详见返修令 A3/A4）：
+
+    - finished 与 stopped 都是"需要通知原会话读取并继续"的终态——只认
+      finished 的话，stop 请求处理完之后落的 stopped 永远不会被通知，
+      任务会卡死在 waiting_background；
+    - 窗口已消失，或者登记时记的 thread_id 跟 status 当前 thread_id 对不上
+      号（同一个 @N 窗口号可能先后属于不同 session）：不管当前顶层状态是
+      不是 idle/waiting_background，都要转 needs_attention——这件事不该被
+      "正忙着 working"掩盖过去，调用方必须无条件把这个分支跑一遍；
+    - 窗口/thread 都没问题，但当前顶层状态是 working（正忙着别的事）：
+      不打断，返回 None 交回正常流程，等它自然停到 idle/waiting_background
+      再通知；
+    - send-keys 真失败（returncode != 0）：不能假装已经通知，留 pending 转
+      needs_attention，不能悄悄再试到地老天荒；
+    - 有登记中的 running 项但心跳超时：原 wrapper 大概率丢了，同样不分顶层
+      状态，转 needs_attention + 单次告警；
+    - 只有还在跑、心跳健康、且当前允许打扰（idle/waiting_background）时，
+      才把 state 摁回 waiting_background；
+    - 都没有：返回 None，交回调用方按原状态机走。
     """
     task_id = task["id"]
     registry = background_runner.load_registry(task_id)
     if not registry:
         return None
 
+    can_notify = status.get("state") in ("idle", "waiting_background")
+    current_thread = status.get("thread_id")
+
     finished_pending = [
         r for r in registry.values()
-        if r.get("state") == "finished" and r.get("notification_state") != "notified"
+        if r.get("state") in ("finished", "stopped") and r.get("notification_state") != "notified"
     ]
     if finished_pending:
-        if not window_id or not launcher.window_alive(window_id, config):
+        mismatched = [
+            r for r in finished_pending
+            if r.get("thread_id_at_start") and current_thread
+            and r.get("thread_id_at_start") != current_thread
+        ]
+        if not alive or mismatched:
             if not status.get("background_attention_noted"):
-                reason = f"{len(finished_pending)} 个后台任务已完成，但窗口已消失，无法通知它继续读取结果"
+                if not alive:
+                    reason = (
+                        f"{len(finished_pending)} 个后台任务已完成/已停止，"
+                        "但窗口已消失，无法通知它继续读取结果"
+                    )
+                else:
+                    ids = "、".join(r["background_id"] for r in mismatched)
+                    reason = (
+                        f"{len(mismatched)} 个后台任务登记时的会话跟当前 thread_id 对不上号，"
+                        f"不敢冒充通知：{ids}"
+                    )
                 store.update_status(
                     task_id, state="needs_attention", error=reason,
                     background_attention_noted=True, last_event_at=to_iso(now),
                 )
-                store.append_event(task_id, f"后台完成但窗口消失 → needs_attention：{reason}")
+                store.append_event(task_id, f"后台完成但窗口/会话对不上 → needs_attention：{reason}")
                 launcher.open_notice_window(task, "(需要人工)", [reason], config)
-            return [f"{task_id} 后台完成但窗口消失 → needs_attention"]
+            return [f"{task_id} 后台完成但窗口/会话对不上 → needs_attention"]
+
+        if not can_notify:
+            return None  # 窗口/会话都没问题，但正忙着 working，不打断
+
+        def _verb(r: dict) -> str:
+            return "已结束" if r.get("state") == "finished" else "已停止"
 
         lines = [
-            f"来自nightshift：后台任务 {r['background_id']} 已结束"
+            f"来自nightshift：后台任务 {r['background_id']} {_verb(r)}"
             f"（exit={r.get('exit_code')}），结果在 {r.get('result_path')}，请读取并继续。"
             for r in finished_pending
         ]
-        launcher.send_keys(window_id, "\n".join(lines))
+        proc = launcher.send_keys(window_id, "\n".join(lines))
+        if proc.returncode != 0:
+            if not status.get("background_attention_noted"):
+                reason = f"后台完成但 send-keys 失败（returncode={proc.returncode}），未能通知它继续"
+                store.update_status(
+                    task_id, state="needs_attention", error=reason,
+                    background_attention_noted=True, last_event_at=to_iso(now),
+                )
+                store.append_event(task_id, f"后台完成通知失败 → needs_attention：{reason}")
+                launcher.open_notice_window(task, "(需要人工)", [reason], config)
+            return [f"{task_id} 后台完成通知失败 → needs_attention"]
+
         ids = [r["background_id"] for r in finished_pending]
 
         def mark_notified(data: dict) -> None:
@@ -568,7 +646,7 @@ def _reconcile_codex_background(
             launcher.open_notice_window(task, "(需要人工)", [reason], config)
         return [f"{task_id} 后台心跳超时 → needs_attention"]
 
-    if running and status.get("state") != "waiting_background":
+    if running and can_notify and status.get("state") != "waiting_background":
         store.update_status(task_id, state="waiting_background", last_event_at=to_iso(now))
         store.append_event(
             task_id,
@@ -617,8 +695,29 @@ def _check_running(
         and bool(pane_pid)
         and launcher.pid_alive(int(pane_pid))
     )
+    runner = task.get("runner") or "claude"
+
+    # S6.1 A4：Codex 的 F12 后台核对必须在通用 window_gone 判断之前做，且不
+    # 分当前顶层状态（working 也要查）——原来挂在通用 alive 分支之后、又只
+    # 在 idle/waiting_background 时才查，窗口一旦消失就被通用分支抢先判成
+    # exited(window_gone)，F12 自己那条"后台做完了但没人能读"的
+    # needs_attention 永远没机会触发，registry 里的完成结果就这么静默丢单。
+    # `_reconcile_codex_background` 内部自己按当前状态决定要不要真的打扰
+    # working 中的会话（只有 idle/waiting_background 才会 send-keys 通知/
+    # 摁回 waiting_background；needs_attention 类的告警不分状态都会触发）。
+    if runner == "codex":
+        registry = background_runner.load_registry(task_id)
+        if registry:
+            bg_result = _reconcile_codex_background(
+                task, status, config, now, str(window_id) if window_id else "", alive,
+            )
+            if bg_result is not None:
+                return bg_result
+
     if not alive:
-        # 窗口没了又没等到 SessionEnd → 按退场处理
+        # 窗口没了又没等到 SessionEnd → 按退场处理（F12 有话说的情形已经在
+        # 上面被拦下，走不到这里；这里只处理"确实没有未处理的后台完成/丢失"
+        # 的普通窗口消失）
         store.update_status(
             task_id, state="exited", exit_reason="window_gone",
             last_event_at=to_iso(now),
@@ -626,25 +725,30 @@ def _check_running(
         store.append_event(task_id, "窗口不在了且没等到 SessionEnd → exited(window_gone)")
         return [f"{task_id} 窗口消失 → exited(window_gone)"]
 
-    # S6④：Codex 后台登记簿核对（F12）——只在"看起来干完了/已经在等后台"的
-    # 时候查，working 中途不打扰（正忙着，不该往它嘴里塞话）
-    if (task.get("runner") or "claude") == "codex" and status.get("state") in (
-        "idle", "waiting_background",
-    ):
-        bg_result = _reconcile_codex_background(task, status, config, now, str(window_id))
-        if bg_result is not None:
-            return bg_result
-
     # S4 疑似卡住：working/waiting_background 静默太久（一条前台工具调用里
     # 轮询、轮次不结束、hook 不响）。只标状态与事件，不动会话、不改 state；
     # 恢复由 hook 事件清 stuck（hook.py 唯一允许的改动）。
+    #
+    # S6.1 A5：Codex 有新鲜心跳的 running 后台项时不适用这条判定——那是给
+    # "前台工具调用轮询很久没响应"设计的，F12 后台任务心跳每秒刷新，健康
+    # 跑着的后台不该被当成同一回事，否则会被误判成卡住甚至触发自动 Esc
+    # 打断前台会话（跟这个后台进程本身毫无关系，纯属误伤）。
+    codex_has_fresh_background = False
+    if runner == "codex":
+        bg_registry = background_runner.load_registry(task_id)
+        codex_has_fresh_background = any(
+            r.get("state") == "running" and not _background_heartbeat_stale(r, now, config)
+            for r in bg_registry.values()
+        )
+
     sch = config.get("scheduler") or {}
     stuck_minutes = sch.get("stuck_minutes")
     if stuck_minutes is None:
         stuck_minutes = 15  # config 没写时的兜底（与 config.example.json 一致）
     stuck = False
     if (
-        status.get("state") in ("working", "waiting_background")
+        not codex_has_fresh_background
+        and status.get("state") in ("working", "waiting_background")
         and stuck_minutes > 0
         and status.get("last_event_at")
     ):
@@ -705,7 +809,7 @@ def _check_running(
     # S6③：Codex 没有 ScheduleWakeup（不能自己定缓存闹钟），working 时五小时
     # 线到了必须由调度器主动 send-keys 叫它停下、转 waiting_wakeup；
     # Claude 走 hook.py 的 _quota_check 自助报告，这条只管 codex。
-    if (task.get("runner") or "claude") == "codex" and status.get("state") == "working":
+    if runner == "codex" and status.get("state") == "working":
         codex_pause = _check_codex_quota_pause(task, status, config, now, str(window_id))
         if codex_pause is not None:
             return codex_pause
@@ -718,7 +822,6 @@ def _check_running(
     if paused_until and status.get("state") in ("idle", "waiting_wakeup"):
         if now < parse_iso(paused_until):
             return []
-        runner = task.get("runner") or "claude"
         codex_waiting_wakeup = (
             runner == "codex" and status.get("state") == "waiting_wakeup"
         )
@@ -730,7 +833,16 @@ def _check_running(
                 if runner == "codex"
                 else "来自nightshift：五小时额度应已刷新，请从刚才停下的地方继续。"
             )
-            launcher.send_keys(str(window_id), text)
+            # S6.1 B2：send-keys 真失败不能假装已经叫醒了它——不写
+            # quota_resume_sent/清 quota_paused_until，留在原状态下 tick 重试
+            proc = launcher.send_keys(str(window_id), text)
+            if proc.returncode != 0:
+                store.append_event(
+                    task_id,
+                    f"额度刷新时间已到但 send-keys 失败（returncode={proc.returncode}），"
+                    "未能让它继续",
+                )
+                return [f"{task_id} 额度刷新但叫醒失败"]
             store.update_status(task_id, quota_resume_sent=True, quota_paused_until=None)
             store.append_event(task_id, "额度刷新时间已到，已 send-keys 让它继续")
             return [f"{task_id} 额度刷新，敲它继续"]
@@ -752,7 +864,6 @@ def _check_running(
     # S6③：保活分家——claude 50 分钟、codex 25 分钟（GPT-5.6 缓存 30 分钟，
     # 见靶测记录 F6），各自文案；旧配置没有 config.runners 时兼容视图会从
     # scheduler.keepalive_* 合成，claude 这条数字/文案跟一期一字不变
-    runner = task.get("runner") or "claude"
     rc = store.runner_config(config).get(runner) or {}
     idle_needed = timedelta(minutes=rc.get("keepalive_idle_minutes", 50 if runner == "claude" else 25))
     stamps = [
@@ -815,7 +926,7 @@ def _check_idle_chain(
     path = _handover_file(task, status)
     text = _read_handover(path)
     if text is not None:
-        return _handover_verdict(task, text, config, now)
+        return _handover_verdict(task, status, text, config, now)
 
     if status.get("context_warned_at"):  # 这班被提醒过却没留交接
         policy = (task.get("chain") or {}).get("on_no_handover") or "continue"
@@ -841,13 +952,13 @@ def _check_idle_chain(
             task["id"],
             "到线提醒过却没留交接，按 chain.on_no_handover=continue 续班（兜底文案）",
         )
-        return _chain_continue(task, config, now, handover_text=None)
+        return _chain_continue(task, status, config, now, handover_text=None)
 
     return _finalize_done(task, config, now)
 
 
 def _handover_verdict(
-    task: dict, text: str, config: dict, now: datetime
+    task: dict, status: dict, text: str, config: dict, now: datetime
 ) -> list[str]:
     """有交接时的判定（idle 与 exited 共用）：末行 NEXT: done → 完工分流；
     NEXT: continue（或没写 NEXT，按 continue）→ 续班。"""
@@ -857,15 +968,24 @@ def _handover_verdict(
     note = ""
     if not _RE_NEXT_CONTINUE.match(last):
         note = "（交接末行没写 NEXT，按 continue）"
-    return _chain_continue(task, config, now, handover_text=text, note=note)
+    return _chain_continue(task, status, config, now, handover_text=text, note=note)
 
 
 def _chain_continue(
-    task: dict, config: dict, now: datetime,
+    task: dict, status: dict, config: dict, now: datetime,
     handover_text: str | None, note: str = "",
 ) -> list[str]:
     """续班：班次没到上限就造后继任务（父任务转 chained）；到上限标
-    chain_exhausted 并开提醒窗。后继下一 tick 走完整预检（额度不够就推迟）。"""
+    chain_exhausted 并开提醒窗。后继下一 tick 走完整预检（额度不够就推迟）。
+
+    S6.1 A7：Codex 续班在造完后继后，最好把父班窗口关掉——下一班要
+    `codex resume` 同一个 thread，父窗口还开着的话会跟后继窗口同时持有
+    同一个会话（两开）。这里是 best-effort（tmux 抽风/窗口已经不在都不算
+    错误，`close_windows` 本来就只关它确认还活着的窗口）；真正兜底的是
+    `launcher.launch()` 里那道"父窗还活着就拒绝 resume"的硬检查——就算这里
+    关闭失败，后继下一 tick 也不会悄悄两开，而是 fail-closed。Claude 换班
+    原样保留旧窗口（一期行为不变，Claude 没有"同一个会话"这个概念）。
+    """
     task_id = task["id"]
     shift = int(task.get("shift") or 1)
     chain = task.get("chain") or {}
@@ -888,6 +1008,16 @@ def _chain_continue(
         )
         return [f"{task_id} 第 {shift} 班结束：班次用尽"]
     successor_id = store.create_successor(task, handover_text, config)
+    if (task.get("runner") or "claude") == "codex":
+        window_id = status.get("window_id")
+        if window_id:
+            closed = launcher.close_windows([window_id], config)
+            store.append_event(
+                task_id,
+                f"续班：已关闭父班窗口 {window_id}" if closed
+                else f"续班：父班窗口 {window_id} 关闭未确认成功"
+                "（launch() 会在 resume 前再核验一次，关不掉就 fail-closed，不会两开）",
+            )
     store.append_event(task_id, f"续班 → {successor_id}（第 {shift + 1} 班）{note}")
     return [f"{task_id} 续班 → {successor_id}（第 {shift + 1} 班）{note}"]
 
@@ -906,7 +1036,7 @@ def _check_exited_chain(
     blocked = _checkpoint_shift(task, status, config, now)
     if blocked:
         return blocked
-    return _handover_verdict(task, text, config, now)
+    return _handover_verdict(task, status, text, config, now)
 
 
 # ---------- S5②：收工存档点与完工分流 ----------

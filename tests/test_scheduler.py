@@ -128,6 +128,7 @@ class Fakes:
 
     def _send_keys(self, window_id, text):
         self.send_keys_calls.append((window_id, text))
+        return subprocess.CompletedProcess([], 0)
 
     def _fetch(self, config, timeout=120):
         self.fetch_calls.append(1)
@@ -719,7 +720,7 @@ def test_auto_interrupt_fires_once(monkeypatch):
     escapes: list[str] = []
     keys: list[tuple] = []
     monkeypatch.setattr(launcher, "send_escape", lambda wid: escapes.append(wid))
-    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: keys.append((wid, text)))
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: keys.append((wid, text)) or subprocess.CompletedProcess([], 0))
     tid = make_task(title="自动中止", guards={"auto_interrupt_minutes": 5})
     stale = scheduler.to_iso(NOW - timedelta(minutes=20))
     store.update_status(tid, state="working", window_id="@56", pane_pid=NO_PID,
@@ -749,7 +750,7 @@ def test_auto_interrupt_uses_configured_text(monkeypatch):
     Fakes(monkeypatch)
     monkeypatch.setattr(launcher, "send_escape", lambda wid: None)
     keys: list[tuple] = []
-    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: keys.append((wid, text)))
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: keys.append((wid, text)) or subprocess.CompletedProcess([], 0))
     tid = make_task(title="自定义自检文案", guards={"auto_interrupt_minutes": 3})
     stale = scheduler.to_iso(NOW - timedelta(minutes=20))
     store.update_status(tid, state="working", window_id="@58", pane_pid=NO_PID,
@@ -844,6 +845,52 @@ def test_chain_continue_creates_successor(monkeypatch):
         assert successor[key] == parent[key]
     # 父窗口不关（没人去杀它；这里至少保证调度器没开/关任何窗口）
     assert fakes.failure_calls == []
+
+
+def test_chain_continue_claude_does_not_close_parent_window(monkeypatch):
+    """Claude 换班原样保留旧窗口——一期行为不变，close_windows 不该被调用。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    _go_idle(tid)
+    _write_handover(tid, "登录页已完成。\n还差支付页。\nNEXT: continue")
+    scheduler.tick(CONFIG, NOW)
+    assert fakes.close_calls == []
+
+
+def test_chain_continue_codex_closes_parent_window_after_successor_persisted(monkeypatch):
+    """S6.1 A7：Codex 续班要在后继落盘（父任务已经是 chained + successor_id）
+    之后才关父班窗口，且只关登记在案的那个 @N，不碰会话/其它窗口。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    monkeypatch.setattr(
+        sched.launcher, "send_keys",
+        lambda w, t: subprocess.CompletedProcess([], 0),
+    )
+    tid = make_task_codex(worktree=False)  # 跳过工作树存档点，只测续班本身
+    close_calls = []
+    call_order = []
+
+    def fake_close_windows(ids, config):
+        # 调用发生时，父任务必须已经落盘 chained + successor_id——
+        # "发生在后继落盘后"不是靠调用顺序猜的，是断言当时的磁盘状态
+        parent_status = store.read_status(tid)
+        call_order.append(("close_windows", parent_status.get("state"),
+                           bool(parent_status.get("successor_id"))))
+        close_calls.append([str(w) for w in ids])
+        return [str(w) for w in ids]
+
+    monkeypatch.setattr(sched.launcher, "close_windows", fake_close_windows)
+
+    store.update_status(tid, state="idle", window_id="@7", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW), thread_id="thread-1")
+    _write_handover(tid, "已完成第一段。\nNEXT: continue")
+    sched.tick(CODEX_CONFIG, NOW)
+
+    assert close_calls == [["@7"]]
+    assert call_order == [("close_windows", "chained", True)]
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "已关闭父班窗口 @7" in events
 
 
 def test_chain_done_finishes(monkeypatch):
@@ -1293,7 +1340,7 @@ def test_waiting_wakeup_not_finished_nor_poked(monkeypatch):
     monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
     monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
     sent = []
-    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t))
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t) or subprocess.CompletedProcess([], 0))
     monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: None)
     now = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
     tid = make_task()
@@ -1321,7 +1368,11 @@ def test_waiting_wakeup_not_finished_nor_poked(monkeypatch):
 CODEX_CONFIG = {
     **CONFIG,
     "runners": {
-        "claude": {"bin": "claude", "models": CONFIG["models"], "efforts": CONFIG["efforts"],
+        # S6.1 B3：runners.claude 存在时是唯一权威源（不再退回顶层
+        # claude_bin/probe_model），这里必须显式带全，不能只带部分字段
+        # 指望顶层兜底——那正是 B3 要堵死的分裂口子。
+        "claude": {"bin": CONFIG["claude_bin"], "probe_model": CONFIG["probe_model"],
+                   "models": CONFIG["models"], "efforts": CONFIG["efforts"],
                    "keepalive_idle_minutes": 50},
         "codex": {"bin": "codex", "profile": "nightowl",
                   "models": {"gpt-5.6-luna": {"context_limit": None}},
@@ -1410,7 +1461,7 @@ def test_codex_working_over_session_line_sends_pause_and_waits(monkeypatch):
     monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
     monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
     sent = []
-    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t))
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t) or subprocess.CompletedProcess([], 0))
     tid = make_task_codex(guards={"session_pct_max": 80, "weekly_pct_max": 95})
     quota.write_quota_runner("codex", {
         "usage": {"session_pct": 85, "session_resets": "2026-08-27T20:00:00Z",
@@ -1436,7 +1487,7 @@ def test_codex_waiting_wakeup_actively_woken_unlike_claude(monkeypatch):
     monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
     monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
     sent = []
-    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t))
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t) or subprocess.CompletedProcess([], 0))
     tid = make_task_codex()
     store.update_status(
         tid, state="waiting_wakeup", window_id="@1", pane_pid=1,
@@ -1462,7 +1513,7 @@ def test_keepalive_codex_25_minutes_claude_50_minutes(monkeypatch):
     monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
     monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
     sent = []
-    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t))
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t) or subprocess.CompletedProcess([], 0))
 
     codex_tid = make_task_codex()
     store.update_status(codex_tid, state="waiting_background", window_id="@1", pane_pid=1,
@@ -1490,7 +1541,7 @@ def _codex_running_task(monkeypatch, sched, window_id="@1"):
     monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
     monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
     sent = []
-    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)))
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)) or subprocess.CompletedProcess([], 0))
     tid = make_task_codex()
     store.update_status(tid, state="idle", window_id=window_id, pane_pid=1,
                         last_event_at=scheduler.to_iso(NOW))
@@ -1563,6 +1614,39 @@ def test_codex_running_background_missing_heartbeat_not_treated_as_stale(monkeyp
     sched.tick(CODEX_CONFIG, NOW)
     assert store.read_status(tid)["state"] == "waiting_background"
     assert notices == []
+
+
+def test_codex_healthy_background_not_stuck_and_not_auto_interrupted(monkeypatch):
+    """S6.1 A5 真机复现：`last_event_at` 20 分钟前（按通用标准早该判卡住/
+    自动 Esc 了）+ F12 心跳刚刚——这是"前台安静但后台任务健康在跑"，不是
+    "卡在一条工具调用里没反应"，不该被通用卡住判定误伤，更不该被自动 Esc
+    打断一个跟这个后台进程毫不相干的前台会话。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    escaped = []
+    monkeypatch.setattr(sched.launcher, "send_escape", lambda w: escaped.append(w))
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)) or subprocess.CompletedProcess([], 0))
+
+    tid = make_task_codex(guards={
+        "session_pct_max": 80, "weekly_pct_max": 95, "auto_interrupt_minutes": 5,
+    })
+    stale_event = scheduler.to_iso(NOW - timedelta(minutes=20))
+    store.update_status(tid, state="waiting_background", window_id="@1", pane_pid=1,
+                        last_event_at=stale_event, stuck_since=stale_event)
+    fresh_hb = scheduler.to_iso(NOW - timedelta(seconds=2))
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "running", "background_id": "bg-1", "heartbeat_at": fresh_hb},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert not status.get("stuck")
+    assert not status.get("auto_interrupted")
+    assert escaped == []
+    # 保活戳（跟卡住判定是两条独立逻辑，不该被这个改动误伤）不受影响：
+    # waiting_background 静默超过 25 分钟该戳还是会戳，这里 20 分钟不到线
+    assert sent == []
 
 
 def test_codex_background_heartbeat_stale_seconds_config_override(monkeypatch):
@@ -1638,22 +1722,123 @@ def test_codex_background_finished_window_gone_needs_attention(monkeypatch):
     monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: False)
     monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
     sent = []
-    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)))
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)) or subprocess.CompletedProcess([], 0))
     notices = []
     monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: notices.append(a))
     tid = make_task_codex()
-    # window_alive False 会先在通用 alive 检查那里判 exited；这里直接单测
-    # _reconcile_codex_background 本体，覆盖"窗口消失"这条防线
+    # S6.1 A4：F12 现在跑在通用 alive 检查之前，直接调用私有 helper 单测本体
+    # 依旧有用（针对性测边界），但真正证明"真实 tick 也走得到"的是下面
+    # test_codex_tick_background_finished_window_gone_reaches_needs_attention
     background_runner.modify_registry(tid, lambda d: d.update({
         "bg-1": {"state": "finished", "background_id": "bg-1", "exit_code": 0,
                  "result_path": "/tmp/a.log", "notification_state": "pending"},
     }))
     status = store.read_status(tid)
-    result = sched._reconcile_codex_background(store.load_task(tid), status, CODEX_CONFIG, NOW, "@1")
+    result = sched._reconcile_codex_background(
+        store.load_task(tid), status, CODEX_CONFIG, NOW, "@1", alive=False,
+    )
     assert result is not None
     assert store.read_status(tid)["state"] == "needs_attention"
     assert sent == []  # 不敲错窗口
     assert len(notices) == 1
+
+
+def test_codex_tick_background_finished_window_gone_reaches_needs_attention(monkeypatch):
+    """S6.1 A4 的核心反例：真实 scheduler.tick()（不是直接调用私有 helper）
+    走完整 window_gone 判断路径时，F12 的 needs_attention 必须真的够得到——
+    改之前通用 alive 检查会抢在前面把它判成 exited(window_gone)，F12 自己
+    的分支永远没机会跑。这里任务状态故意是 working（不是 idle/
+    waiting_background），验证"窗口消失"这条不分顶层状态都能触发。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: False)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)) or subprocess.CompletedProcess([], 0))
+    notices = []
+    monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: notices.append(a))
+    tid = make_task_codex()
+    store.update_status(tid, state="working", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "finished", "background_id": "bg-1", "exit_code": 0,
+                 "result_path": "/tmp/a.log", "notification_state": "pending"},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention", status
+    assert sent == []  # 不敲错窗口
+    assert len(notices) == 1
+    # 不该被通用 window_gone 分支抢答成 exited
+    assert status.get("exit_reason") != "window_gone"
+
+
+def test_codex_tick_background_thread_mismatch_needs_attention(monkeypatch):
+    """S6.1 A4：窗口活着，但登记时的 thread_id 跟当前 status 的 thread_id
+    不一样（比如同一个 @N 窗口号先后属于不同 session）——不敢冒充通知，
+    走 needs_attention，不能敲进一个其实不是那次后台任务发起者的会话。"""
+    import nightshift.scheduler as sched
+    tid, sent = _codex_running_task(monkeypatch, sched)
+    notices = []
+    monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: notices.append(a))
+    store.update_status(tid, thread_id="thread-current")
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "finished", "background_id": "bg-1", "exit_code": 0,
+                 "result_path": "/tmp/a.log", "notification_state": "pending",
+                 "thread_id_at_start": "thread-stale"},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention"
+    assert sent == []  # 不敲错会话
+    assert len(notices) == 1
+
+
+def test_codex_tick_background_send_keys_failure_not_marked_notified(monkeypatch):
+    """S6.1 A4：send-keys 真的失败（returncode != 0）不能假装已经通知——
+    留 pending 转 needs_attention，不许悄悄标 notified 然后没人再理它。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    monkeypatch.setattr(
+        sched.launcher, "send_keys",
+        lambda w, t: subprocess.CompletedProcess([], 1, stderr="tmux 抽风了"),
+    )
+    notices = []
+    monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: notices.append(a))
+    tid = make_task_codex()
+    store.update_status(tid, state="idle", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "finished", "background_id": "bg-1", "exit_code": 0,
+                 "result_path": "/tmp/a.log", "notification_state": "pending"},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention"
+    assert len(notices) == 1
+    registry = background_runner.load_registry(tid)
+    assert registry["bg-1"]["notification_state"] == "pending"  # 没被谎报成 notified
+
+
+def test_codex_stopped_background_notifies_and_marks_once(monkeypatch):
+    """S6.1 A3：state=stopped（用户主动停后台）也是需要通知的终态，不只
+    finished——不然 stop 完的任务永远卡在 waiting_background 没人理。"""
+    import nightshift.scheduler as sched
+    tid, sent = _codex_running_task(monkeypatch, sched)
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "stopped", "background_id": "bg-1", "exit_code": None,
+                 "result_path": "/tmp/a.log", "notification_state": "pending"},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    assert len(sent) == 1
+    assert "已停止" in sent[0][1]
+    assert "bg-1" in sent[0][1]
+    registry = background_runner.load_registry(tid)
+    assert registry["bg-1"]["notification_state"] == "notified"
+    assert store.read_status(tid)["state"] == "waiting_background"
+
+    sched.tick(CODEX_CONFIG, NOW + timedelta(seconds=30))
+    assert len(sent) == 1  # 同一个 completion 不许再敲一次
 
 
 def test_codex_background_survives_registry_reread_like_restart(monkeypatch):
@@ -1680,7 +1865,7 @@ def test_codex_empty_or_bad_registry_does_not_block_idle_chain(monkeypatch):
     monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
     monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
     sent = []
-    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)))
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)) or subprocess.CompletedProcess([], 0))
     tid = make_task_codex(worktree=False)
     store.update_status(tid, state="idle", window_id="@1", pane_pid=1,
                         last_event_at=scheduler.to_iso(NOW))
@@ -1698,7 +1883,7 @@ def test_codex_working_task_not_disturbed_by_finished_background(monkeypatch):
     monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
     monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
     sent = []
-    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)))
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)) or subprocess.CompletedProcess([], 0))
     tid = make_task_codex()
     store.update_status(tid, state="working", window_id="@1", pane_pid=1,
                         last_event_at=scheduler.to_iso(NOW))

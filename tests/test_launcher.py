@@ -237,6 +237,64 @@ def test_write_task_files_codex_skips_settings_json(tmp_path):
     assert (d / "prompt.txt").is_file()
 
 
+def test_write_task_files_codex_includes_f12_instruction_once(tmp_path):
+    """S6.1 A1：Codex 任务的 prompt.txt 必须带 F12 后台协议前言（新会话），
+    且只出现一次；worktree 前言同时存在时两条都要在。"""
+    task_id, config = make_task_codex(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    store.update_status(task_id, worktree_path="/home/user/projects/demo")
+    launcher.write_task_files(task, config, None)
+    prompt_txt = (store.task_dir(task_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert prompt_txt.count(store.CODEX_BACKGROUND_INSTRUCTION) == 1
+    assert store.WORKTREE_INSTRUCTION in prompt_txt  # 新任务缺省建树，两条前言都该在
+    assert prompt_txt.endswith(task["prompt_final"])
+
+
+def test_write_task_files_codex_resume_also_includes_f12_instruction(tmp_path):
+    """S6.1 A1：续班（有 resume_thread_id）同样要带这条协议——不能只有首班有。"""
+    task_id, config = make_task_codex(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    launcher.write_task_files(
+        task, config, "thread-abc", resume_thread_id="thread-abc",
+    )
+    prompt_txt = (store.task_dir(task_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert prompt_txt.count(store.CODEX_BACKGROUND_INSTRUCTION) == 1
+
+
+def test_write_task_files_codex_custom_prompt_file_still_gets_instruction_once(tmp_path):
+    """S6.1 A1：用户自己用 --prompt-file 给的全文（这里模拟成完全自定义的
+    prompt_final，跟模板占位符无关）一样要保证兜底追加，且如果这段文本碰巧
+    已经原样包含这条协议（比如用户自己抄了一遍），也不能重复追加成两遍。"""
+    task_id, config = make_task_codex(project_path="/home/user/projects/demo", worktree=False)
+    task = store.load_task(task_id)
+    task["prompt_final"] = "用户自己写的完整提示词，跟模板毫无关系。"
+    store.atomic_write_json(store.task_dir(task_id) / "task.json", task)
+    launcher.write_task_files(task, config, None)
+    prompt_txt = (store.task_dir(task_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert prompt_txt.count(store.CODEX_BACKGROUND_INSTRUCTION) == 1
+    assert prompt_txt.endswith(task["prompt_final"])
+
+    # 用户自己的文本碰巧已经包含这条协议：不能变成两遍
+    task2_id, config2 = make_task_codex(project_path="/home/user/projects/demo", worktree=False)
+    task2 = store.load_task(task2_id)
+    task2["prompt_final"] = store.CODEX_BACKGROUND_INSTRUCTION + "\n\n用户自己的正文。"
+    store.atomic_write_json(store.task_dir(task2_id) / "task.json", task2)
+    launcher.write_task_files(task2, config2, None)
+    prompt_txt2 = (store.task_dir(task2_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert prompt_txt2.count(store.CODEX_BACKGROUND_INSTRUCTION) == 1
+
+
+def test_write_task_files_claude_prompt_not_padded_with_codex_instruction(tmp_path):
+    """Claude 任务的 prompt 一字不多——F12 协议是 Codex 专属，不该出现在
+    Claude 的 prompt.txt 里。"""
+    task_id, config = make_task(project_path="/home/user/projects/demo", worktree=False)
+    task = store.load_task(task_id)
+    launcher.write_task_files(task, config, "01234567-89ab-cdef-0123-456789abcdef")
+    prompt_txt = (store.task_dir(task_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert store.CODEX_BACKGROUND_INSTRUCTION not in prompt_txt
+    assert prompt_txt == task["prompt_final"]
+
+
 def test_launch_codex_resume_fail_closed_without_parent_thread_id(tmp_path, monkeypatch):
     """S6：Codex 续班找不到父班 thread_id，宁可判失败也不悄悄开新会话。"""
     proj = tmp_path / "proj"
@@ -652,6 +710,12 @@ def test_launch_codex_resume_uses_parent_thread_id(tmux_session, codex_env):
     wait_for_state(parent_id)  # 等首班坐实 thread_id
 
     parent_task = store.load_task(parent_id)
+    # S6.1 A7：生产链路里 _chain_continue 续班时会先关掉父班窗口再造后继；
+    # 这里手动做同一步，否则 launch() 的新守卫会因为父窗还活着而 fail-closed
+    # （父窗跑完只是"留窗"等回车，tmux 里仍然算活着，见 run.sh 的 read）
+    parent_window_id = store.read_status(parent_id)["window_id"]
+    launcher.close_windows([parent_window_id], config)
+
     succ_id = store.create_successor(parent_task, "交接", config)
     succ_status = launcher.launch(succ_id, config)
     assert succ_status["state"] == "launching"
@@ -667,6 +731,22 @@ def test_launch_codex_resume_uses_parent_thread_id(tmux_session, codex_env):
     fake_log = (codex_env["fake_log"]).read_text(encoding="utf-8")
     assert "resume" in fake_log
     assert "01a05206-e86e-7c80-8540-1b92468c92a1" in fake_log
+
+
+def test_launch_codex_resume_fails_closed_when_parent_window_still_alive(tmux_session, codex_env):
+    """S6.1 A7：父班窗口没被关掉（比如 close_windows 失败/没人调用）时，
+    绝不允许后继在新窗口 resume 同一个 thread——两开比开不了更糟，宁可这
+    一班启动失败。"""
+    parent_id, config = make_task_codex(project_path=str(codex_env["proj"]))
+    launcher.launch(parent_id, config)
+    wait_for_state(parent_id)  # 等首班坐实 thread_id；父窗故意不关
+
+    parent_task = store.load_task(parent_id)
+    succ_id = store.create_successor(parent_task, "交接", config)
+    succ_status = launcher.launch(succ_id, config)
+    assert succ_status["state"] == "failed"
+    assert "仍然存活" in succ_status["error"]
+    assert "两开" in succ_status["error"]
 
 
 def test_launch_codex_untrusted_claude_json_does_not_block(tmux_session, codex_env, monkeypatch):

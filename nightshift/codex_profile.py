@@ -56,14 +56,30 @@ _HOOK_TIMEOUTS = {
 
 def hooks_json() -> dict:
     """``~/.codex/hooks.json`` 的内容：命令不随任务变（改一字都要重新走信任），
-    task id 全部走 ``NIGHTOWL_TASK_ID`` 环境变量。"""
+    task id 全部走 ``NIGHTOWL_TASK_ID`` 环境变量。
+
+    S6.1 A2：这份 hooks.json 是用户级、全局的——工头自己交互式跑 codex/Sol
+    也会触发同一条命令，但那种会话既没有 NIGHTOWL_TASK_ID 也没有
+    PYTHONPATH。之前直接裸跑 `python3 -m nightshift.hook --codex <event>`，
+    import 阶段就因为找不到 nightshift 包炸 ModuleNotFoundError（真机实测：
+    `/usr/bin/python3: Error while finding module specification for
+    'nightshift.hook'`），部署后每次工头自己开 codex 都会产生这个噪音。
+    改成先在 shell 层判断 NIGHTOWL_TASK_ID：没有就直接 exit 0，压根不碰
+    python，这才是真正的 no-op；夜班自己的 run.sh 会同时 export
+    NIGHTOWL_TASK_ID 和 PYTHONPATH（见 launcher.run_sh_text），两者总是
+    一起出现，所以夜班环境里这个判断恒真，行为不变。
+    """
 
     def entry(event: str) -> dict:
+        command = (
+            f'[ -n "$NIGHTOWL_TASK_ID" ] && exec {sys.executable} '
+            f"-m nightshift.hook --codex {event} || exit 0"
+        )
         return {
             "matcher": "",
             "hooks": [{
                 "type": "command",
-                "command": f"{sys.executable} -m nightshift.hook --codex {event}",
+                "command": command,
                 "timeout": _HOOK_TIMEOUTS[event],
             }],
         }
