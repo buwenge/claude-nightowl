@@ -49,11 +49,16 @@ ALARM_FALLBACK_COUNT = 6  # 刷新时间没查到：按五小时最长等
 
 
 def _context_limit(task: dict, config: dict) -> int:
-    """上下文上限：任务 guards 里的 context_limit_tokens 优先，否则按模型查 config。"""
+    """上下文上限：任务 guards 里的 context_limit_tokens 优先，否则按模型查 config。
+
+    S6.1 二次返修 B3：本 hook 只服务 Claude（Codex 的 `_refresh_context` 在
+    调用这条之前就已经 return 了），显式传 `runner="claude"` 而不是依赖
+    `context_limit_for` 的默认参数，避免以后默认值改动时这里静默跟着变。
+    """
     limit = (task.get("guards") or {}).get("context_limit_tokens")
     if limit:
         return int(limit)
-    return context_limit_for(task.get("model", ""), config)
+    return context_limit_for(task.get("model", ""), config, runner="claude")
 
 
 def warn_threshold(task: dict, config: dict) -> int:
@@ -100,32 +105,52 @@ def alarm_plan(resets_in: int | None) -> tuple[str, int]:
 
 
 def _read_fresh_usage(config: dict) -> dict | None:
-    """读 home()/quota.json（调度器在刷新），返回 usage dict。
+    """读 home()/quota.json 的 claude 分片（调度器在刷新），返回 usage dict。
 
-    文件缺/坏 JSON/缺键/`fetched_at` 超过 2 × scheduler.quota_refresh_minutes
-    都当没有——回注提醒宁缺勿滥，过期额度只会吓唬人。
+    二次返修阻断二修正：S6 起 quota.json 是双 runner 分片
+    `{"claude": {...}, "codex": {...}}`；这里必须走 `quota.load_quota_file()`
+    只取 `claude` 那一份再判有效（loader 自带一期旧顶层形状兼容，`{"usage":
+    ..., "fetched_at": ...}` 会被当成 claude 分片解释），不能再直接读文件
+    顶层 `data["fetched_at"]`/`data["usage"]`——双分片写法下顶层根本没有
+    这两个键，会让这个 hook 无声失效（Claude 的五小时暂停、周线收尾、
+    别的模型周线提示全部读不到新数据）。
+
+    分片有 error、没有 usage dict、或 `fetched_at` 超过
+    2 × scheduler.quota_refresh_minutes 都当没有——回注提醒宁缺勿滥，
+    过期额度只会吓唬人。
     """
-    path = store.home() / "quota.json"
-    if not path.is_file():
+    from .quota import load_quota_file
+
+    slice_ = load_quota_file().get("claude") or {}
+    if slice_.get("error"):
+        return None
+    usage = slice_.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    fetched_at = slice_.get("fetched_at")
+    if not fetched_at:
         return None
     try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
         refresh_minutes = (config.get("scheduler") or {}).get(
             "quota_refresh_minutes", 30
         )
         max_age_seconds = 2 * float(refresh_minutes) * 60
-        age = datetime.now(timezone.utc) - datetime.fromisoformat(data["fetched_at"])
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(fetched_at)
         if age.total_seconds() > max_age_seconds:
             return None
-        usage = data["usage"]
-    except (OSError, ValueError, KeyError, TypeError):
+    except (ValueError, TypeError):
         return None
-    return usage if isinstance(usage, dict) else None
+    return usage
 
 
 def _other_model_notes(task: dict, config: dict, status: dict) -> list[tuple[str, str]]:
-    """不是本任务模型的单模型周线到了 model_weekly_pct_max → 每个模型提示一次。"""
+    """不是本任务模型的单模型周线到了 model_weekly_pct_max → 每个模型提示一次。
+
+    S6.1 二次返修 B3：模型表必须查 `store.runner_config(config)["claude"]`
+    这份 Claude runner view，不能再看顶层 `config.models`——`runner_config`
+    的语义是"`config.runners` 里有 `claude` 键就整个原样返回，不做字段级
+    合并"，顶层 `models` 分裂出去之后就只是个过期快照。
+    """
     guards = task.get("guards") or {}
     model_max = guards.get("model_weekly_pct_max", guards.get("weekly_pct_max"))
     if model_max is None:
@@ -133,7 +158,8 @@ def _other_model_notes(task: dict, config: dict, status: dict) -> list[tuple[str
     usage = _read_fresh_usage(config)
     if usage is None:
         return []
-    own = (config.get("models") or {}).get(task.get("model", ""), {}).get("usage_label")
+    claude_rc = store.runner_config(config).get("claude") or {}
+    own = claude_rc.get("models", {}).get(task.get("model", ""), {}).get("usage_label")
     warned = set(status.get("other_model_warned") or [])
     out = []
     for label, pct in (usage.get("per_model") or {}).items():
@@ -166,7 +192,8 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
         return None, "", {}
     session_pct = usage.get("session_pct")
     week_all_pct = usage.get("week_all_pct")
-    label = (config.get("models") or {}).get(task.get("model", ""), {}).get("usage_label")
+    claude_rc = store.runner_config(config).get("claude") or {}
+    label = claude_rc.get("models", {}).get(task.get("model", ""), {}).get("usage_label")
     per_model = usage.get("per_model") or {}
     model_pct = per_model.get(label) if label else None
 

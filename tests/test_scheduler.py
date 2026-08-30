@@ -1793,6 +1793,76 @@ def test_codex_tick_background_thread_mismatch_needs_attention(monkeypatch):
     assert len(notices) == 1
 
 
+def test_codex_tick_fresh_running_window_gone_needs_attention(monkeypatch):
+    """二次返修阻断一反例①：登记簿里只有一个新鲜 running 项（不是
+    finished/stopped），窗口却已经消失——旧代码只在 finished_pending 分支查
+    alive，running 项会绕过检查被通用分支抢答成 exited(window_gone)，F12
+    自己的 needs_attention 永远没机会触发。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: False)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append((w, t)) or subprocess.CompletedProcess([], 0))
+    notices = []
+    monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: notices.append(a))
+    tid = make_task_codex()
+    store.update_status(tid, state="working", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+    fresh_hb = scheduler.to_iso(NOW - timedelta(seconds=2))
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "running", "background_id": "bg-1", "heartbeat_at": fresh_hb},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention", status
+    assert sent == []
+    assert len(notices) == 1
+    assert status.get("exit_reason") != "window_gone"  # 不该被通用分支抢答成 exited
+
+
+def test_codex_tick_fresh_running_thread_mismatch_needs_attention(monkeypatch):
+    """二次返修阻断一反例②：登记簿里只有一个新鲜 running 项，窗口还活着，
+    但登记时的 thread_id 跟当前 status 的 thread_id 对不上号——旧代码只在
+    finished_pending 分支查 mismatch，running 项会被摁回 waiting_background
+    当作什么都没发生，实际上这个窗口现在属于别的 session。"""
+    import nightshift.scheduler as sched
+    tid, sent = _codex_running_task(monkeypatch, sched)
+    notices = []
+    monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: notices.append(a))
+    store.update_status(tid, thread_id="thread-current")
+    fresh_hb = scheduler.to_iso(NOW - timedelta(seconds=2))
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "running", "background_id": "bg-1", "heartbeat_at": fresh_hb,
+                 "thread_id_at_start": "thread-stale"},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention", status
+    assert sent == []  # 不敲错会话
+    assert len(notices) == 1
+    assert status["state"] != "waiting_background"
+
+
+def test_codex_tick_only_notified_terminal_window_gone_still_exits_normally(monkeypatch):
+    """二次返修阻断一的边界：registry 里没有未收口项（只剩已经 notified 的
+    终态），窗口消失应该走回普通的 exited(window_gone)——这是正常退场，
+    F12 的核验不该拦下它。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: False)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    tid = make_task_codex()
+    store.update_status(tid, state="waiting_background", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "finished", "background_id": "bg-1", "exit_code": 0,
+                 "result_path": "/tmp/a.log", "notification_state": "notified"},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "exited"
+    assert status.get("exit_reason") == "window_gone"
+
+
 def test_codex_tick_background_send_keys_failure_not_marked_notified(monkeypatch):
     """S6.1 A4：send-keys 真的失败（returncode != 0）不能假装已经通知——
     留 pending 转 needs_attention，不许悄悄标 notified 然后没人再理它。"""

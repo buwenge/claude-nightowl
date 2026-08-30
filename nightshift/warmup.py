@@ -72,12 +72,20 @@ def due(config: dict, now: datetime, state: dict | None = None) -> list[str]:
 
 
 def run_warmup(config: dict, now: datetime, timeout: int = 120, slot: str | None = None) -> dict:
-    """发一句话给 probe_model（默认 haiku），把结果写进 warmup.json 并返回。slot 是本次对应的时刻。"""
+    """发一句话给 probe_model（默认 haiku），把结果写进 warmup.json 并返回。slot 是本次对应的时刻。
+
+    S6.1 二次返修 B3：预热只针对 Claude 的五小时窗口（Codex 没有这个概念），
+    bin/probe_model 必须取 `store.runner_config(config)["claude"]` 这份权威
+    视图，不能再看顶层 `config["claude_bin"]`/`config["probe_model"]`——
+    `runners.claude` 一旦声明，顶层这两个键就只是过期快照。`warmup.model`
+    的显式覆盖语义不变，优先级最高。
+    """
     tz = timezone(timedelta(hours=int(config.get("display_tz_offset_hours", 0))))
     local_now = now.astimezone(tz)
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-    model = (config.get("warmup") or {}).get("model") or config["probe_model"]
-    cmd = [config["claude_bin"], "-p", WARMUP_PROMPT, "--model", model, "--tools", ""]
+    claude_rc = store.runner_config(config).get("claude") or {}
+    model = (config.get("warmup") or {}).get("model") or claude_rc.get("probe_model")
+    cmd = [claude_rc.get("bin", "claude"), "-p", WARMUP_PROMPT, "--model", model, "--tools", ""]
     store.ensure_dirs()
     today = local_now.strftime("%Y-%m-%d")
     prev = read_state()

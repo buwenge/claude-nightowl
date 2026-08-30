@@ -40,12 +40,38 @@ def test_run_warmup_with_fake_claude(tmp_path, monkeypatch):
     fake.write_text("#!/bin/bash\necho 好\n", encoding="utf-8")
     fake.chmod(0o755)
     c = cfg()
-    c["claude_bin"] = str(fake)
+    # S6.1 二次返修 B3：warmup 现在从 runners.claude 权威视图取 bin，不再看
+    # 顶层 claude_bin（config.example.json 已声明 runners.claude，顶层键
+    # 只是过期快照，改它不会生效）。
+    c["runners"]["claude"]["bin"] = str(fake)
     now = datetime(2026, 8, 27, 23, 0, tzinfo=timezone.utc)
     result = warmup.run_warmup(c, now, slot="07:00")
     assert result["ok"] and result["reply"] == "好" and result["last_date"] == "2026-08-28"
     assert result["done"] == {"2026-08-28": ["07:00"]}
     assert warmup.read_state()["last_run_at"] == "2026-08-27T23:00:00Z"
+
+
+def test_run_warmup_ignores_stale_toplevel_when_runner_view_diverges(tmp_path):
+    """二次返修阻断二反例③：顶层 `claude_bin`/`probe_model` 与
+    `runners.claude.bin`/`probe_model` 故意分裂，预热命令只该认 runner
+    view——旧代码直接读 `config["claude_bin"]`/`config["probe_model"]`，
+    会拿一份过期的顶层快照去起进程。"""
+    real_bin = tmp_path / "real-claude"
+    real_bin.write_text("#!/bin/bash\necho 好\n", encoding="utf-8")
+    real_bin.chmod(0o755)
+    fake_bin = tmp_path / "wrong-claude"  # 顶层这份就不该被用到
+    fake_bin.write_text("#!/bin/bash\nexit 1\n", encoding="utf-8")
+    fake_bin.chmod(0o755)
+
+    c = cfg()
+    c["claude_bin"] = str(fake_bin)
+    c["probe_model"] = "TOP_PROBE"
+    c["runners"]["claude"]["bin"] = str(real_bin)
+    c["runners"]["claude"]["probe_model"] = "RUNNER_PROBE"
+    now = datetime(2026, 8, 27, 23, 0, tzinfo=timezone.utc)
+    result = warmup.run_warmup(c, now, slot="07:00")
+    assert result["ok"]  # 走的是 runner view 那个真实脚本，不是顶层那个必炸的假脚本
+    assert result["model"] == "RUNNER_PROBE"
 
 
 def test_tick_runs_warmup_once_and_refreshes_quota(monkeypatch):

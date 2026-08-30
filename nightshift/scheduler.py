@@ -535,15 +535,21 @@ def _reconcile_codex_background(
 ) -> list[str] | None:
     """核对这个 codex 任务的后台登记簿（background_runner.py）。
 
-    S6.1 A3/A4 修正（详见返修令 A3/A4）：
+    S6.1 A3/A4 修正（详见返修令 A3/A4），S6.1 二次返修修正窗口/thread 身份
+    核验的覆盖范围（详见二次返修令"阻断一"）：
 
     - finished 与 stopped 都是"需要通知原会话读取并继续"的终态——只认
       finished 的话，stop 请求处理完之后落的 stopped 永远不会被通知，
       任务会卡死在 waiting_background；
-    - 窗口已消失，或者登记时记的 thread_id 跟 status 当前 thread_id 对不上
-      号（同一个 @N 窗口号可能先后属于不同 session）：不管当前顶层状态是
-      不是 idle/waiting_background，都要转 needs_attention——这件事不该被
-      "正忙着 working"掩盖过去，调用方必须无条件把这个分支跑一遍；
+    - 窗口/thread 身份核验必须覆盖**所有未收口项**（state==running，或
+      finished/stopped 但还没 notified），不能只查 finished_pending——
+      否则一个新鲜的 running 项赶上窗口消失，会绕过这条检查被通用
+      window_gone 分支抢答成 exited；thread 不符也会被误判成"还在正常
+      跑"摁回 waiting_background，两者都违反 F12 的"未收口时窗口/会话
+      有问题必须 needs_attention，不能普通退场或装作没事"；
+    - registry 里只剩已经 notified 的终态项（没有未收口项）时，这条核验
+      不生效，窗口消失走回通用 exited(window_gone)——这是正常退场，不该
+      被 F12 拦下；
     - 窗口/thread 都没问题，但当前顶层状态是 working（正忙着别的事）：
       不打断，返回 None 交回正常流程，等它自然停到 idle/waiting_background
       再通知；
@@ -563,13 +569,18 @@ def _reconcile_codex_background(
     can_notify = status.get("state") in ("idle", "waiting_background")
     current_thread = status.get("thread_id")
 
-    finished_pending = [
+    # 二次返修阻断一：先圈出所有"未收口"项（running，或 finished/stopped
+    # 但还没 notified）——窗口/thread 身份核验必须看着这整个集合，不能只看
+    # finished_pending，否则新鲜的 running 项会绕过这条检查。
+    unresolved = [
         r for r in registry.values()
-        if r.get("state") in ("finished", "stopped") and r.get("notification_state") != "notified"
+        if r.get("state") == "running"
+        or (r.get("state") in ("finished", "stopped") and r.get("notification_state") != "notified")
     ]
-    if finished_pending:
+
+    if unresolved:
         mismatched = [
-            r for r in finished_pending
+            r for r in unresolved
             if r.get("thread_id_at_start") and current_thread
             and r.get("thread_id_at_start") != current_thread
         ]
@@ -577,8 +588,8 @@ def _reconcile_codex_background(
             if not status.get("background_attention_noted"):
                 if not alive:
                     reason = (
-                        f"{len(finished_pending)} 个后台任务已完成/已停止，"
-                        "但窗口已消失，无法通知它继续读取结果"
+                        f"{len(unresolved)} 个后台任务尚未收口，"
+                        "但窗口已消失，无法核对/通知它继续读取结果"
                     )
                 else:
                     ids = "、".join(r["background_id"] for r in mismatched)
@@ -594,6 +605,11 @@ def _reconcile_codex_background(
                 launcher.open_notice_window(task, "(需要人工)", [reason], config)
             return [f"{task_id} 后台完成但窗口/会话对不上 → needs_attention"]
 
+    finished_pending = [
+        r for r in unresolved
+        if r.get("state") in ("finished", "stopped")
+    ]
+    if finished_pending:
         if not can_notify:
             return None  # 窗口/会话都没问题，但正忙着 working，不打断
 

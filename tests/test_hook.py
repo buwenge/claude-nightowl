@@ -326,6 +326,30 @@ def write_quota(session=10, week=10, per_model=None, age_minutes=0) -> None:
     )
 
 
+def write_quota_dual(session=10, week=10, per_model=None, age_minutes=0) -> None:
+    """往数据目录写一份 S6 双分片形状的 quota.json（只填 claude 那一片，
+    codex 留空），用来验证 `_read_fresh_usage` 真的在读双分片而不是只兼容
+    一期旧顶层形状。"""
+    fetched_at = (
+        datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.atomic_write_json(
+        store.home() / "quota.json",
+        {
+            "claude": {
+                "usage": {
+                    "session_pct": session,
+                    "week_all_pct": week,
+                    "per_model": per_model or {},
+                },
+                "fetched_at": fetched_at,
+                "error": None,
+            },
+            "codex": {},
+        },
+    )
+
+
 def test_post_tool_use_injects_context_warn_at_20_and_40(tmp_path):
     task_id = make_task(
         guards={
@@ -427,6 +451,31 @@ def test_post_tool_use_quota_warn(tmp_path):
     assert "五小时额度只剩 15%" in ctx and "线 20%" in ctx
     assert "ScheduleWakeup" in ctx and "50 分钟" in ctx
     assert "上下文已" not in ctx  # 上下文没到线，只有额度这一段
+    status = store.read_status(task_id)
+    assert status["quota_pause_count"] == 1
+    assert status["quota_paused_until"]
+
+
+def test_post_tool_use_quota_warn_dual_slice(tmp_path):
+    """二次返修阻断二反例①：quota.json 是 S6 真实双分片形状
+    （`{"claude": {...}, "codex": {...}}`）时，第 20 次 PostToolUse 仍要
+    正常回注五小时暂停——旧代码直接读顶层 `data["fetched_at"]`/
+    `data["usage"]`，双分片下这两个键根本不存在，会静默读不到任何数据。"""
+    task_id = make_task(
+        guards={
+            "session_pct_max": 80,
+            "weekly_pct_max": 95,
+            "context_warn_tokens": 100000,
+            "context_limit_tokens": 200000,
+        }
+    )
+    write_quota_dual(session=85, week=10)  # 五小时 85 ≥ 80
+    payload = make_transcript(tmp_path / "transcript.jsonl", 100)
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", payload)
+    proc = run_hook(task_id, "PostToolUse", payload)  # 第 20 次
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "五小时额度只剩 15%" in ctx and "线 20%" in ctx
     status = store.read_status(task_id)
     assert status["quota_pause_count"] == 1
     assert status["quota_paused_until"]
@@ -783,6 +832,42 @@ def test_own_model_line_uses_model_weekly_pct_max(tmp_path):
     proc = run_hook(task_id, "PostToolUse", payload)
     ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "Fable 单独周线剩 12%（线 15%）" in ctx and "NEXT: done" in ctx
+
+
+def test_quota_model_lookup_uses_runner_view_not_stale_toplevel(tmp_path):
+    """二次返修阻断二反例②：顶层 `config.models` 与
+    `runners.claude.models` 故意分裂——own-model/other-model 判断只该认
+    runner view，不能被过期的顶层快照带偏（比如顶层还留着旧的
+    usage_label，或者压根没声明这个模型）。"""
+    cfg = dict(CONFIG)
+    # 顶层留一份跟真实情况不一样的旧快照：把 Fable 的 usage_label 改错，
+    # 且压根不认识 Sonnet。
+    cfg["models"] = {"claude-fable-5": {"context_limit": 500000, "usage_label": "旧标签"}}
+    cfg["runners"] = {
+        "claude": {
+            "models": {
+                "claude-fable-5": {"context_limit": 500000, "usage_label": "Fable"},
+                "claude-sonnet-5": {"context_limit": 500000, "usage_label": "Sonnet"},
+            },
+            "efforts": CONFIG["efforts"],
+        }
+    }
+    store.atomic_write_json(store.home() / "config.json", cfg)
+    task_id = make_task(model="claude-sonnet-5", guards={
+        "session_pct_max": 80, "weekly_pct_max": 95, "model_weekly_pct_max": 90,
+        "context_warn_tokens": 100000, "context_limit_tokens": 200000,
+    })
+    write_quota(session=10, week=20, per_model={"Fable": 92, "Sonnet": 30})
+    payload = make_transcript(tmp_path / "transcript.jsonl", 100)
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", payload)
+    proc = run_hook(task_id, "PostToolUse", payload)
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    # own model 是 Sonnet（runner view 里查得到 usage_label），"旧标签"
+    # 那份过期顶层快照如果被用来查 own，会把 Fable 也当成"不是自己"去提示，
+    # 或者干脆查不到 own 导致 Fable 提示逻辑判断错误。
+    assert "Fable 的周额度只剩 8%" in ctx and "别再派 Fable" in ctx
+    assert "旧标签" not in ctx
 
 
 # ---------- S4①/S4.1 疑似卡住：恢复事件清整个卡住周期 ----------
