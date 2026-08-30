@@ -423,10 +423,20 @@ def test_create_task_worktree_fields(authed):
     status, _, body = authed.request(
         "POST", "/api/tasks", {**base, "review": {"enabled": True}})
     assert status == 400
-    assert "S7" in body["error"]
+    assert "runner" in body["error"]  # S7：没给 runner，报缺项而不是"S7 才开放"
     status, _, body = authed.request(
         "POST", "/api/tasks", {**base, "review": {"enabled": False, "merge_policy": "yolo"}})
     assert status == 400
+    # S7：review.enabled=true 且给全 runner/model/effort，worktree 缺省 true 时能建成
+    status, _, body = authed.request(
+        "POST", "/api/tasks", {**base, "title": "带审稿", "review": {
+            "enabled": True, "runner": "claude", "model": "claude-fable-5", "effort": "high",
+        }})
+    assert status == 201, body
+    review_task = store.load_task(body["id"])
+    assert review_task["review"]["enabled"] is True
+    assert review_task["review"]["max_rounds"] == 5
+    assert review_task["pipeline_id"] == body["id"]
 
 
 # ---------- S6：runner ----------
@@ -547,19 +557,26 @@ def test_put_task_worktree_review_edit_rules(authed):
     task = store.load_task(task_id)
     assert task["worktree"] is False
     assert task["review"]["merge_policy"] == "auto"
-    # review.enabled=true 一样被 400 拦下，task.json 不被写坏
+    # review.enabled=true 但 worktree 仍是上一步设的 false：400 拦下
     status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {
         "review": {"enabled": True},
     })
-    assert status == 400 and "S7" in body["error"]
+    assert status == 400 and "worktree" in body["error"]
     assert store.load_task(task_id)["review"]["enabled"] is False
+    # 补全 runner/model/effort + worktree=true：S7 起可以真正开启
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {
+        "worktree": True,
+        "review": {"enabled": True, "runner": "claude", "model": "claude-fable-5", "effort": "high"},
+    })
+    assert status == 200, body
+    assert store.load_task(task_id)["review"]["enabled"] is True
     # 活跃编辑：worktree / review 不在允许键里
     store.update_status(task_id, state="working")
     status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {
-        "worktree": True,
+        "worktree": False,
     })
     assert status == 400
-    assert store.load_task(task_id)["worktree"] is False
+    assert store.load_task(task_id)["worktree"] is True
 
 
 def test_worktrees_api_requires_auth_and_lists_orphans(authed, ns_home):

@@ -261,10 +261,10 @@ def test_review_shape_and_validation(repo):
     # 只认 manual / auto
     task_auto = make_task(config, review={"enabled": False, "merge_policy": "auto"})
     assert task_auto["review"]["merge_policy"] == "auto"
-    # enabled=true 明确拒绝（S7 才开放）
+    # enabled=true 但没给 runner：拒绝
     with pytest.raises(ValueError) as exc:
         make_task(config, review={"enabled": True, "merge_policy": "manual"})
-    assert "S7" in str(exc.value)
+    assert "runner" in str(exc.value)
     with pytest.raises(ValueError):
         make_task(config, review={"enabled": False, "merge_policy": "yolo"})
     with pytest.raises(ValueError):
@@ -272,10 +272,22 @@ def test_review_shape_and_validation(repo):
     with pytest.raises(ValueError):
         make_task(config, review="审一下")
     with pytest.raises(ValueError):
-        make_task(config, review={"enabled": False, "criteria_text": "多出来的键"})
+        make_task(config, review={"enabled": False, "unknown_key": "多出来的键"})
     # worktree 非布尔拒绝
     with pytest.raises(ValueError):
         make_task(config, worktree="true")
+    # enabled=true + worktree=false：明确拒绝
+    with pytest.raises(ValueError) as exc2:
+        make_task(config, worktree=False, review={
+            "enabled": True, "runner": "claude", "model": "claude-fable-5", "effort": "high",
+        })
+    assert "worktree" in str(exc2.value)
+    # enabled=true + 给全 runner/model/effort：S7 起真的能开
+    task_review = make_task(config, review={
+        "enabled": True, "runner": "claude", "model": "claude-fable-5", "effort": "high",
+    })
+    assert task_review["review"]["enabled"] is True
+    assert task_review["review"]["max_rounds"] == 5
 
 
 # ---------- 后继班共享一棵树 ----------

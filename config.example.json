@@ -78,6 +78,12 @@
     "keepalive": true,
     "model_weekly_pct_max": 95
   },
+  "review": {
+    "max_rounds": 5,
+    "on_no_quota": "release",
+    "merge_policy": "manual",
+    "criteria_text": "对照任务书说的事做没做全；测试跑没跑绿；有没有明显 bug——三条都行放行，否则写意见退回"
+  },
   "chain": {
     "max_windows": 3,
     "on_no_handover": "continue"
@@ -111,6 +117,13 @@
   "codex_quota_pause_text": "来自nightshift：五小时额度只剩 {session_left}%（线 {session_line_left}%），约 {resets_at} 刷新。现在停下，不要再开新的工具调用，调度器到点会敲你继续。",
   "codex_resume_text": "来自nightshift：五小时额度应已刷新，请从刚才停下的地方继续。",
   "codex_stop_background_text": "来自nightshift：请用 `python3 -m nightshift.background_runner list` 看一下登记在这个任务下的后台进程，然后逐个用 `python3 -m nightshift.background_runner stop <background_id>` 停掉，然后停下不要继续。",
+  "review_template": "你在无人值守的定时会话里做代码审查，项目工作树 {project_path}（分支基准 {base_ref}）。任务：{title}\n\n{task}\n\n只读审查，不许改代码、不许 git commit。看改动请跑：{diff_command}\n\n施工班交接：\n{build_handover}\n\n{previous_review}这是第 {round} 轮审稿。通过标准：\n{criteria}\n\n{stop_build_hint}审完把完整意见写成本次最终回复的正文（不要写文件、不要用 shell 重定向），最后一个非空行严格写成三选一：`NEXT: done`（通过）、`NEXT: fix`（退回，正文说清改什么/为什么/是小改还是重写）或 `NEXT: pending`（额度到线意见没写完，不计本轮）。",
+  "review_fix_template": "你在无人值守的定时会话里工作，项目目录 {project_path}。任务：{title}\n\n{task}\n\n这是第 {round} 轮返工，审稿意见如下：\n{review}\n\n{worktree_instruction}先核对审稿意见里说的问题，逐条确认改完再收尾。没有人在场：遇到问题按合理判断继续，不要停下来等确认。完成或换班时照常写交接，末行写 NEXT: done 或 NEXT: continue。",
+  "review_criteria_text": "对照任务书说的事做没做全；测试跑没跑绿；有没有明显 bug——三条都行放行，否则写意见退回",
+  "review_wrapup_text": "[nightshift] 审稿额度快到线，一时半会儿刷新不了。现在把已经看到的意见写进本次最终回复正文，末行写 NEXT: pending（本轮不计数，调度器按审稿方没额度的设置处理），然后停下。",
+  "review_stop_build_text": "来自nightshift：审稿已经通过（NEXT: done），这条流水线收尾了，请停下不要再继续动代码。",
+  "hold_text": "来自nightshift：工头要来看，停在这里别再动代码；有人问再答。",
+  "resume_text": "来自nightshift：继续刚才的活。",
   "warmup": {
     "enabled": false,
     "time_local": "07:00",

@@ -23,6 +23,8 @@ __all__ = [
     "CODEX_BACKGROUND_INSTRUCTION",
     "ConfigMissing",
     "ENDED_STATES",
+    "ON_NO_QUOTA_VALUES",
+    "REVIEW_KEYS",
     "RUNNERS",
     "STATES",
     "WORKTREE_INSTRUCTION",
@@ -31,8 +33,13 @@ __all__ = [
     "atomic_write_text",
     "build_prompt",
     "chain_state",
+    "create_cross_role_successor",
+    "create_same_role_successor",
     "create_successor",
     "create_task",
+    "effective_effort",
+    "effective_model",
+    "effective_runner",
     "ensure_dirs",
     "home",
     "list_tasks",
@@ -40,8 +47,14 @@ __all__ = [
     "load_task",
     "modify_status",
     "new_task_id",
+    "pipeline_id_of",
     "read_status",
     "render",
+    "render_review_fix_prompt",
+    "render_review_prompt",
+    "review_config",
+    "role_of",
+    "round_of",
     "runner_config",
     "runner_label",
     "task_dir",
@@ -70,6 +83,7 @@ STATES = (
     "waiting_background",
     "waiting_wakeup",
     "idle",
+    "held",
     "chained",
     "exited",
     "finished",
@@ -111,8 +125,23 @@ CODEX_BACKGROUND_INSTRUCTION = (
     "主动把结果敲给你再继续。禁止裸用 `&`/`nohup`/`setsid`，禁止自己 fork 脱离——"
     "那样起的后台进程在这次工具调用判定完成时会被沙箱一并回收，永远不会跑完。"
 )
-# review.merge_policy 只认这两个值（S7 扩写同一个 review 对象，不做二次迁移）
+# review.merge_policy 只认这两个值
 _MERGE_POLICIES = ("manual", "auto")
+# S7：review 对象只认这七个键；旧任务/S5 占位对象（只有 enabled/merge_policy）
+# 是这个集合的子集，天然兼容。
+REVIEW_KEYS = frozenset({
+    "enabled", "runner", "model", "effort", "max_rounds",
+    "on_no_quota", "merge_policy", "criteria_text",
+})
+# review.on_no_quota 只认这两个值
+ON_NO_QUOTA_VALUES = ("release", "hold")
+# config.review 兜底默认值（task.review 没显式给的键从这里取）
+_REVIEW_CONFIG_DEFAULTS = {
+    "max_rounds": 5,
+    "on_no_quota": "release",
+    "merge_policy": "manual",
+    "criteria_text": "",
+}
 
 # trigger.type == "after" 且 when == "ended" 时，前置链最新一班落在这些状态
 # 就算"已结束"（调度器与网页共用这一个定义）
@@ -211,6 +240,77 @@ def runner_label(runner: str) -> str:
     return "Codex" if runner == "codex" else "Claude Code"
 
 
+# ---------- S7：流水线 / 角色 / 有效工人（唯一权威源） ----------
+
+
+def pipeline_id_of(task: dict) -> str:
+    """这一班所属的流水线 id：pipeline_id 缺失（S7 之前落盘的旧任务）按
+    root_id 兼容，再缺就按自身 id——只读兼容，不加载即回写。"""
+    return task.get("pipeline_id") or task.get("root_id") or task["id"]
+
+
+def role_of(task: dict) -> str:
+    """这一班的角色：build | review。旧任务缺 role 按 build 解释。"""
+    return task.get("role") or "build"
+
+
+def round_of(task: dict) -> int:
+    """这一班所属的返工轮次。旧任务缺 round 按 1 解释。"""
+    return int(task.get("round") or 1)
+
+
+def effective_runner(task: dict) -> str:
+    """这一班真正要用的工人（S7 唯一权威源，launcher/额度预检/保活/状态
+    展示一律走这里，不许各自直接读 task["runner"]）：
+    build 角色取顶层 runner（旧任务缺省 claude，一期语义不变）；
+    review 角色取 task.review.runner。"""
+    if role_of(task) == "review":
+        return (task.get("review") or {}).get("runner") or "claude"
+    return task.get("runner") or "claude"
+
+
+def effective_model(task: dict) -> str:
+    """同 effective_runner，取模型；review 角色缺失时退顶层 model 只是防炸，
+    正常流水线里 review.enabled=true 必有 review.model（validate_task 保证）。"""
+    if role_of(task) == "review":
+        return (task.get("review") or {}).get("model") or task.get("model") or ""
+    return task.get("model") or ""
+
+
+def effective_effort(task: dict) -> str:
+    """同 effective_runner，取档位。"""
+    if role_of(task) == "review":
+        return (task.get("review") or {}).get("effort") or task.get("effort") or ""
+    return task.get("effort") or ""
+
+
+def review_config(task: dict, config: dict) -> dict:
+    """review 配置的合并视图：task.review 里显式给的键优先，缺的从
+    config.review 同名键兜底，config 也没有就用代码内置默认值
+    （_REVIEW_CONFIG_DEFAULTS）。返回值总是含全部七个键，供 pipeline 逻辑
+    统一读取，不必每处都做三层 or 判断。"""
+    task_review = task.get("review") or {}
+    cfg_review = config.get("review") or {}
+
+    def pick(key: str):
+        if key in task_review and task_review[key] is not None:
+            return task_review[key]
+        if key in cfg_review and cfg_review[key] is not None:
+            return cfg_review[key]
+        return _REVIEW_CONFIG_DEFAULTS.get(key)
+
+    return {
+        "enabled": bool(task_review.get("enabled", False)),
+        "runner": task_review.get("runner"),
+        "model": task_review.get("model"),
+        "effort": task_review.get("effort"),
+        "max_rounds": pick("max_rounds"),
+        "on_no_quota": pick("on_no_quota"),
+        "merge_policy": pick("merge_policy"),
+        "criteria_text": pick("criteria_text"),
+    }
+
+
 def runner_config(config: dict) -> dict:
     """统一 runner 配置视图：{"claude": {...}, "codex": {...}}（codex 键
     不一定存在——旧配置或没配 codex 时就是没有）。
@@ -295,24 +395,52 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
     ):
         raise ValueError("guards.auto_interrupt_minutes 必须是正整数")
 
-    # S5：worktree 只有显式 true/false 两种；review 占住形状但 enabled 必须 false
+    # S5：worktree 只有显式 true/false 两种
     if task.get("worktree") is not None and not isinstance(task.get("worktree"), bool):
         raise ValueError("worktree 必须是布尔值")
+    # S7：review 只认 REVIEW_KEYS 七个键；enabled=true 要求 worktree=true，
+    # 且审稿方 runner/model/effort 必须真实存在于 config.runners（或旧配置
+    # 合成的兼容视图）；enabled=false 继续接受 S5 的最小占位对象。
     review = task.get("review")
     if review is not None:
         if not isinstance(review, dict):
             raise ValueError("review 必须是对象")
-        unknown = sorted(set(review) - {"enabled", "merge_policy"})
+        unknown = sorted(set(review) - REVIEW_KEYS)
         if unknown:
-            raise ValueError(f"review 只认 enabled / merge_policy，多出：{'、'.join(unknown)}")
+            raise ValueError(
+                f"review 只认 {'、'.join(sorted(REVIEW_KEYS))}，多出：{'、'.join(unknown)}"
+            )
         enabled = review.get("enabled", False)
         if not isinstance(enabled, bool):
             raise ValueError("review.enabled 必须是布尔值")
-        if enabled:
-            raise ValueError("联动审稿要到 S7 才开放，现在只能 enabled=false")
         policy = review.get("merge_policy", "manual")
         if policy not in _MERGE_POLICIES:
             raise ValueError("review.merge_policy 只认 manual / auto")
+        if "max_rounds" in review and review["max_rounds"] is not None:
+            max_rounds = review["max_rounds"]
+            if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or max_rounds <= 0:
+                raise ValueError("review.max_rounds 必须是正整数")
+        if "on_no_quota" in review and review["on_no_quota"] is not None:
+            if review["on_no_quota"] not in ON_NO_QUOTA_VALUES:
+                raise ValueError("review.on_no_quota 只认 release / hold")
+        if "criteria_text" in review and review["criteria_text"] is not None:
+            if not isinstance(review["criteria_text"], str):
+                raise ValueError("review.criteria_text 必须是字符串")
+        if enabled:
+            if task.get("worktree") is not True:
+                raise ValueError("联动审稿（review.enabled=true）要求 worktree=true")
+            r_runner = review.get("runner")
+            if r_runner not in RUNNERS:
+                raise ValueError(f"review.runner 只认 {'/'.join(RUNNERS)}：{r_runner}")
+            r_rc = runner_config(config).get(r_runner)
+            if not r_rc:
+                raise ValueError(f"审稿方 {runner_label(r_runner)} 还没在 config.runners 里配置")
+            r_label = runner_label(r_runner)
+            if review.get("effort") not in (r_rc.get("efforts") or []):
+                raise ValueError(f"审稿方 {r_label} 不支持这个档位：{review.get('effort')}")
+            r_models = r_rc.get("models") or {}
+            if r_models and review.get("model") not in r_models:
+                raise ValueError(f"审稿方 {r_label} 不支持这个模型：{review.get('model')}")
 
     trigger = task.get("trigger")
     if trigger is None:
@@ -364,11 +492,23 @@ def create_task(task: dict, config: dict) -> str:
     review = data.get("review")
     if not isinstance(review, dict):
         data["review"] = {"enabled": False, "merge_policy": "manual"}
-    else:
+    elif not review.get("enabled"):
+        # 未开审稿：保持 S5 的最小占位形状，不给旧式任务凭空堆七个键
         data["review"] = {
-            "enabled": bool(review.get("enabled", False)),
+            "enabled": False,
             "merge_policy": review.get("merge_policy") or "manual",
         }
+    else:
+        # S7：开审稿的新任务落盘时把七个键的兜底值坐实，后续读取不必每次
+        # 都经 review_config() 三层 or；review_config() 对老任务仍然兼容。
+        merged = review_config(data, config)
+        merged.update({
+            "enabled": True,
+            "runner": review["runner"],
+            "model": review["model"],
+            "effort": review["effort"],
+        })
+        data["review"] = merged
     if not data.get("run_at"):
         data["run_at"] = utc_now_iso()  # after 任务：只当排序用
 
@@ -376,6 +516,10 @@ def create_task(task: dict, config: dict) -> str:
     data["id"] = task_id
     data["created_at"] = utc_now_iso()
     data.setdefault("shift", 1)
+    data.setdefault("role", "build")
+    data.setdefault("round", 1)
+    data.setdefault("role_shift", 1)
+    data.setdefault("pipeline_id", task_id)
     guards = dict(config.get("guards") or {})
     guards.update(data.pop("guards", None) or {})
     data["guards"] = guards
@@ -430,31 +574,76 @@ NO_HANDOVER_TEXT = (
 )
 
 
-def create_successor(parent_task: dict, handover_text: str | None, config: dict) -> str:
-    """换班：按父任务造后继任务并落盘，返回后继任务 id。
+def _copy_common_fields(parent_task: dict) -> dict:
+    """换班/角色轮转共用的字段复制：title/project/runner/model/effort/
+    task_text/worktree/review/root_id/pipeline_id/重试与守卫设置——build 与
+    review 的后继都从这份基础上再补角色专属字段（shift/role/round/…）。
 
-    - 复制 title/project/model/effort/task_text/guards/chain/retry_max；
-    - S5：显式复制 worktree 与 review，并让后继班沿用父班的
-      worktree_path / branch / base_ref——一条换班链从头到尾只有一棵树、
-      一个分支、一个基准提交；
-    - shift = 父 shift + 1，parent_id / root_id（根任务的 root_id 是它自己）；
-    - run_at = 现在（后继下一轮 tick 就能走预检）；
-    - prompt_final = render(config.chain_template, task=…, shift=…, handover=…)，
-      没交接就用 NO_HANDOVER_TEXT 兜底；
-    - 父任务状态改 chained 并记 successor_id（本班结束，后继进 scheduled）。
+    S5 起：显式复制 worktree 与 review——旧式父任务（缺 worktree 字段）的
+    后继必须保持 false，不能吃 create_task 的新任务缺省 true。runner/model/
+    effort 复制的是这条流水线的**建造配方**（顶层字段），不随后继班的角色
+    变化；review 角色要用的是 review 子对象，由 effective_* 系列取，不在
+    这里改写顶层字段。
     """
-    parent_id = parent_task["id"]
-    shift = int(parent_task.get("shift") or 1) + 1
-    handover = handover_text if handover_text else NO_HANDOVER_TEXT
     task: dict = {
         "title": parent_task["title"],
         "project": parent_task["project"],
         "runner": parent_task.get("runner") or "claude",
         "model": parent_task["model"],
         "effort": parent_task["effort"],
-        "run_at": utc_now_iso(),
         "task_text": parent_task["task_text"],
-        # 续班模板可用的占位符 = 首班模板那四个 + shift/handover，别让第 2 班少掉开场叮嘱
+        "root_id": parent_task.get("root_id") or parent_task["id"],
+        "pipeline_id": pipeline_id_of(parent_task),
+        "worktree": worktree_enabled(parent_task),
+        "review": dict(parent_task.get("review") or {}),
+    }
+    if parent_task.get("retry_max") is not None:
+        task["retry_max"] = parent_task["retry_max"]
+    if parent_task.get("guards"):
+        task["guards"] = parent_task["guards"]
+    if parent_task.get("chain"):
+        task["chain"] = parent_task["chain"]
+    return task
+
+
+def _copy_worktree_meta(parent_id: str, successor_id: str) -> None:
+    """沿用父班的工作树三件元数据（有才写；父班还没建树就没有）——一条
+    流水线从头到尾只有一棵树、一个分支、一个基准提交，任何后继（同角色
+    续班或角色轮转）都要沿用，不许另建。"""
+    parent_status = read_status(parent_id)
+    meta = {
+        key: parent_status[key]
+        for key in ("worktree_path", "branch", "base_ref")
+        if parent_status.get(key)
+    }
+    if meta:
+        update_status(successor_id, **meta)
+
+
+def create_same_role_successor(
+    parent_task: dict, handover_text: str | None, config: dict,
+) -> str:
+    """同角色续班：上下文/额度到线 → 下一班接着干（Codex 同角色允许
+    `codex resume`）。role/round 不变，shift 与 role_shift 各自 +1，
+    pipeline_id 沿用；父任务状态改 chained 并记 successor_id（本班结束，
+    后继进 scheduled）。
+
+    - run_at = 现在（后继下一轮 tick 就能走预检）；
+    - prompt_final = render(config.chain_template, task=…, shift=…, handover=…)，
+      没交接就用 NO_HANDOVER_TEXT 兜底——续班模板占位符与首班共用四个
+      （task/title/project_path/context_limit）再加 shift/handover。
+    """
+    parent_id = parent_task["id"]
+    shift = int(parent_task.get("shift") or 1) + 1
+    handover = handover_text if handover_text else NO_HANDOVER_TEXT
+    task = _copy_common_fields(parent_task)
+    task.update({
+        "run_at": utc_now_iso(),
+        "shift": shift,
+        "role": role_of(parent_task),
+        "round": round_of(parent_task),
+        "role_shift": int(parent_task.get("role_shift") or 1) + 1,
+        "parent_id": parent_id,
         "prompt_final": render(
             config["chain_template"],
             task=parent_task["task_text"],
@@ -469,31 +658,53 @@ def create_successor(parent_task: dict, handover_text: str | None, config: dict)
                 WORKTREE_INSTRUCTION if worktree_enabled(parent_task) else ""
             ),
         ),
-        "shift": shift,
-        "parent_id": parent_id,
-        "root_id": parent_task.get("root_id") or parent_id,
-        # S5：显式复制——旧式父任务（缺 worktree 字段）的后继必须保持 false，
-        # 不能吃 create_task 的新任务缺省 true
-        "worktree": worktree_enabled(parent_task),
-        "review": dict(parent_task.get("review") or {}),
-    }
-    if parent_task.get("retry_max") is not None:
-        task["retry_max"] = parent_task["retry_max"]
-    if parent_task.get("guards"):
-        task["guards"] = parent_task["guards"]
-    if parent_task.get("chain"):
-        task["chain"] = parent_task["chain"]
+    })
     successor_id = create_task(task, config)
-    # 沿用父班的工作树三件元数据（有才写；父班还没建树就没有）
-    parent_status = read_status(parent_id)
-    meta = {
-        key: parent_status[key]
-        for key in ("worktree_path", "branch", "base_ref")
-        if parent_status.get(key)
-    }
-    if meta:
-        update_status(successor_id, **meta)
+    _copy_worktree_meta(parent_id, successor_id)
     update_status(parent_id, state="chained", successor_id=successor_id)
+    return successor_id
+
+
+def create_successor(parent_task: dict, handover_text: str | None, config: dict) -> str:
+    """向后兼容别名：S1–S6 的换班入口，等价于 create_same_role_successor
+    （S7 之前没有角色轮转，续班永远同角色）。S7 起的新调用点请直接用
+    create_same_role_successor / create_cross_role_successor，语义更明确。
+    """
+    return create_same_role_successor(parent_task, handover_text, config)
+
+
+def create_cross_role_successor(
+    parent_task: dict, config: dict, *, role: str, round_: int,
+    prompt_final: str, parent_next_state: str,
+) -> str:
+    """角色轮转的后继（build 收工 → 起同轮 review；review NEXT:fix → 下一轮
+    build 返工）：新角色/新轮次，role_shift 重新从 1 起（只有同角色续班才在
+    原有 role_shift 上 +1），shift 沿用全局单调序号，pipeline_id 沿用。
+
+    跨角色永远开新会话（不传、也不查任何 resume 相关信息——resume 只在
+    launcher 按"是否同角色续班"的判断里生效，这里造的后继天然不同角色）。
+
+    prompt_final 由调用方渲染好整段传入（review_template / review_fix_template
+    与 chain_template 占位符不同，不能共用 create_same_role_successor 那套
+    渲染逻辑）。parent_next_state 必须由调用方显式给出——父班收工起审稿时
+    该转 held（还在等审稿结果，不是"结束"），只有真正的角色轮转终点
+    （如返工上限内的正常交接）才可能是 chained；本 helper 不揣测、不默认。
+    """
+    parent_id = parent_task["id"]
+    shift = int(parent_task.get("shift") or 1) + 1
+    task = _copy_common_fields(parent_task)
+    task.update({
+        "run_at": utc_now_iso(),
+        "shift": shift,
+        "role": role,
+        "round": round_,
+        "role_shift": 1,
+        "parent_id": parent_id,
+        "prompt_final": prompt_final,
+    })
+    successor_id = create_task(task, config)
+    _copy_worktree_meta(parent_id, successor_id)
+    update_status(parent_id, state=parent_next_state, successor_id=successor_id)
     return successor_id
 
 
@@ -599,4 +810,53 @@ def build_prompt(
         project_path=config["projects"][project],
         context_limit=_context_limit_text(model, config, runner),
         worktree_instruction=WORKTREE_INSTRUCTION if worktree else "",
+    )
+
+
+# ---------- S7：审稿 / 返工提示词渲染 ----------
+
+
+def render_review_prompt(
+    config: dict, task: dict, *, base_ref: str, diff_command: str,
+    build_handover: str | None, previous_review: str, round_: int,
+    stop_build_hint: str = "",
+) -> str:
+    """渲染审稿班的提示词（config.review_template）。
+
+    只给固定参数数组语义的 git diff 命令（{diff_command}），不把整份 diff
+    塞进提示词——审稿班自己在只读工具面里跑这条命令看改动。
+    """
+    review = review_config(task, config)
+    criteria = review.get("criteria_text") or config.get("review_criteria_text") or ""
+    return render(
+        config["review_template"],
+        task=task["task_text"],
+        title=task["title"],
+        project_path=config["projects"][task["project"]],
+        base_ref=base_ref,
+        diff_command=diff_command,
+        build_handover=build_handover if build_handover else NO_HANDOVER_TEXT,
+        previous_review=previous_review or "",
+        round=round_,
+        criteria=criteria,
+        stop_build_hint=stop_build_hint,
+    )
+
+
+def render_review_fix_prompt(
+    config: dict, task: dict, *, round_: int, review_text: str,
+) -> str:
+    """渲染返工班的提示词（config.review_fix_template）：原任务书 + 第几轮
+    返工 + 完整审稿意见 + 工作树安全前言（返工班永远是工作树任务）。"""
+    return render(
+        config["review_fix_template"],
+        task=task["task_text"],
+        title=task["title"],
+        project_path=config["projects"][task["project"]],
+        round=round_,
+        review=review_text,
+        context_limit=_context_limit_text(
+            task.get("model", ""), config, task.get("runner") or "claude"
+        ),
+        worktree_instruction=WORKTREE_INSTRUCTION,
     )

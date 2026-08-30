@@ -362,14 +362,77 @@ def test_worktree_review_validation_rejects_bad_shapes():
     for over in (
         {"worktree": "true"},
         {"worktree": 1},
-        {"review": {"enabled": True}},                       # S7 才开放
+        {"review": {"enabled": True}},                       # 没给 runner，S7 也拒
         {"review": {"enabled": False, "merge_policy": "yolo"}},
         {"review": {"enabled": "yes"}},
         {"review": "审一下"},
-        {"review": {"enabled": False, "criteria_text": "多出来的键"}},
+        {"review": {"enabled": False, "unknown_key": "多出来的键"}},  # S7：criteria_text 已合法，换个真正未知的键
+        {"worktree": False, "review": {"enabled": True, "runner": "claude",
+                                        "model": "claude-fable-5", "effort": "high"}},  # S7：enabled 要求 worktree=true
+        {"review": {"enabled": True, "runner": "claude", "model": "claude-fable-5",
+                     "effort": "high", "max_rounds": True}},  # bool 不能冒充正整数
+        {"review": {"enabled": True, "runner": "claude", "model": "claude-fable-5",
+                     "effort": "high", "on_no_quota": "postpone"}},
+        {"review": {"enabled": True, "runner": "codex", "model": "gpt-5.6-luna",
+                     "effort": "high"}},  # CONFIG 没配 codex runner
     ):
         with pytest.raises(ValueError):
             store.create_task(make_task(**over), CONFIG)
+
+
+def test_review_enabled_requires_worktree_and_valid_reviewer():
+    config = dict(CONFIG)
+    config["runners"] = {
+        "claude": {"models": {"claude-fable-5": {"context_limit": 500000}},
+                   "efforts": ["low", "medium", "high", "xhigh", "max"]},
+    }
+    tid = store.create_task(
+        make_task(worktree=True, review={
+            "enabled": True, "runner": "claude", "model": "claude-fable-5",
+            "effort": "high",
+        }),
+        config,
+    )
+    task = store.load_task(tid)
+    assert task["review"]["enabled"] is True
+    assert task["review"]["max_rounds"] == 5
+    assert task["review"]["on_no_quota"] == "release"
+    assert task["review"]["merge_policy"] == "manual"
+    assert task["review"]["criteria_text"] == ""
+    assert task["role"] == "build"
+    assert task["round"] == 1
+    assert task["role_shift"] == 1
+    assert task["pipeline_id"] == tid
+
+
+def test_review_config_defaults_and_overrides():
+    config = dict(CONFIG)
+    config["review"] = {"max_rounds": 2, "on_no_quota": "hold", "criteria_text": "全局标准"}
+    task = make_task(review={"enabled": True, "runner": "claude",
+                              "model": "claude-fable-5", "effort": "high"})
+    merged = store.review_config(task, config)
+    assert merged["max_rounds"] == 2
+    assert merged["on_no_quota"] == "hold"
+    assert merged["criteria_text"] == "全局标准"
+    assert merged["merge_policy"] == "manual"  # 代码内置默认
+    task["review"]["max_rounds"] = 1
+    merged2 = store.review_config(task, config)
+    assert merged2["max_rounds"] == 1  # task 显式给的优先于 config
+
+
+def test_effective_runner_model_effort_by_role():
+    task = {
+        "id": "x", "runner": "claude", "model": "claude-fable-5", "effort": "high",
+        "review": {"enabled": True, "runner": "codex", "model": "gpt-5.6-luna", "effort": "xhigh"},
+        "role": "build",
+    }
+    assert store.effective_runner(task) == "claude"
+    assert store.effective_model(task) == "claude-fable-5"
+    assert store.effective_effort(task) == "high"
+    task["role"] = "review"
+    assert store.effective_runner(task) == "codex"
+    assert store.effective_model(task) == "gpt-5.6-luna"
+    assert store.effective_effort(task) == "xhigh"
 
 
 def test_old_task_json_missing_worktree_stays_false():
