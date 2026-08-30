@@ -294,6 +294,35 @@ def test_write_task_files_codex_custom_prompt_file_still_gets_instruction_once(t
     assert prompt_txt2.count(store.CODEX_BACKGROUND_INSTRUCTION) == 1
 
 
+def test_write_task_files_codex_review_role_skips_f12_instruction(tmp_path):
+    """S7.1 阻断五：F12 后台协议只适用于可写的 build 角色（起长任务、等
+    后台完成）——review 角色只读、不该起后台进程，之前只按
+    effective_runner=="codex" 判断，漏了角色，会诱导只读的审稿班去干起
+    后台任务这种不该做的事。"""
+    task_id, config = make_task_codex(
+        project_path="/home/user/projects/demo",
+        review={"enabled": True, "runner": "codex", "model": "gpt-5.6-luna", "effort": "high"},
+    )
+    task = store.load_task(task_id)
+    task["role"] = "review"
+    task["round"] = 1
+    store.atomic_write_json(store.task_dir(task_id) / "task.json", task)
+    task = store.load_task(task_id)
+    store.update_status(task_id, worktree_path="/home/user/projects/demo")
+    launcher.write_task_files(task, config, None)
+    prompt_txt = (store.task_dir(task_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert store.CODEX_BACKGROUND_INSTRUCTION not in prompt_txt
+    assert prompt_txt == task["prompt_final"]
+
+    # 对照：同一份 config，build 角色（缺省）照常带这条协议
+    build_id, _ = make_task_codex(project_path="/home/user/projects/demo", title="build 对照")
+    build_task = store.load_task(build_id)
+    store.update_status(build_id, worktree_path="/home/user/projects/demo")
+    launcher.write_task_files(build_task, config, None)
+    build_prompt_txt = (store.task_dir(build_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert store.CODEX_BACKGROUND_INSTRUCTION in build_prompt_txt
+
+
 def test_write_task_files_claude_prompt_not_padded_with_codex_instruction(tmp_path):
     """Claude 任务的 prompt 一字不多——F12 协议是 Codex 专属，不该出现在
     Claude 的 prompt.txt 里。"""
@@ -797,7 +826,10 @@ def test_write_task_files_review_claude_gets_readonly_tools(tmp_path):
     for pattern in ("Bash(git diff *)", "Bash(git log *)", "Bash(git show *)",
                     "Bash(git status *)", "Bash(python3 -m pytest *)"):
         assert pattern in run_sh
-    assert "--permission-mode auto" in run_sh
+    # S7.1 阻断五：review 角色用 dontAsk（无人值守拒绝语义），不是 auto
+    # （auto 在这台 CLI 上是"列表外也无需询问直接放行"，不是真只读）。
+    assert "--permission-mode dontAsk" in run_sh
+    assert "--permission-mode auto" not in run_sh
     # Claude 角色不论 build/review 都要写 settings.json（hook 走 per-task 配置）
     assert (d / "settings.json").is_file()
 
@@ -808,6 +840,10 @@ def test_write_task_files_review_claude_gets_readonly_tools(tmp_path):
     assert "--tools " not in build_run_sh
     assert "--allowedTools" not in build_run_sh
     assert "--disallowedTools" not in build_run_sh
+    # S7.1 阻断五：build 角色字节级不变，仍是 auto，不受 review 的
+    # dontAsk 改动影响。
+    assert "--permission-mode auto" in build_run_sh
+    assert "--permission-mode dontAsk" not in build_run_sh
 
 
 def test_codex_command_review_role_uses_read_only_sandbox():

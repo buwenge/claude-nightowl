@@ -813,6 +813,177 @@ def test_stop_build_role_never_writes_review_file():
     assert not (store.task_dir(task_id) / "review-1.md").exists()
 
 
+# ---------- S7.1 阻断二：并发安全 + pending 可继续 + 控制 turn 隔离 ----------
+
+
+def test_stop_review_pending_then_done_records_new_verdict():
+    """pending 之后同一轮真正的 done 必须能正常记录——旧写法拿
+    review_recorded_round==round 当"已处理过"的全部依据，pending 自己也会
+    把这个字段设成当前 round，导致后续同轮的 done 被误判成重复 Stop 而
+    忽略掉。"""
+    task_id = make_review_task()
+    pending_text = "额度快到线了，还没看完。\n\nNEXT: pending"
+    proc1 = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": pending_text}))
+    assert proc1.returncode == 0
+    status = store.read_status(task_id)
+    assert status["review_verdict"] == "pending"
+    assert status["review_recorded_round"] == 1
+    assert status["review_verdict_final"] is False
+
+    done_text = "额度刷新后接着看完了，都对。\n\nNEXT: done"
+    proc2 = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": done_text}))
+    assert proc2.returncode == 0
+    status = store.read_status(task_id)
+    assert status["review_verdict"] == "done"  # 没有被 pending 的"已记录"挡住
+    assert status["review_verdict_final"] is True
+    assert Path(status["review_file"]).read_text(encoding="utf-8") == done_text
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "忽略重复 Stop" not in events
+
+
+def test_stop_review_pending_then_fix_records_new_verdict():
+    """同上，pending → fix 同样要能正常记录（不止 done 一条路径）。"""
+    task_id = make_review_task()
+    pending_text = "还没看完。\n\nNEXT: pending"
+    run_hook(task_id, "Stop", json.dumps({"last_assistant_message": pending_text}))
+    fix_text = "接着看完了，有个 bug 要退回。\n\nNEXT: fix"
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": fix_text}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["review_verdict"] == "fix"
+    assert status["review_verdict_final"] is True
+    assert Path(status["review_file"]).read_text(encoding="utf-8") == fix_text
+
+
+def test_stop_review_done_then_pending_is_ignored_as_duplicate():
+    """反过来：done（终态）之后同一轮又来一次 Stop（哪怕内容是 pending），
+    必须仍按重复 Stop 忽略——不可覆盖的只应该是 done/fix 这类终态，不能
+    因为"新内容不是 pending"就放宽成允许覆盖已确认的结果。"""
+    task_id = make_review_task()
+    done_text = "看完了，都对。\n\nNEXT: done"
+    run_hook(task_id, "Stop", json.dumps({"last_assistant_message": done_text}))
+    later_text = "改主意了。\n\nNEXT: pending"
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": later_text}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["review_verdict"] == "done"  # 终态没被覆盖
+    assert Path(status["review_file"]).read_text(encoding="utf-8") == done_text
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "忽略重复 Stop" in events
+
+
+def test_stop_review_control_turn_does_not_record_verdict():
+    """保活/我来看这类"不要求正式 verdict"的回复（发之前调用方会把
+    review_awaiting_verdict 落成 False）：Stop 只清运行期字段，不碰
+    review_verdict/review_recorded_round，即使回复正文没有合法 NEXT 也不会
+    被判协议缺失、保守转成 fix。"""
+    task_id = make_review_task()
+    store.update_status(task_id, review_awaiting_verdict=False, state="held")
+    text = "收到，我在等，先不动。"  # 没有 NEXT 行的普通控制回复
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert "review_verdict" not in status
+    assert "review_recorded_round" not in status
+    assert not (store.task_dir(task_id) / "review-1.md").exists()
+    assert status["state"] == "held"  # 不瞎猜复原状态，原样保留
+    assert status["review_awaiting_verdict"] is False  # 不自作主张翻回 True
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "控制 turn" in events
+
+
+def test_stop_review_control_turn_after_verdict_does_not_overwrite():
+    """已经有过一次真正 verdict 之后，控制 turn（比如返工新一轮开始前的
+    额外保活戳）不能把已经记录的 verdict 冲掉。"""
+    task_id = make_review_task()
+    done_text = "看完了，都对。\n\nNEXT: done"
+    run_hook(task_id, "Stop", json.dumps({"last_assistant_message": done_text}))
+    store.update_status(task_id, review_awaiting_verdict=False)
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": "收到"}))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["review_verdict"] == "done"
+    assert status["review_recorded_round"] == 1
+
+
+def test_stop_review_concurrent_stop_accepts_only_one_verdict():
+    """S7.1 阻断二反例：两个并发 Stop（不同内容）打向同一个 review 任务
+    同一轮，最终只有一个 verdict 被接受、两个进程都不抛异常、review_file
+    内容与被接受的那次一致（不会两边都判定"我可以写"、也不会文件内容被
+    交叉写乱）。"""
+    task_id = make_review_task()
+    texts = {
+        "done": "第一个并发 Stop 的意见，通过。\n\nNEXT: done",
+        "fix": "第二个并发 Stop 的意见，退回。\n\nNEXT: fix",
+    }
+    procs = [
+        multiprocessing.Process(
+            target=_run_hook_proc,
+            args=(task_id, "Stop", json.dumps({"last_assistant_message": t})),
+        )
+        for t in texts.values()
+    ]
+    _spawn_and_join(procs)
+    status = store.read_status(task_id)
+    assert status["review_verdict"] in texts
+    assert status["review_recorded_round"] == 1
+    assert status["review_verdict_final"] is True
+    winner_text = texts[status["review_verdict"]]
+    review_path = Path(status["review_file"])
+    assert review_path.read_text(encoding="utf-8") == winner_text
+
+
+def test_post_tool_use_context_warn_review_role_ends_in_pending(tmp_path):
+    """S7.1 阻断二：review 撞上下文警戒线收到的是 review 专属文案（末行
+    NEXT: pending），不是 build 的 handover/NEXT:continue-done 协议——
+    否则回复末行写 NEXT:continue 会被 `_parse_review_verdict` 判协议缺失，
+    保守转成 fix（假退回）。不用在测试 config 里额外配
+    review_context_warn_text，模块内置默认兜底就该生效。"""
+    task_id = make_review_task(guards={
+        "session_pct_max": 80,
+        "context_warn_tokens": 400,
+        "context_limit_tokens": 2000,
+    })
+    payload = make_transcript(tmp_path / "transcript.jsonl", 1200)
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", payload)
+    proc = run_hook(task_id, "PostToolUse", payload)  # 第 20 次
+    assert proc.returncode == 0
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "NEXT: pending" in ctx
+    assert "NEXT: continue" not in ctx
+    assert "handover" not in ctx  # 不是 build 那套交接协议
+    from nightshift.hook import _parse_review_verdict
+
+    simulated_reply = ctx + "\n\n（模拟审稿正文接在提醒后面）\n\nNEXT: pending"
+    verdict, protocol_ok = _parse_review_verdict(simulated_reply)
+    assert verdict == "pending" and protocol_ok
+
+
+def test_post_tool_use_quota_pause_review_role_ends_in_pending(tmp_path):
+    """S7.1 阻断二：review 撞五小时额度线不走 build 那套 ScheduleWakeup
+    多轮自我唤醒闹钟（中间那些"·"回复没有 NEXT，会被判协议缺失、保守转成
+    fix）——改成当场一次性 NEXT: pending，交给 nightshift 调度器按额度
+    刷新时间主动敲它继续。"""
+    task_id = make_review_task(guards={
+        "session_pct_max": 80,
+        "weekly_pct_max": 95,
+        "context_warn_tokens": 100000,
+        "context_limit_tokens": 200000,
+    })
+    write_quota(session=85, week=10)  # 五小时 85 ≥ 80
+    payload = make_transcript(tmp_path / "transcript.jsonl", 100)
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", payload)
+    proc = run_hook(task_id, "PostToolUse", payload)  # 第 20 次
+    assert proc.returncode == 0
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "NEXT: pending" in ctx
+    assert "ScheduleWakeup" not in ctx  # 不再走 build 那套多轮自我唤醒
+    status = store.read_status(task_id)
+    assert status["quota_paused_until"]
+
+
 def test_silence_on_empty_stdin():
     task_id = make_task()
     proc = run_hook(task_id, "Stop", "")

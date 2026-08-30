@@ -1009,8 +1009,14 @@ class _Handler(BaseHTTPRequestHandler):
             text = cfg.get("hold_text") or "来自nightshift：工头要来看，停在这里别再动代码；有人问再答。"
             pinged = []
             for item in self._pipeline_members(pipeline_id):
-                wid = (item["status"] or {}).get("window_id")
+                t, s = item["task"], item["status"] or {}
+                wid = s.get("window_id")
                 if wid and launcher.window_alive(str(wid), cfg):
+                    if store.role_of(t) == "review":
+                        # S7.1 阻断二：hold_text 不要求正式 verdict，发之前
+                        # 先落 review_awaiting_verdict=False，接下来的 Stop
+                        # 按控制 turn 处理，不会被误记成协议缺失→fix。
+                        store.update_status(t["id"], review_awaiting_verdict=False)
                     launcher.send_keys(str(wid), text)
                     pinged.append(str(wid))
             store.append_event(

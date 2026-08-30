@@ -1623,6 +1623,21 @@ def test_pipeline_hold_pings_alive_windows_and_is_idempotent(authed, monkeypatch
     assert sent == []  # 幂等：已经请求过，不重复敲
 
 
+def test_pipeline_hold_marks_review_member_awaiting_verdict_false(authed, monkeypatch):
+    """S7.1 阻断二：hold_text 不要求正式 verdict，敲给 review 成员之前要落
+    review_awaiting_verdict=False，接下来它的 Stop 会走控制 turn 分支，
+    不会被误记成协议缺失→fix。build 成员没有这个字段（build 不认
+    review_awaiting_verdict 这个概念），不该被凭空加上。"""
+    build_id, review_id = make_review_pipeline(authed)
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: None)
+
+    status, _, body = authed.request("POST", f"/api/tasks/{review_id}/hold")
+    assert status == 200 and body["hold_requested"] is True
+    assert store.read_status(review_id)["review_awaiting_verdict"] is False
+    assert "review_awaiting_verdict" not in store.read_status(build_id)
+
+
 def test_pipeline_hold_blocks_next_review_verdict_routing(authed, monkeypatch):
     """先按"我来看"，再让审稿给出 done：下一 tick 应该被拦在 held，不直接合并。"""
     from nightshift import scheduler

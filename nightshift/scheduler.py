@@ -51,6 +51,13 @@ DEFAULT_CODEX_QUOTA_PAUSE_TEXT = (
 DEFAULT_CODEX_RESUME_TEXT = (
     "来自nightshift：五小时额度应已刷新，请从刚才停下的地方继续。"
 )
+# S7.1 阻断二/三：review 角色因额度到线转 held（on_no_quota=hold）后的
+# 恢复文案——明确要求"继续完成这一轮审稿"，结尾仍然只用 NEXT: done/fix/
+# pending 三选一，不能沿用 build 那句"从刚才停下的地方继续"（不成协议）。
+DEFAULT_REVIEW_RESUME_TEXT = (
+    "来自nightshift：额度应已刷新，请继续完成这一轮审稿——"
+    "结束时仍然只用 NEXT: done / NEXT: fix / NEXT: pending 三选一。"
+)
 # 交接文件末行的换班指令（设计稿 §4.4）
 _RE_NEXT_CONTINUE = re.compile(r"^NEXT:\s*continue\s*$")
 _RE_NEXT_DONE = re.compile(r"^NEXT:\s*done\s*$")
@@ -131,9 +138,12 @@ def tick(config: dict, now: datetime) -> list[str]:
         # 其余状态（chained/finished/…）不动
 
     # 每轮末尾：只刷有活跃任务在等的那家 runner，且它自己的分片缺失/过期才刷
-    # （零开销原则；两家各自独立，S6 前只有 claude，行为不变）
+    # （零开销原则；两家各自独立，S6 前只有 claude，行为不变）。
+    # S7.1 阻断四 Part A：必须走 effective_runner——review 角色可能跟顶层
+    # build runner 不同（task.review.runner），只读 task["runner"] 在
+    # Codex 施工/Claude 审稿这类跨家组合下会漏刷正在等的那一家。
     active_runners = {
-        item["task"].get("runner") or "claude"
+        store.effective_runner(item["task"])
         for item in items
         if store.read_status(item["task"]["id"]).get("state") in ACTIVE_STATES
     }
@@ -808,10 +818,14 @@ def _check_running(
 
     # R2：auto 被 CC 静默回落（如 haiku 只吃 default），无人值守会整晚卡在
     # 权限问答。开窗提醒一次就够——不改 state、不杀窗口，人来处理。
+    # S7.1 阻断五：review 角色故意用 dontAsk（无人值守拒绝语义，见
+    # launcher._claude_command），不是"被静默回落"，不该被这条误报。
     mode = status.get("permission_mode")
+    review_dont_ask = store.role_of(task) == "review" and mode == "dontAsk"
     if (
         mode
         and mode not in ("auto", "bypassPermissions")
+        and not review_dont_ask
         and not status.get("mode_warned")
     ):
         launcher.open_notice_window(
@@ -872,6 +886,35 @@ def _check_running(
         if status.get("state") == "waiting_wakeup":
             return []  # Claude：闹钟还没响完，等它自己醒
 
+    # S7.1 阻断二/三：review 角色因额度到线转 held（scheduler._review_pending
+    # 的 on_no_quota=hold 分支）——上面那段只认 idle/waiting_wakeup，held
+    # 状态永远等不到"额度刷新后主动继续"的 send-keys，会永久卡住。
+    if (
+        paused_until and status.get("state") == "held"
+        and store.role_of(task) == "review"
+        and not status.get("quota_resume_sent")
+    ):
+        if now < parse_iso(paused_until):
+            return []
+        text = config.get("review_resume_text") or DEFAULT_REVIEW_RESUME_TEXT
+        # 发之前重新要求 verdict——这是一次真正的恢复，不是控制 turn，接下来
+        # 的 Stop 要能被正常解析成 done/fix/pending。
+        store.update_status(task_id, review_awaiting_verdict=True)
+        proc = launcher.send_keys(str(window_id), text)
+        if proc.returncode != 0:
+            store.append_event(
+                task_id,
+                f"审稿额度刷新时间已到但 send-keys 失败（returncode={proc.returncode}），"
+                "未能让它继续",
+            )
+            return [f"{task_id} 审稿额度刷新但叫醒失败"]
+        store.update_status(
+            task_id, quota_resume_sent=True, quota_paused_until=None,
+            state="working", last_event_at=to_iso(now),
+        )
+        store.append_event(task_id, "审稿额度刷新时间已到，已 send-keys 让它继续（等待新一轮 verdict）")
+        return [f"{task_id} 审稿额度刷新，敲它继续"]
+
     # S3 换班：idle 收尾后按交接文件接下一班（每次评估先落 chain_checked
     # 防重复；评估失败的代价是这班不再自动续，好过重复开出双份后继）。
     # S7：review 角色走独立的 verdict 分流，不进 build 的交接判定。
@@ -908,12 +951,17 @@ def _check_running(
         return []
 
     text = rc.get("keepalive_text") or DEFAULT_KEEPALIVE_TEXT
+    keepalive_fields = {
+        "last_keepalive_at": to_iso(now),
+        "keepalive_count": int(status.get("keepalive_count") or 0) + 1,
+    }
+    if store.role_of(task) == "review":
+        # S7.1 阻断二：保活探针不是要求正式 verdict 的回复，发之前先落
+        # review_awaiting_verdict=False，让接下来的 Stop 走控制 turn 分支，
+        # 不会被 _parse_review_verdict 判协议缺失、误记成 fix。
+        keepalive_fields["review_awaiting_verdict"] = False
     launcher.send_keys(str(window_id), text)
-    store.update_status(
-        task_id,
-        last_keepalive_at=to_iso(now),
-        keepalive_count=int(status.get("keepalive_count") or 0) + 1,
-    )
+    store.update_status(task_id, **keepalive_fields)
     store.append_event(
         task_id, f"保活戳：{status.get('state')} 静默超时，已 send-keys 探针"
     )
@@ -1457,6 +1505,35 @@ def _review_done(review_task: dict, config: dict, now: datetime) -> list[str]:
     return _finalize_done(review_task, config, now)
 
 
+def _review_hold_resume_eta(review_task: dict, now: datetime) -> str:
+    """review 角色 hold（额度到线）自动恢复的时间估计。
+
+    S7.1 阻断二/三：以前 `_review_pending` 的 hold 分支只转 held、什么都
+    不落，没有任何机制能把它带回来（`_check_running` 通用的
+    quota_paused_until 恢复只认 idle/waiting_wakeup，held 状态永远等不到）。
+
+    优先复用 hook.py `_quota_check` 撞五小时线时已经落盘的
+    `quota_paused_until`（那是按真实 API 回报的刷新时间算的，最准）；
+    没有（多半是撞的周线，没有精确到分钟的刷新时间）就现查一次这一班
+    runner 的缓存用量，按周线 resets 估一个时间；都查不到就退回一个固定
+    的兜底间隔——不确定但好过永远卡住，`_check_running` 的恢复分支到点
+    发现还是没刷新时，review 大概率还会再给一次 pending，届时会重新走这里
+    算一次新的估计（自我修正，不是死锁在一个错误估计上）。
+    """
+    status = store.read_status(review_task["id"])
+    existing = status.get("quota_paused_until")
+    if existing:
+        return existing
+    runner = store.effective_runner(review_task)
+    usage = (quota.load_quota_file().get(runner) or {}).get("usage")
+    resets_in = None
+    if isinstance(usage, dict):
+        resets_in = quota.resets_in_minutes(usage.get("week_all_resets"))
+    if resets_in is None:
+        resets_in = 60  # 查不到就按 1 小时后重试一次
+    return to_iso(now + timedelta(minutes=resets_in))
+
+
 def _review_pending(review_task: dict, config: dict, now: datetime) -> list[str]:
     """审稿额度到线、意见没写完（NEXT: pending，不计轮数）：按
     review.on_no_quota release/hold 处理这一轮——release 另起同轮审稿等
@@ -1467,9 +1544,13 @@ def _review_pending(review_task: dict, config: dict, now: datetime) -> list[str]
     on_no_quota = review_cfg.get("on_no_quota") or "release"
     store.append_event(task_id, f"审稿第 {round_} 轮 pending（{on_no_quota}）")
     if on_no_quota == "hold":
+        # S7.1 阻断二/三：额外落 quota_paused_until，配合
+        # _check_running 新增的 review-hold 恢复分支，不再永久卡住。
         store.update_status(
             task_id, state="held", held_since=to_iso(now),
             held_reason="审稿额度到线，等刷新后继续", last_event_at=to_iso(now),
+            quota_paused_until=_review_hold_resume_eta(review_task, now),
+            quota_resume_sent=False,
         )
         return [f"{task_id} 审稿 pending → held"]
 

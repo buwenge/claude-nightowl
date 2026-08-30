@@ -2019,6 +2019,92 @@ def _review_config_for(proj: Path) -> dict:
     return cfg
 
 
+def test_review_dont_ask_permission_mode_not_warned(monkeypatch):
+    """S7.1 阻断五：review 角色故意用 dontAsk（无人值守拒绝语义，见
+    launcher._claude_command），不是"被静默回落成非 auto"，R2 的"没进 auto
+    模式"提醒窗不该误伤它。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_review_task()
+    data = store.load_task(tid)
+    data["role"] = "review"
+    store.atomic_write_json(store.task_dir(tid) / "task.json", data)
+    store.update_status(
+        tid, state="working", window_id="@1", pane_pid=NO_PID,
+        permission_mode="dontAsk",
+    )
+    scheduler.tick(REVIEW_CONFIG, NOW)
+    assert fakes.notice_calls == []
+    assert store.read_status(tid).get("mode_warned") is not True
+
+    # 对照：build 角色（同样是 dontAsk，理论上不该出现，但既然出现了就该
+    # 按老规则提醒——只有 review 角色的 dontAsk 是合法豁免）
+    build_tid = make_task(title="build dontAsk 异常")
+    store.update_status(
+        build_tid, state="working", window_id="@2", pane_pid=NO_PID,
+        permission_mode="dontAsk",
+    )
+    scheduler.tick(REVIEW_CONFIG, NOW)
+    assert len(fakes.notice_calls) == 1
+    assert fakes.notice_calls[0][0] == build_tid
+
+
+def test_tick_refreshes_both_runners_when_codex_build_held_claude_review_working(monkeypatch):
+    """S7.1 阻断四 Part A：tick() 一轮里，active_runners 收集只看顶层
+    task["runner"] 会漏刷 Codex 施工 + Claude 审稿这类跨家组合——active
+    build 顶层 runner 是 codex，但真正在跑的 review 是 claude，两家都要
+    刷新，不能只刷 codex。"""
+    fakes = Fakes(monkeypatch)
+    codex_calls: list[int] = []
+    monkeypatch.setattr(
+        quota, "fetch_usage_codex",
+        lambda config, timeout=15.0: codex_calls.append(1) or dict(fakes.usage),
+    )
+    cfg = dict(REVIEW_CONFIG, runners=CODEX_CONFIG["runners"])
+
+    build_id = store.create_task({
+        "title": "codex 施工", "project": "demo", "runner": "codex",
+        "model": "gpt-5.6-luna", "effort": "high",
+        "run_at": scheduler.to_iso(NOW), "task_text": "正文", "prompt_final": "提示词",
+    }, cfg)
+    store.update_status(build_id, state="held", window_id="@1", pane_pid=NO_PID)
+
+    review_id = store.create_task({
+        "title": "claude 审稿", "project": "demo", "runner": "codex",
+        "model": "gpt-5.6-luna", "effort": "high",
+        "run_at": scheduler.to_iso(NOW), "task_text": "正文", "prompt_final": "提示词",
+        "review": {"enabled": True, "runner": "claude", "model": "claude-fable-5", "effort": "high"},
+    }, cfg)
+    data = store.load_task(review_id)
+    data["role"] = "review"
+    store.atomic_write_json(store.task_dir(review_id) / "task.json", data)
+    store.update_status(review_id, state="working", window_id="@2", pane_pid=NO_PID)
+
+    scheduler.tick(cfg, NOW)
+    assert len(fakes.fetch_calls) == 1  # claude（review 的有效工人）被刷新
+    assert len(codex_calls) == 1  # codex（build 的顶层 runner）也被刷新
+
+
+def test_review_keepalive_marks_control_turn_before_poking(monkeypatch):
+    """S7.1 阻断二：保活探针不要求正式 verdict，发之前要落
+    review_awaiting_verdict=False，接下来的 Stop 才会走控制 turn 分支，
+    不会被误记成协议缺失→fix。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_review_task()
+    data = store.load_task(tid)
+    data["role"] = "review"
+    store.atomic_write_json(store.task_dir(tid) / "task.json", data)
+    stale = scheduler.to_iso(NOW - timedelta(minutes=51))
+    store.update_status(
+        tid, state="held", window_id="@5", pane_pid=NO_PID,
+        last_event_at=stale, review_awaiting_verdict=True,
+    )
+    scheduler.tick(REVIEW_CONFIG, NOW)
+    assert len(fakes.send_keys_calls) == 1
+    status = store.read_status(tid)
+    assert status["review_awaiting_verdict"] is False
+    assert status["state"] == "held"  # 保活不改流程状态
+
+
 def test_review_pipeline_fix_then_done_reuses_held_session(tmp_path, monkeypatch):
     """held 会话还活着：fix 直接捎话续第 2 轮，不新开窗口；第 2 轮 done →
     manual 收工 awaiting_merge。全程 fix_count/round/checkpoint 历史正确。"""
@@ -2290,6 +2376,75 @@ def test_review_pipeline_pending_hold_and_release(tmp_path, monkeypatch):
     new_review = store.load_task(new_review_id)
     assert new_review["role"] == "review" and new_review["round"] == 1
     assert new_review["role_shift"] == 1  # 全新会话，不是同角色续班
+
+
+def test_review_pipeline_pending_hold_auto_resumes_after_quota_refresh(tmp_path, monkeypatch):
+    """S7.1 阻断二/三：pending + hold 之前没有对应的"额度刷新后自动恢复"
+    动作，必然永久 held。落 quota_paused_until 之后，到点要能被
+    _check_running 新增的 review-hold 恢复分支敲醒——文案是 review 语气、
+    review_awaiting_verdict 被置回 True，之后真正的 done 仍能被正常记录
+    （不会被当成控制 turn 吞掉）。"""
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg_hold = dict(_review_config_for(proj))
+    cfg_hold["review"] = {**cfg_hold["review"], "on_no_quota": "hold"}
+    tid = make_review_task(review={
+        "enabled": True, "runner": "claude", "model": "claude-fable-5",
+        "effort": "high", "on_no_quota": "hold",
+    })
+    wt = _register_tree(proj, tid, "审稿流水线任务")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "写完了。\nNEXT: done")
+    scheduler.tick(cfg_hold, NOW)
+    review_id = store.read_status(tid)["successor_id"]
+    _go_idle(review_id, window_id="@2")
+    rf = store.task_dir(review_id) / "review-1.md"
+    rf.write_text("额度到线，没看完。\n\nNEXT: pending", encoding="utf-8")
+    store.update_status(review_id, review_verdict="pending", review_file=str(rf),
+                        review_recorded_round=1)
+    scheduler.tick(cfg_hold, NOW)
+    review_status = store.read_status(review_id)
+    assert review_status["state"] == "held"
+    paused_until = review_status.get("quota_paused_until")
+    assert paused_until  # 阻断二/三的核心：以前这里是 None，永远等不到恢复
+
+    # 还没到刷新时间：不该敲
+    scheduler.tick(cfg_hold, NOW)
+    assert fakes.send_keys_calls == []
+
+    # build（tid）仍 held 着等审稿结果，跟这条 review-hold 恢复路径无关；
+    # 暂停它的保活，不然时间跳到 later 时它自己的保活戳会混进 send_keys_calls
+    store.update_status(tid, keepalive_paused=True)
+
+    later = scheduler.parse_iso(paused_until) + timedelta(minutes=1)
+    scheduler.tick(cfg_hold, later)
+    assert len(fakes.send_keys_calls) == 1
+    window_id, text = fakes.send_keys_calls[0]
+    assert window_id == "@2"
+    assert "继续完成这一轮审稿" in text
+    assert "NEXT" in text
+    review_status = store.read_status(review_id)
+    assert review_status["quota_resume_sent"] is True
+    assert review_status["quota_paused_until"] is None
+    assert review_status["review_awaiting_verdict"] is True  # 重新要求真 verdict
+    assert review_status["state"] == "working"
+
+    # 再 tick 不重复敲
+    scheduler.tick(cfg_hold, later)
+    assert len(fakes.send_keys_calls) == 1
+
+    # 恢复之后真正的 done 仍能被 hook 正常记录——不是被当成控制 turn 吞掉
+    # （review_awaiting_verdict 已经被恢复分支置回 True）。
+    from nightshift import hook
+
+    hook.handle_event(
+        review_id, "Stop",
+        {"last_assistant_message": "接着看完了，都对。\n\nNEXT: done"},
+    )
+    final_status = store.read_status(review_id)
+    assert final_status["review_verdict"] == "done"
+    assert final_status["review_recorded_round"] == 1
 
 
 def test_apply_review_no_quota_policy_release_closes_build_window(monkeypatch):

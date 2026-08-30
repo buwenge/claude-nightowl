@@ -52,6 +52,27 @@ DEFAULT_REVIEW_WRAPUP_TEXT = (
     "[nightshift] 审稿额度只剩 {week_left}%（线 {week_line_left}%）{model_note}，一时半会儿刷新不了。"
     "现在把已经看到的意见写进本次最终回复正文，末行写 NEXT: pending（本轮不计数），然后停下。"
 )
+# S7.1 阻断二：review 撞五小时额度线时，不走 build 那套 ScheduleWakeup 多轮
+# 自我唤醒闹钟（那套后续每个闹钟醒来的回复都不带 NEXT，会被 review 的 Stop
+# 协议解析成"协议缺失→保守按 fix"，产生假退回）。review 角色改成当场一次
+# 性停下、末行写 NEXT: pending——跟审稿自己的周额度收尾走同一套协议，之后
+# 由 nightshift 调度器（scheduler._check_running 的 review 专属恢复分支）
+# 按额度刷新时间主动敲它继续，不需要它自己设闹钟。
+DEFAULT_REVIEW_QUOTA_PAUSE_TEXT = (
+    "[nightshift] 审稿五小时额度只剩 {session_left}%（线 {session_line_left}%），约 {resets_in} 分钟后刷新。"
+    "现在把已经看到的意见写进本次最终回复正文，末行写 NEXT: pending（本轮不计数）；"
+    "不用自己设闹钟，额度刷新后 nightshift 会主动敲你继续这一轮审稿。"
+)
+# S7.1 阻断二：review 撞上下文警戒线时，不能沿用 build 那套"写 handover、
+# 末行 NEXT: continue/done"协议——review 没有 handover 概念，且 continue/
+# done 不在 review 的 NEXT 三选一里，回复末行写 NEXT: continue 会被
+# `_parse_review_verdict` 判协议缺失、保守转成 fix（假退回）。改成跟额度
+# 收尾同款：当场把已经看到的意见写进最终回复正文，末行 NEXT: pending。
+DEFAULT_REVIEW_CONTEXT_WARN_TEXT = (
+    "[nightshift] 上下文已到 {ctx_k}k/{limit_k}k，快满了。"
+    "现在把已经看到的意见写进本次最终回复正文，末行写 NEXT: pending（本轮不计数），然后停下；"
+    "下一轮审稿会是一个新会话，接着看。"
+)
 # 闹钟规矩：50 分钟一个（缓存 TTL 约 1 小时），尾数补一个短的，再加几分钟缓冲
 ALARM_UNIT_MINUTES = 50
 ALARM_BUFFER_MINUTES = 3
@@ -237,14 +258,27 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
         from .quota import resets_in_minutes
 
         resets_in = resets_in_minutes(usage.get("session_resets"))
-        plan, total = alarm_plan(resets_in)
-        text = store.render(
-            config.get("quota_pause_text") or QUOTA_PAUSE_TEXT,
-            session_left=100 - session_pct,
-            session_line_left=100 - session_max,
-            resets_in=("未知" if resets_in is None else resets_in),
-            alarm_plan=plan,
-        )
+        if store.role_of(task) == "review":
+            # S7.1 阻断二：review 不走 build 那套 ScheduleWakeup 多轮自我唤醒
+            # 闹钟——那套闹钟醒来的中间回复不带 NEXT，会被 review 的 Stop
+            # 协议解析成协议缺失、保守转成 fix（假退回）。改成当场一次性
+            # NEXT: pending，之后由调度器按额度刷新时间主动敲它继续。
+            total = (resets_in if resets_in is not None else ALARM_FALLBACK_COUNT * ALARM_UNIT_MINUTES)
+            text = store.render(
+                config.get("review_quota_pause_text") or DEFAULT_REVIEW_QUOTA_PAUSE_TEXT,
+                session_left=100 - session_pct,
+                session_line_left=100 - session_max,
+                resets_in=("未知" if resets_in is None else resets_in),
+            )
+        else:
+            plan, total = alarm_plan(resets_in)
+            text = store.render(
+                config.get("quota_pause_text") or QUOTA_PAUSE_TEXT,
+                session_left=100 - session_pct,
+                session_line_left=100 - session_max,
+                resets_in=("未知" if resets_in is None else resets_in),
+                alarm_plan=plan,
+            )
         paused_until = datetime.now(timezone.utc) + timedelta(minutes=total)
         return "pause", text, {"quota_paused_until": paused_until.strftime("%Y-%m-%dT%H:%M:%SZ")}
     return None, "", {}
@@ -263,7 +297,12 @@ def _refresh_context(task: dict, payload: dict, fields: dict) -> None:
     """
     fields["context_tokens"] = None
     fields["context_pct"] = None
-    if (task.get("runner") or "claude") == "codex":
+    # S7.1 阻断四 Part A：这一步实际只在 effective_runner=="claude" 的班上被
+    # 调用（PostToolUse 的 codex 分支在 handle_event 里已经按 effective_runner
+    # 提前 return，不会走到这里），但仍要按这一班自己的有效工人判断，不能看
+    # 顶层 task["runner"]——否则 Codex 施工 + Claude 审稿这类跨家组合下，
+    # review 这一班会被顶层的 build runner 误判成 codex，白白跳过上下文刷新。
+    if store.effective_runner(task) == "codex":
         return
     transcript_path = payload.get("transcript_path")
     if not transcript_path:
@@ -321,9 +360,20 @@ def _post_tool_use_refresh(task: dict, status: dict, payload: dict) -> str | Non
                 store.append_event(task_id, f"算不出警戒线：{exc!r}")
             else:
                 if tokens >= threshold:
-                    text = (task.get("guards") or {}).get(
-                        "context_warn_text"
-                    ) or config.get("context_warn_text")
+                    is_review = store.role_of(task) == "review"
+                    guard_text = (task.get("guards") or {}).get("context_warn_text")
+                    if is_review:
+                        # S7.1 阻断二：review 撞上下文线不能沿用 build 的
+                        # handover/NEXT:continue-done 协议（协议缺失会被
+                        # 判协议缺失、保守转成 fix）——总有一份内置默认
+                        # 兜底，不依赖运维记得单独配 review_context_warn_text。
+                        text = (
+                            guard_text
+                            or config.get("review_context_warn_text")
+                            or DEFAULT_REVIEW_CONTEXT_WARN_TEXT
+                        )
+                    else:
+                        text = guard_text or config.get("context_warn_text")
                     if text:
                         ctx = store.render(
                             text,
@@ -406,48 +456,95 @@ def _parse_review_verdict(text: str) -> tuple[str, bool]:
 def _handle_review_stop(task: dict, payload: dict, now: str) -> None:
     """审稿班（role=review，Claude 或 Codex 皆同一套）的 Stop：把最终回复
     正文原子落成 review-<round>.md，解析末行 NEXT 记 review_verdict，state
-    转 idle/waiting_wakeup——跟 build 共用同一套 idle 语义，具体下一步（起
-    返工班/合并/告栏）由调度器 tick 时按 role=review 分流决定，hook 本身
-    只管落盘事实，不做流程判断。
+    转 idle——具体下一步（起返工班/合并/告栏）由调度器 tick 时按
+    role=review 分流决定，hook 本身只管落盘事实，不做流程判断。
 
-    幂等：这一轮已经记过 verdict 就不再重复覆盖文件/verdict——CC 对一次
-    残缺响应会静默重试（同一 turn 两次 Stop），第二次不该覆盖已确认的结果，
-    调度器也只该在 verdict 从"无"变为"有"的那次 tick 里推进一次轮次。
+    S7.1 阻断二：review 角色永远转 idle，不再像 build 那样在
+    quota_paused_until 有值时转 waiting_wakeup——review 的"额度到线等
+    刷新"统一记在 status.state=held（scheduler._review_pending 的 hold
+    分支），waiting_wakeup 是 build 专属的"自己设了缓存闹钟"语义；这两套
+    混用会让 review 的 verdict 落盘之后卡在 waiting_wakeup，
+    _check_review_idle 只在 state=="idle" 时才会被调度器分流到，
+    卡在 waiting_wakeup 的 verdict 会被无限期晾在那儿没人处理。
+
+    并发安全 + 幂等（S7.1 阻断二）：
+    - "这一轮是否已经接受过不可覆盖的 verdict"判断挪进 modify_status 的
+      锁内闭包一起做，不再锁外 read_status 判重复——两个并发 Stop 不能
+      都判定"我可以写"。
+    - 只有 done/fix 是不可覆盖的终态（review_verdict_final=True）；
+      pending 只是"这一轮还没完"，同一轮后续真正的 done/fix 仍然要能
+      正常记录，不能被 pending 自己设的 review_recorded_round 挡住。
+      （没有 review_verdict_final 字段的旧数据按"verdict 不是 pending
+      就当已确认"向下兼容。）
+    - 控制 turn 隔离：`review_awaiting_verdict` 为 False 时，说明这次
+      Stop 是保活/我来看之类"不要求正式 verdict"的回复，只清运行期字段
+      （stuck/auto_interrupted/last_event_at），**不改 state、不碰
+      review_verdict/review_recorded_round**——控制 turn 发生时这一班本
+      来就已经 held/waiting_background 着（发保活/hold_text 之前调用方
+      自己会把它落在这两个状态之一），瞎猜一个"复原后的 state"反而可能把
+      它错误地拽出 held（比如提前把仍在等额度刷新的 review 判成
+      idle，让 `_check_review_idle` 在额度真正刷新之前就重新分流一遍
+      pending verdict）；保持 state 原样，交给真正的恢复路径（额度到点/
+      "继续"）显式改。不会把一句"收到，我等着"误判成协议缺失、保守转成
+      fix。
     """
     task_id = task["id"]
     round_ = store.round_of(task)
-    status_now = store.read_status(task_id)
-    if status_now.get("review_recorded_round") == round_ and status_now.get("review_verdict"):
+    text = payload.get("last_assistant_message") or ""
+
+    decision: dict = {}
+
+    def decide(status: dict) -> None:
+        if not status.get("review_awaiting_verdict", True):
+            decision["kind"] = "control"
+            status["last_event_at"] = now
+            status["stuck"] = False
+            status.pop("auto_interrupted", None)
+            status.pop("stuck_since", None)
+            return
+        verdict_final = status.get("review_verdict_final")
+        if verdict_final is None:  # 旧数据兼容：没这个字段就按 verdict 本身推断
+            verdict_final = status.get("review_verdict") not in (None, "pending")
+        if status.get("review_recorded_round") == round_ and verdict_final:
+            decision["kind"] = "duplicate"
+            return
+        decision["kind"] = "verdict"
+        verdict, protocol_ok = _parse_review_verdict(text)
+        decision["verdict"] = verdict
+        decision["protocol_ok"] = protocol_ok
+        status["last_message"] = text[:2000]
+        status["stuck"] = False
+        status["last_event_at"] = now
+        status["review_verdict"] = verdict
+        status["review_recorded_round"] = round_
+        status["review_verdict_final"] = verdict != "pending"
+        status["state"] = "idle"
+        status.pop("auto_interrupted", None)
+        status.pop("stuck_since", None)
+
+    store.modify_status(task_id, decide)
+
+    if decision["kind"] == "control":
+        store.append_event(
+            task_id, "hook Stop(review) 控制 turn（保活/我来看/额度恢复），未解析 verdict"
+        )
+        return None
+    if decision["kind"] == "duplicate":
         store.append_event(
             task_id, f"hook Stop(review) 第 {round_} 轮已记过 verdict，忽略重复 Stop"
         )
         return None
 
-    text = payload.get("last_assistant_message") or ""
-    verdict, protocol_ok = _parse_review_verdict(text)
+    # 走到这里说明上面锁内判断已经放行了这一次（并发的第二个 Stop 在锁内
+    # 判断阶段就已经被挡成 duplicate/control，不会跑到这里跟这次撞车）。
     path = review_file_path(task)
     store.atomic_write_text(path, text if text.strip() else "（空消息，无审稿正文）\n")
-
-    fields = {
-        "last_message": text[:2000],
-        "stuck": False,
-        "last_event_at": now,
-        "review_verdict": verdict,
-        "review_file": str(path),
-        "review_recorded_round": round_,
-    }
-    fields["state"] = "waiting_wakeup" if status_now.get("quota_paused_until") else "idle"
-
-    def clear_stuck_cycle_review(status: dict) -> None:
-        status.update(fields)
-        status.pop("auto_interrupted", None)
-        status.pop("stuck_since", None)
-
-    store.modify_status(task_id, clear_stuck_cycle_review)
-    note = "" if protocol_ok else "（协议缺失：没写合法 NEXT，保守按 fix）"
+    updated = store.update_status(task_id, review_file=str(path))
+    note = "" if decision["protocol_ok"] else "（协议缺失：没写合法 NEXT，保守按 fix）"
     store.append_event(
         task_id,
-        f"hook Stop(review) 第 {round_} 轮 → verdict={verdict}{note}，state={fields['state']}",
+        f"hook Stop(review) 第 {round_} 轮 → verdict={decision['verdict']}{note}，"
+        f"state={updated['state']}",
     )
     return None
 

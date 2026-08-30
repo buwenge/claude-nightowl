@@ -171,7 +171,13 @@ def _claude_command(task: dict, config: dict, session_id: str) -> str:
     task['effort']，不改变输出）；review 角色额外插入只读工具面三件套
     （--tools 收窄可见工具、--allowedTools 只放行只读文件工具与参数受限的
     git diff/log/show/status/pytest、--disallowedTools 明确挡
-    Write/Edit/NotebookEdit），--permission-mode auto 与其余参数顺序不变。
+    Write/Edit/NotebookEdit）。
+
+    S7.1 阻断五：review 角色的 `--permission-mode` 改成 `dontAsk`（build
+    角色不变，仍是 `auto`）——`auto` 在这台 CLI 上的语义是"allowedTools
+    之外的也无需询问直接放行"，不是"列表外一律拒绝"；`dontAsk` 才是"列表
+    外一律拒绝、且不询问"的无人值守语义，配合 --allowedTools/--tools/
+    --disallowedTools 三件套才是真正的权限层只读，不能只靠提示词自觉。
     """
     d = store.task_dir(task["id"])
     parts = [
@@ -179,14 +185,16 @@ def _claude_command(task: dict, config: dict, session_id: str) -> str:
         f"--model {_sq(store.effective_model(task))}",
         f"--effort {_sq(store.effective_effort(task))}",
     ]
-    if store.role_of(task) == "review":
+    is_review = store.role_of(task) == "review"
+    if is_review:
         parts += [
             f"--tools {_sq(REVIEW_TOOLS)}",
             f"--allowedTools {_sq(','.join(REVIEW_ALLOWED_TOOLS))}",
             f"--disallowedTools {_sq(REVIEW_DISALLOWED_TOOLS)}",
         ]
+    permission_mode = "dontAsk" if is_review else "auto"
     parts += [
-        "--permission-mode auto",
+        f"--permission-mode {permission_mode}",
         f"--name {_sq(config['window_prefix'] + task['title'])}",
         f"--session-id {_sq(session_id)}",
         f"--settings {_sq(d / 'settings.json')}",
@@ -296,7 +304,14 @@ def _prompt_text(task: dict) -> str:
         and store.WORKTREE_INSTRUCTION not in text
     ):
         text = store.WORKTREE_INSTRUCTION + "\n\n" + text
-    if store.effective_runner(task) == "codex" and store.CODEX_BACKGROUND_INSTRUCTION not in text:
+    # S7.1 阻断五：F12 后台协议只适用于可写的 build 角色（起长任务、等
+    # 后台完成）——review 角色只读、不该起后台进程，硬塞这段协议只会诱导
+    # 它去做不该做的事。
+    if (
+        store.effective_runner(task) == "codex"
+        and store.role_of(task) == "build"
+        and store.CODEX_BACKGROUND_INSTRUCTION not in text
+    ):
         text = store.CODEX_BACKGROUND_INSTRUCTION + "\n\n" + text
     return text
 
