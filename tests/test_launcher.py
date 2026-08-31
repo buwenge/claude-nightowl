@@ -40,6 +40,9 @@ def ns_home(tmp_path, monkeypatch):
     monkeypatch.setenv("NIGHTSHIFT_HOME", str(tmp_path))
     monkeypatch.delenv("NIGHTSHIFT_CLAUDE_BIN", raising=False)
     monkeypatch.delenv("NIGHTSHIFT_CLAUDE_JSON", raising=False)
+    # S7.6：ensure_codex_trusted 会往 CODEX_HOME/config.toml 写盘——指到 tmp，
+    # 绝不让任何一条测试摸到真实 ~/.codex。
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex_home"))
     store.atomic_write_json(tmp_path / "config.json", CONFIG)
     return tmp_path
 
@@ -215,14 +218,16 @@ def test_run_sh_text_codex_new_session_command():
     assert f"export NIGHTOWL_TASK_ID='{task_id}'" in run_sh
     assert "export NIGHTOWL_RUNNER='codex'" in run_sh
     cmd_line = next(line for line in run_sh.splitlines() if line.startswith("'codex'"))
+    # S7.6：命令行 trust 覆盖已删除（Codex 信任闸门根本不认它，见
+    # ensure_codex_trusted）；信任改由 launch() 起会话前持久化写盘解决。
     assert cmd_line == (
         "'codex' -C '/home/user/projects/demo' --sandbox workspace-write "
         "--ask-for-approval never -m 'gpt-5.6-luna' "
         '-c \'model_reasoning_effort="high"\' '
-        '-c \'projects."/home/user/projects/demo".trust_level="trusted"\' '
         "--profile 'nightowl' "
         f"\"$(cat '{store.task_dir(task_id) / 'prompt.txt'}')\""
     )
+    assert "trust_level" not in cmd_line
     assert "codex 已退出" in run_sh
     assert "--session-id" not in run_sh  # Codex 没有这个概念
     assert "resume" not in cmd_line  # 新会话不 resume
@@ -795,6 +800,98 @@ def test_launch_codex_untrusted_claude_json_does_not_block(tmux_session, codex_e
     task_id, config = make_task_codex(project_path=str(codex_env["proj"]))
     status = launcher.launch(task_id, config)
     assert status["state"] == "launching"
+
+
+# ---------- S7.6：Codex 信任持久化写盘（命令行 -c 覆盖不生效，监理受控实测坐实） ----------
+
+
+def test_ensure_codex_trusted_writes_config_toml_and_is_idempotent():
+    """launcher.ensure_codex_trusted 把 workdir 持久化写进 config.toml，
+    重复调用同一个 workdir 不重复追加段落（幂等）。"""
+    config_path = launcher.codex_config_path()
+    assert not config_path.exists()  # CODEX_HOME 指到 tmp（ns_home 夹具），干净起点
+
+    workdir = "/tmp/proj/.claude/worktrees/abcd-slug"
+    launcher.ensure_codex_trusted(workdir)
+    assert config_path.is_file()
+    text = config_path.read_text(encoding="utf-8")
+    assert f'[projects."{workdir}"]' in text
+    assert 'trust_level = "trusted"' in text
+    assert launcher._codex_workdir_trusted(config_path, workdir)
+
+    launcher.ensure_codex_trusted(workdir)  # 第二次：不该再追加一段
+    text2 = config_path.read_text(encoding="utf-8")
+    assert text2.count(f'[projects."{workdir}"]') == 1
+
+
+def test_ensure_codex_trusted_preserves_existing_content_and_other_projects():
+    """已有内容（比如另一个 worktree 早就信任过）不能被截断/覆盖，只追加。"""
+    config_path = launcher.codex_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        '[projects."/other/tree"]\ntrust_level = "trusted"\n', encoding="utf-8"
+    )
+    launcher.ensure_codex_trusted("/tmp/proj/.claude/worktrees/new-slug")
+    text = config_path.read_text(encoding="utf-8")
+    assert '[projects."/other/tree"]' in text
+    assert '[projects."/tmp/proj/.claude/worktrees/new-slug"]' in text
+    assert launcher._codex_workdir_trusted(config_path, "/other/tree")
+    assert launcher._codex_workdir_trusted(config_path, "/tmp/proj/.claude/worktrees/new-slug")
+
+
+def test_codex_config_path_respects_codex_home(monkeypatch, tmp_path):
+    other_home = tmp_path / "other-codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(other_home))
+    assert launcher.codex_config_path() == other_home / "config.toml"
+
+
+def test_launch_codex_persists_trust_for_build_role(tmux_session, codex_env):
+    """S7.6 回归测试：launch() 起 Codex build 会话前必须把 workdir 持久化
+    写进 config.toml——命令行 -c projects...trust_level 覆盖对 Codex 的
+    信任闸门无效（监理两发受控实测坐实，见
+    reports/夜班-S7.4-真机smoke.md §9.7），补丁前 launch() 从不写这份文件，
+    这条断言会失败。worktree=False：直接落在项目目录，workdir 可预测，
+    不必再从 status 里现读实际建出来的工作树路径。"""
+    workdir = str(codex_env["proj"])
+    config_path = launcher.codex_config_path()
+    assert not config_path.exists()
+
+    task_id, config = make_task_codex(project_path=workdir, worktree=False)
+    launcher.launch(task_id, config)
+
+    assert config_path.is_file()
+    assert launcher._codex_workdir_trusted(config_path, workdir)
+
+
+def test_launch_codex_persists_trust_for_review_role(tmux_session, codex_env):
+    """同一条回归测试的 review 角色版本：--sandbox read-only 的审稿会话
+    同样必须先持久化写信任，否则真无人值守会静默卡在信任对话框（S7.4
+    真机 smoke §9.3/§9.7）。这里保留默认的 worktree=True（S7 审稿角色的
+    真实形态本就跑在工作树里），实际 workdir 现读 status.worktree_path，
+    不能想当然假设等于项目主目录。"""
+    workdir = str(codex_env["proj"])
+    config_path = launcher.codex_config_path()
+
+    task_id, config = make_task_codex(project_path=workdir)
+    review_task = store.load_task(task_id)
+    review_task["role"] = "review"
+    review_task["round"] = 1
+    review_task["review"] = {
+        "enabled": True, "runner": "codex", "model": "gpt-5.6-luna",
+        "effort": "low", "max_rounds": 5, "on_no_quota": "release",
+        "merge_policy": "manual", "criteria_text": "",
+    }
+    store.atomic_write_json(store.task_dir(task_id) / "task.json", review_task)
+
+    launcher.launch(task_id, config)
+
+    actual_workdir = store.read_status(task_id)["worktree_path"]
+    assert actual_workdir  # review 角色也建了工作树
+    assert config_path.is_file()
+    assert launcher._codex_workdir_trusted(config_path, actual_workdir)
+    # 幂等：这次调用没有把同一个 workdir 的段落重复堆一份
+    text = config_path.read_text(encoding="utf-8")
+    assert text.count(f'[projects."{actual_workdir}"]') == 1
 
 
 # ---------- S7：审稿角色的只读命令与有效工人 ----------

@@ -256,8 +256,9 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
     runner = store.effective_runner(task)
 
     # a. 目录信任：没点过信任，交互式 claude 会卡在信任问答——等人也没用，直接判失败。
-    # Codex 不吃这份信任记录（自己的信任状态在 ~/.codex/config.toml，覆盖
-    # 每次都显式带在命令行上，见 launcher._codex_command），跳过这条。
+    # Codex 不吃这份信任记录（自己的信任状态在 ~/.codex/config.toml），跳过
+    # 这条预检——它的信任由 launcher.launch() 在起会话前调用
+    # ensure_codex_trusted() 持久化写盘解决（S7.6）。
     if runner == "claude" and not launcher.is_trusted(project_path):
         return _fail_now(
             task, config, now,

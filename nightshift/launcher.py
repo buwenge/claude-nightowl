@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
+import tomllib
 import uuid
 from pathlib import Path
 
@@ -20,7 +22,9 @@ __all__ = [
     "claude_bin",
     "close_windows",
     "codex_bin",
+    "codex_config_path",
     "codex_resume_thread_id",
+    "ensure_codex_trusted",
     "ensure_tmux_session",
     "hook_settings",
     "is_trusted",
@@ -137,6 +141,78 @@ def is_trusted(project_path: str) -> bool:
     return entry.get("hasTrustDialogAccepted") is True
 
 
+def codex_config_path() -> Path:
+    """Codex 的 config.toml 路径：尊重 CODEX_HOME 环境变量（Codex CLI 自己的
+    约定，测试把它指到 tmp_path 即可隔离，绝不碰真实 ~/.codex），默认
+    ~/.codex/config.toml。"""
+    home = os.environ.get("CODEX_HOME")
+    base = Path(home) if home else (Path.home() / ".codex")
+    return base / "config.toml"
+
+
+def _toml_quote(value: str) -> str:
+    """TOML 基本字符串转义（反斜杠、双引号）：worktree 路径理论上不会带
+    引号，但持久化写盘这种"一旦写错就永久卡住无人值守流水线"的操作，值得
+    多这一步。"""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _codex_workdir_trusted(config_path: Path, workdir: str) -> bool:
+    """workdir 是否已经在 Codex config.toml 里被记成 trusted。解析失败（文件
+    不存在/格式坏了）一律当作"还没信任"，交给调用方走追加分支——追加是纯
+    末尾写入，不会因为文件本身有问题而丢数据。"""
+    if not config_path.is_file():
+        return False
+    try:
+        with open(config_path, "rb") as f:
+            data = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError):
+        return False
+    projects = data.get("projects")
+    if not isinstance(projects, dict):
+        return False
+    entry = projects.get(workdir)
+    if not isinstance(entry, dict):
+        return False
+    return entry.get("trust_level") == "trusted"
+
+
+def ensure_codex_trusted(workdir: str) -> None:
+    """把 workdir 以 `[projects."<workdir>"] trust_level = "trusted"` 持久化
+    写进 Codex 的 config.toml（跟 moving/work/ob 几个人工配置的项目同款）。
+
+    S7.6：`_codex_command` 原来靠命令行 `-c projects."<wt>".trust_level=
+    "trusted"` 覆盖，监理 2026-08-31 两发受控实测坐实这个覆盖 Codex 的信任
+    闸门根本不认——已信任的父根不让 worktree 子目录继承信任，`-c` 覆盖对
+    未信任目录照样弹交互式信任对话框；真无人值守下每个新 worktree 的第一次
+    Codex 会话都会静默卡死在那个对话框上，没有任何日志能提示。唯一生效的
+    机制是持久化写盘（详见 reports/夜班-S7.4-真机smoke.md §9.7）。
+
+    幂等：已经是 trusted 就不重复追加，避免同一路径的 `[projects."..."]`
+    段落在 config.toml 里堆积。原子 + 加锁：多个 Codex 任务可能并发起跑并发
+    写同一份 config.toml（build 和 review 都会调用这个函数），用文件锁串行
+    化，写盘走"临时文件 + os.replace"，锁内先重新确认一次是否已信任（双重
+    检查），避免并发场景下重复追加。
+    """
+    config_path = codex_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = config_path.with_name(f".{config_path.name}.lock")
+    with open(lock_path, "a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            if _codex_workdir_trusted(config_path, workdir):
+                return
+            existing = ""
+            if config_path.is_file():
+                existing = config_path.read_text(encoding="utf-8")
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            block = f'[projects."{_toml_quote(workdir)}"]\ntrust_level = "trusted"\n'
+            store.atomic_write_text(config_path, existing + block)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def hook_settings(task_id: str) -> dict:
     """单个任务专属的 hook 配置，形状与 Claude Code settings 的 hooks 一致。"""
 
@@ -210,11 +286,16 @@ def _codex_command(task: dict, config: dict, workdir: str, resume_thread_id: str
     同一个 thread（同角色续班），否则起一个全新会话。build 角色沙箱固定
     workspace-write（字节级不变）；review 角色固定 --sandbox read-only——
     不用 --add-dir（会给额外目录写权限，不是只读挂载），也不靠它交审稿
-    文件（Stop hook 在沙箱外原子落盘，见 hook.py）。"""
+    文件（Stop hook 在沙箱外原子落盘，见 hook.py）。
+
+    S7.6：命令行 trust 覆盖（`-c projects."<wt>".trust_level="trusted"`）已
+    删除——监理实测坐实 Codex 的信任闸门根本不认这个覆盖，留着只会误导人
+    以为信任问题已经处理（见 ensure_codex_trusted 的 docstring）。真正的
+    信任现在由 launch() 在起会话前调用 ensure_codex_trusted() 持久化写进
+    Codex 自己的 config.toml 解决，这里不再需要它。"""
     d = store.task_dir(task["id"])
     rc = store.runner_config(config).get("codex") or {}
     profile = rc.get("profile", "nightowl")
-    trust_override = f'projects."{workdir}".trust_level="trusted"'
     effort_override = f'model_reasoning_effort="{store.effective_effort(task)}"'
     sandbox = "read-only" if store.role_of(task) == "review" else "workspace-write"
     parts = [_sq(codex_bin(config))]
@@ -226,7 +307,6 @@ def _codex_command(task: dict, config: dict, workdir: str, resume_thread_id: str
         "--ask-for-approval never",
         f"-m {_sq(store.effective_model(task))}",
         f"-c {_sq(effort_override)}",
-        f"-c {_sq(trust_override)}",
         f"--profile {_sq(profile)}",
         f"\"$(cat {_sq(d / 'prompt.txt')})\"",
     ]
@@ -382,9 +462,8 @@ def launch(task_id: str, config: dict) -> dict:
 
     # ① 目录没信任过，交互式 claude 会卡在信任问答 → 直接判失败。
     # 只查主项目路径：信任预检不要求工作树单独出现在 ~/.claude.json 里。
-    # Codex 不吃这份文件（它自己的信任状态在 ~/.codex/config.toml），信任
-    # 覆盖每次都显式带在命令行上（_codex_command 的 trust_override），
-    # 这里对 codex 任务不做这个检查。
+    # Codex 不吃这份文件（它自己的信任状态在 ~/.codex/config.toml），这里
+    # 对 codex 任务不做这个检查——Codex 走的是下面 ①''' 的持久化写盘。
     if runner == "claude" and not is_trusted(project_path):
         reason = f"目录未信任，请先手动在该目录开一次 claude：{project_path}"
         store.append_event(task_id, f"启动被拦：{reason}")
@@ -438,6 +517,26 @@ def launch(task_id: str, config: dict) -> dict:
                 f"父班窗口 {parent_window_id} 仍然存活，"
                 "拒绝在新窗口 resume 同一个 Codex thread（防止两开）"
             )
+            store.append_event(task_id, f"启动被拦：{reason}")
+            status = store.update_status(
+                task_id, state="failed", error=reason,
+                last_event_at=store.utc_now_iso(),
+            )
+            open_failure_window(task, reason, config)
+            return status
+
+    # ①''' S7.6：Codex 会话开始前，把这一班的工作目录持久化写进
+    # ~/.codex/config.toml 的信任表——命令行 -c projects...trust_level 覆盖
+    # 对 Codex 的信任闸门无效（监理受控实测坐实，见 reports/夜班-S7.4-真机
+    # smoke.md §9.7），只有持久化写盘才能免交互；不分 build/review 角色，
+    # 两边都要（review 的 --sandbox read-only 同样会撞信任对话框）。写盘
+    # 失败（权限/磁盘问题）直接判这一班失败，不要在信任缺失的情况下继续
+    # 起一个注定会静默卡死的窗口。
+    if runner == "codex":
+        try:
+            ensure_codex_trusted(workdir_for(task, config))
+        except OSError as exc:
+            reason = f"写 Codex 信任配置失败：{exc}"
             store.append_event(task_id, f"启动被拦：{reason}")
             status = store.update_status(
                 task_id, state="failed", error=reason,
