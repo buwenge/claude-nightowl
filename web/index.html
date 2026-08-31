@@ -33,8 +33,8 @@
       </div>
       <div id="quota-body"><p class="hint">加载中…</p></div>
       <div class="warmup-row">
-        <label class="inline"><input type="checkbox" id="w-enabled"> 每天预热五小时窗口</label>
-        <span class="hint">（发一句话给 haiku，让窗口从那一刻起算；每个时刻各触发一次，改了自动保存）</span>
+        <label class="inline"><input type="checkbox" id="w-enabled"> 每天预热 Claude Code 五小时窗口</label>
+        <span class="hint">（只预热 Claude Code；发一句话给 haiku，让窗口从那一刻起算；每个时刻各触发一次，改了自动保存。Codex 没有预热开关，见下方双额度里的说明）</span>
       </div>
       <div id="w-times" class="warmup-times"></div>
       <button type="button" id="btn-warmup-add" class="ghost">＋ 再加一个时刻</button>
@@ -258,67 +258,113 @@
 
   <!-- ============ 模板页 ============ -->
   <section id="view-tpl" hidden>
-    <h2>提示词模板</h2>
-    <p class="hint">占位符：{task} {title} {project_path} {context_limit} {worktree_instruction}（工作树任务渲染成"只在当前工作树施工、不要 commit"的前言，老式任务为空）</p>
+    <p class="hint">下面按用途分了组；每条文案下面写着它的占位符和真实用途，改完统一点最下面「保存模板」。</p>
+
+    <h2 class="tpl-group">施工</h2>
+
+    <h3>提示词模板</h3>
+    <p class="hint">占位符：{task} {title} {project_path} {context_limit} {worktree_instruction}（工作树任务渲染成"只在当前工作树施工、不要 commit"的前言，老式任务为空）。新建任务时的默认提示词就是这条模板渲染出来的。</p>
     <textarea id="t-prompt" class="mono tall" rows="8"></textarea>
 
-    <h2>到线注入的话</h2>
-    <p class="hint">占位符：{ctx_k} {limit_k} {handover_path} {commit_step}（工作树任务渲染为空，老式任务渲染成"把未提交的改动 commit；"）</p>
-    <textarea id="t-warntext" class="tall" rows="6"></textarea>
-
-    <h2>五小时额度到线：暂停等刷新</h2>
-    <p class="hint">占位符：{session_left} 剩余% · {session_line_left} 线（剩余%）· {resets_in} 几分钟后刷新 · {alarm_plan} 闹钟排法（系统自动填）</p>
-    <textarea id="t-quotapause" class="tall" rows="5"></textarea>
-
-    <h2>周额度到线：收尾交接</h2>
-    <p class="hint">占位符：{week_left} 剩余% · {week_line_left} 线（剩余%）· {model_line_left} 单模型线（剩余%）· {model_note} 单模型周线说明 · {handover_path} · {commit_step}</p>
-    <textarea id="t-quotawrap" class="tall" rows="5"></textarea>
-
-    <h2>别的模型周额度到线：只提示</h2>
-    <p class="hint">占位符：{label} 模型名 · {left} 剩余% · {line_left} 线（剩余%）。本会话不停，只叫它别派那个模型的子 agent。</p>
-    <textarea id="t-quotaother" class="tall" rows="4"></textarea>
-
-    <h2>续班模板</h2>
-    <p class="hint">占位符：{task} {shift} {handover} {title} {project_path} {context_limit} {worktree_instruction}（系统自动填，改文案别删花括号）</p>
+    <h3>续班模板</h3>
+    <p class="hint">占位符：{task} {shift} {handover} {title} {project_path} {context_limit} {worktree_instruction}（系统自动填，改文案别删花括号）。同角色续班（上下文/额度到线换下一班）时用这条渲染提示词。</p>
     <textarea id="t-chain" class="tall" rows="6"></textarea>
 
-    <h2>停后台指令</h2>
-    <p class="hint">点任务卡上的「停后台」时敲进会话的话，原样发送、没有占位符。</p>
-    <textarea id="t-stopbg" class="tall" rows="4"></textarea>
+    <h3>到线注入的话</h3>
+    <p class="hint">占位符：{ctx_k} {limit_k} {handover_path} {commit_step}（工作树任务渲染为空，老式任务渲染成"把未提交的改动 commit；"）。上下文逼近警戒线时敲给施工窗口的提醒。</p>
+    <textarea id="t-warntext" class="tall" rows="6"></textarea>
 
-    <h2>疑似卡住自动中止后的自检提示</h2>
+    <h3>疑似卡住自动中止后的自检提示</h3>
     <p class="hint">占位符：{stuck_minutes} 卡住的分钟数。Esc 只能打断当前这一轮，不会触发它自己收尾（Claude Code 官方说明：Stop 不认用户中断），所以按完 Esc 会紧接着把这段话敲进去起一个新轮次，让它自己判断刚才卡在哪、要不要继续。</p>
     <textarea id="t-stuckinterrupt" class="tall" rows="4"></textarea>
 
-    <h2>审稿班提示词</h2>
+    <h2 class="tpl-group">额度</h2>
+
+    <h3>五小时额度到线：暂停等刷新</h3>
+    <p class="hint">占位符：{session_left} 剩余% · {session_line_left} 线（剩余%）· {resets_in} 几分钟后刷新 · {alarm_plan} 闹钟排法（系统自动填）。Claude Code 任务用这条；用 ScheduleWakeup 自己缓存闹钟。</p>
+    <textarea id="t-quotapause" class="tall" rows="5"></textarea>
+
+    <h3>周额度到线：收尾交接</h3>
+    <p class="hint">占位符：{week_left} 剩余% · {week_line_left} 线（剩余%）· {model_line_left} 单模型线（剩余%）· {model_note} 单模型周线说明 · {handover_path} · {commit_step}</p>
+    <textarea id="t-quotawrap" class="tall" rows="5"></textarea>
+
+    <h3>别的模型周额度到线：只提示</h3>
+    <p class="hint">占位符：{label} 模型名 · {left} 剩余% · {line_left} 线（剩余%）。本会话不停，只叫它别派那个模型的子 agent。</p>
+    <textarea id="t-quotaother" class="tall" rows="4"></textarea>
+
+    <h3>Codex 五小时额度到线：暂停等刷新</h3>
+    <p class="hint">占位符：{session_left} {session_line_left} {resets_at}（系统自动填）。Codex 没有 ScheduleWakeup，到点/刷新都要调度器主动敲窗口，所以这条跟"恢复"是配对的两句话。</p>
+    <textarea id="t-codexquotapause" class="tall" rows="4"></textarea>
+
+    <h3>Codex 额度刷新后恢复</h3>
+    <p class="hint">没有占位符，原样发送。调度器判定五小时额度应已刷新时敲给暂停中的 Codex 会话。</p>
+    <textarea id="t-codexresume" class="tall" rows="3"></textarea>
+
+    <h2 class="tpl-group">审稿与返工</h2>
+
+    <h3>审稿班提示词</h3>
     <p class="hint">占位符：{task} {title} {project_path} {base_ref} {diff_command} {build_handover} {previous_review} {round} {criteria} {stop_build_hint}（系统自动填）。只读审查，最终回复正文就是审稿意见，末行严格写 NEXT: done / fix / pending。</p>
     <textarea id="t-review" class="mono tall" rows="8"></textarea>
 
-    <h2>返工班提示词</h2>
-    <p class="hint">占位符：{task} {title} {project_path} {round} {review} {context_limit} {worktree_instruction}（系统自动填）</p>
+    <h3>返工班提示词</h3>
+    <p class="hint">占位符：{task} {title} {project_path} {round} {review} {context_limit} {worktree_instruction}（系统自动填）。审稿 NEXT: fix 后，下一轮返工班拿这条模板渲染的提示词。</p>
     <textarea id="t-reviewfix" class="mono tall" rows="6"></textarea>
 
-    <h2>审稿通过标准（默认文案）</h2>
-    <p class="hint">任务里没单独补一句时用这条；{criteria} 占位符即渲染这段文本。</p>
+    <h3>审稿通过标准（默认文案）</h3>
+    <p class="hint">任务里没单独补一句时用这条；{criteria} 占位符即渲染这段文本；新建页"联动审稿"折叠区的"通过标准补充一句"会接在这条后面。</p>
     <textarea id="t-reviewcriteria" class="tall" rows="3"></textarea>
 
-    <h2>审稿班额度到线收尾</h2>
+    <h3>审稿班额度到线收尾</h3>
     <p class="hint">占位符：{week_left} {week_line_left} {model_line_left} {model_note}。叫它把已看到的意见写进最终回复正文、末行 NEXT: pending，不叫它写交接文件。</p>
     <textarea id="t-reviewwrapup" class="tall" rows="4"></textarea>
 
-    <h2>审稿通过后敲给施工班的话</h2>
+    <h3>审稿通过后敲给施工班的话</h3>
     <p class="hint">审稿 NEXT: done 且施工班还 held 着时敲给它的一句话，原样发送、没有占位符。</p>
     <textarea id="t-reviewstopbuild" class="tall" rows="3"></textarea>
 
-    <h2>"我来看"生效时投给两边的话</h2>
-    <p class="hint">按"我来看"时敲给当前活窗口的一句话，原样发送、没有占位符。</p>
+    <h3>审稿额度刷新后恢复</h3>
+    <p class="hint">没有占位符，原样发送。审稿方因为 review.on_no_quota=hold 停在 held 等额度，额度应已刷新时敲这句，跟"审稿通过后"那句不是同一件事。</p>
+    <textarea id="t-reviewresume" class="tall" rows="3"></textarea>
+
+    <h3>"我来看"打断审稿后的继续</h3>
+    <p class="hint">没有占位符，原样发送。跟上一条"额度刷新"文案不同——这条明确是"工头看完了继续"，不提额度。任务卡上点"继续"、目标是被打断到一半的审稿班时用这句。</p>
+    <textarea id="t-reviewholdresume" class="tall" rows="3"></textarea>
+
+    <h3>"我来看"打断施工后的继续</h3>
+    <p class="hint">没有占位符，原样发送。跟审稿那条是分开的两句——施工的协议是交接文件末行 NEXT: done/continue，不提 verdict。任务卡上点"继续"、目标是被打断到一半的施工班时用这句。</p>
+    <textarea id="t-buildholdresume" class="tall" rows="3"></textarea>
+
+    <h2 class="tpl-group">暂停与保活</h2>
+
+    <h3>"我来看"生效时投给两边的话</h3>
+    <p class="hint">按"我来看"时敲给当前活窗口（施工或审稿，谁活着敲谁）的一句话，原样发送、没有占位符。</p>
     <textarea id="t-hold" class="tall" rows="3"></textarea>
 
-    <h2>"继续"时投给施工班的话</h2>
-    <p class="hint">按"继续"后敲给恢复施工的窗口的一句话，原样发送、没有占位符。</p>
+    <h3>"继续"时投给施工班的话（旧版通用恢复）</h3>
+    <p class="hint">没有占位符，原样发送。历史遗留的通用恢复文案；S7 起"我来看"打断的恢复走上面两条更明确的文案，这条继续保留兼容。</p>
     <textarea id="t-resume" class="tall" rows="3"></textarea>
 
-    <p id="tpl-note" class="ok-note"></p>
+    <h3>Claude Code 保活探针</h3>
+    <p class="hint">没有占位符，原样发送。施工/审稿会话长时间没动静（默认 50 分钟）时敲这一句，简短回一句即可，不算真正干活。</p>
+    <textarea id="t-keepaliveclaude" class="tall" rows="3"></textarea>
+
+    <div id="box-keepalivecodex" hidden>
+      <h3>Codex 保活探针</h3>
+      <p class="hint">没有占位符，原样发送。Codex 会话没动静（默认 25 分钟）时敲这一句，请它读一下登记的后台任务状态再简短回复。</p>
+      <textarea id="t-keepalivecodex" class="tall" rows="3"></textarea>
+    </div>
+
+    <h2 class="tpl-group">停后台</h2>
+
+    <h3>Claude Code 停后台指令</h3>
+    <p class="hint">点任务卡上的「停后台」时敲进会话的话，原样发送、没有占位符。Claude Code 用 TaskStop 停掉子 agent 与后台任务。</p>
+    <textarea id="t-stopbg" class="tall" rows="4"></textarea>
+
+    <h3>Codex 停后台指令</h3>
+    <p class="hint">没有占位符，原样发送。Codex 没有 TaskStop，改叫它自己用 background_runner 的 list/stop 逐个停掉登记的后台进程。</p>
+    <textarea id="t-codexstopbg" class="tall" rows="4"></textarea>
+
+    <p id="tpl-note" class="ok-note" role="status"></p>
     <button type="button" id="btn-save-tpl" class="primary" style="width:100%">保存模板</button>
   </section>
 

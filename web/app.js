@@ -25,6 +25,17 @@ var CAL_OPEN = false;      // 日期面板是否展开
 
 function $(id) { return document.getElementById(id); }
 
+// S8④：弹层打开前记住触发它的元素，关闭后把焦点还回去；打开时把焦点
+// 挪进弹层本身第一个可交互元素（各 open* 函数自己 .focus() 具体目标）。
+var OVERLAY_RETURN_FOCUS = null;
+function trackFocusBeforeOverlay() { OVERLAY_RETURN_FOCUS = document.activeElement; }
+function restoreFocusAfterOverlay() {
+  if (OVERLAY_RETURN_FOCUS && typeof OVERLAY_RETURN_FOCUS.focus === "function") {
+    OVERLAY_RETURN_FOCUS.focus();
+  }
+  OVERLAY_RETURN_FOCUS = null;
+}
+
 function el(tag, attrs, children) {
   var node = document.createElement(tag);
   if (attrs) {
@@ -610,6 +621,7 @@ function pipelineControlActions(chain) {
 // ---------- S8③：直接返工弹层（独立于"给窗口捎话"草稿） ----------
 
 function openFixNow(id, title) {
+  trackFocusBeforeOverlay();
   FIXNOW_TASK = { id: id, title: title };
   $("fixnow-title").textContent = "直接返工 · " + title;
   $("fixnow-text").value = "";
@@ -620,6 +632,7 @@ function openFixNow(id, title) {
 function closeFixNow() {
   FIXNOW_TASK = null;
   $("fixnow-overlay").classList.remove("show");
+  restoreFocusAfterOverlay();
 }
 
 function sendFixNow() {
@@ -1072,10 +1085,12 @@ function loadScreen() {
 }
 
 function openScreen(id, title) {
+  trackFocusBeforeOverlay();
   SCREEN_TASK = { id: id, title: title };
   $("screen-title").textContent = "屏幕快照 · " + title;
   $("screen-text").textContent = "加载中…";
   $("screen-overlay").classList.add("show");
+  $("btn-screen-close").focus();
   loadScreen();
   if (screenTimer) clearInterval(screenTimer);
   screenTimer = setInterval(function () {
@@ -1087,6 +1102,7 @@ function closeScreen() {
   SCREEN_TASK = null;
   $("screen-overlay").classList.remove("show");
   if (screenTimer) { clearInterval(screenTimer); screenTimer = null; }
+  restoreFocusAfterOverlay();
 }
 
 /* ---------- 新建页 ---------- */
@@ -1431,6 +1447,7 @@ function chainFromForm(base) {
 /* ---------- 捎话弹层（S4③） ---------- */
 
 function openMsg(id, title, draft) {
+  trackFocusBeforeOverlay();
   MSG_TASK = { id: id, title: title };
   $("msg-title").textContent = "捎话 · " + title;
   $("msg-text").value = draft || "";
@@ -1443,6 +1460,7 @@ function closeMsg() {
   MSG_TASK = null;
   $("msg-overlay").classList.remove("show");
   refreshTasks();  // 草稿行/按钮状态以服务器为准
+  restoreFocusAfterOverlay();
 }
 
 function sendMessage() {
@@ -1607,9 +1625,24 @@ function loadTemplatesView() {
     $("t-reviewstopbuild").value = cfg.review_stop_build_text || "";
     $("t-hold").value = cfg.hold_text || "";
     $("t-resume").value = cfg.resume_text || "";
+    // S8④：commit①开放的实际有消费者的文案
+    $("t-codexquotapause").value = cfg.codex_quota_pause_text || "";
+    $("t-codexresume").value = cfg.codex_resume_text || "";
+    $("t-codexstopbg").value = cfg.codex_stop_background_text || "";
+    $("t-reviewresume").value = cfg.review_resume_text || "";
+    $("t-reviewholdresume").value = cfg.review_hold_resume_text || "";
+    $("t-buildholdresume").value = cfg.build_hold_resume_text || "";
+    var runners = cfg.runners || {};
+    $("t-keepaliveclaude").value = (runners.claude && runners.claude.keepalive_text) || "";
+    $("t-keepalivecodex").value = (runners.codex && runners.codex.keepalive_text) || "";
+    $("box-keepalivecodex").hidden = !runners.codex;
   }).catch(function () {});
 }
 
+// S8④：主体模板文案与 runners.*.keepalive_text 分两次 PUT——后者要求
+// config.runners 里已有目标 runner 的真实分块，旧配置/没配 Codex 时会
+// 400；拆开发送保证那种情况下前面一大串正常文案仍然保存成功，不会因为
+// 一个可选的保活探针文案把整页"保存模板"拖成全有全无。
 function saveTemplates() {
   var note = $("tpl-note");
   note.textContent = "";
@@ -1628,7 +1661,20 @@ function saveTemplates() {
     review_wrapup_text: $("t-reviewwrapup").value,
     review_stop_build_text: $("t-reviewstopbuild").value,
     hold_text: $("t-hold").value,
-    resume_text: $("t-resume").value
+    resume_text: $("t-resume").value,
+    codex_quota_pause_text: $("t-codexquotapause").value,
+    codex_resume_text: $("t-codexresume").value,
+    codex_stop_background_text: $("t-codexstopbg").value,
+    review_resume_text: $("t-reviewresume").value,
+    review_hold_resume_text: $("t-reviewholdresume").value,
+    build_hold_resume_text: $("t-buildholdresume").value
+  }).then(function () {
+    var runners = (CFG && CFG.runners) || {};
+    var runnerKt = {};
+    if (runners.claude) runnerKt.claude = $("t-keepaliveclaude").value;
+    if (runners.codex) runnerKt.codex = $("t-keepalivecodex").value;
+    if (!Object.keys(runnerKt).length) return null;
+    return api("PUT", "./api/templates", { runner_keepalive_text: runnerKt });
   }).then(function () {
     note.textContent = "已保存";
     setTimeout(function () { note.textContent = ""; }, 3000);
@@ -1663,6 +1709,21 @@ function start() {
     });
   });
   $("btn-screen-close").addEventListener("click", closeScreen);
+  // S8④：三个弹层统一支持 Esc（桌面）+ 点背景关闭；打开/关闭时的焦点进出
+  // 由各 open*/close* 函数自己处理（trackFocusBeforeOverlay/restoreFocusAfterOverlay）。
+  var OVERLAY_CLOSERS = { "msg-overlay": closeMsg, "fixnow-overlay": closeFixNow, "screen-overlay": closeScreen };
+  Object.keys(OVERLAY_CLOSERS).forEach(function (id) {
+    $(id).addEventListener("click", function (ev) {
+      if (ev.target === $(id)) OVERLAY_CLOSERS[id]();
+    });
+  });
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key !== "Escape") return;
+    var openId = Object.keys(OVERLAY_CLOSERS).filter(function (id) {
+      return $(id).classList.contains("show");
+    })[0];
+    if (openId) OVERLAY_CLOSERS[openId]();
+  });
   // 一改就存：勾选/时刻变化立刻 PUT，不给轮询插队的机会
   $("w-enabled").addEventListener("change", function () { WARMUP_DIRTY = true; saveWarmup(); });
   $("btn-warmup-add").addEventListener("click", function () {

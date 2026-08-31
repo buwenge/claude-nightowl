@@ -266,7 +266,7 @@ details.events pre {
 /* S8③：每轮详情——折叠区，手机上不横滚 */
 .pipeline-detail { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 6px; }
 .pipeline-detail summary {
-  cursor: pointer; min-height: 40px; line-height: 40px; color: var(--muted); font-size: 14px;
+  cursor: pointer; min-height: 44px; line-height: 44px; color: var(--muted); font-size: 14px;
   touch-action: manipulation;
 }
 .pipeline-detail-body { padding-top: 4px; }
@@ -288,8 +288,9 @@ details.events pre {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   cursor: pointer;
   color: var(--accent);
-  min-height: 32px;
-  line-height: 32px;
+  min-height: 44px;
+  line-height: 44px;
+  touch-action: manipulation;
 }
 
 /* ---------- 新建页 ---------- */
@@ -612,3 +613,31 @@ button.danger.solid { background: var(--danger); border-color: var(--danger); co
   color: var(--muted);
 }
 .cal-filter-hint button { min-height: 36px; padding: 0 10px; font-size: 13px; }
+
+/* ---------- S8④：模板页分组 / 忙碌按钮 / 手机总收口 ---------- */
+
+.tpl-group {
+  margin-top: 28px;
+  padding-top: 10px;
+  border-top: 2px solid var(--accent);
+  color: var(--accent);
+}
+.tpl-group:first-of-type { margin-top: 20px; }
+#view-tpl h3 { font-size: 15px; margin: 16px 0 4px; }
+
+/* 请求进行中禁用态：不只靠颜色变浅，光标也明确变化 */
+button[aria-busy="true"] { cursor: progress; }
+
+/* 320–430px 宽度：卡片内文字/分支名/交接正文一律允许在任意字符处折行，
+   不靠横向滚动条 */
+.task-title, .task-meta, .review-meta, .lastmsg, .warn-reason,
+.wt-path, .draft-line, .quota-line, .bar-resets {
+  overflow-wrap: anywhere;
+}
+.wt-branch { min-height: 44px; line-height: 44px; }
+details.events summary { min-height: 44px; line-height: 44px; }
+.quota-btns button { min-height: 44px; }
+.warmup-times input[type="time"] { min-height: 44px; }
+.warmup-times .x { min-height: 44px; min-width: 44px; }
+
+html, body { overflow-x: hidden; }

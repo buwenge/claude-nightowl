@@ -304,3 +304,68 @@ def test_css_has_phase_chip_held_and_pipeline_detail_styles():
     css = (WEB / "style.css").read_text(encoding="utf-8")
     for piece in ("st-held", "phase-chip", "pipeline-detail", "pipeline-doc", "overflow-wrap: anywhere"):
         assert piece in css, piece
+
+
+# ---------- S8④：模板、双额度与手机视觉总收口 ----------
+
+
+def test_index_has_all_new_template_textareas_grouped():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    for piece in (
+        'class="tpl-group"',
+        'id="t-codexquotapause"', 'id="t-codexresume"', 'id="t-codexstopbg"',
+        'id="t-reviewresume"', 'id="t-reviewholdresume"', 'id="t-buildholdresume"',
+        'id="t-keepaliveclaude"', 'id="t-keepalivecodex"', 'id="box-keepalivecodex"',
+        # 老键全部还在（不许删旧模板能力）
+        'id="t-prompt"', 'id="t-warntext"', 'id="t-quotapause"', 'id="t-quotawrap"',
+        'id="t-quotaother"', 'id="t-chain"', 'id="t-stopbg"', 'id="t-stuckinterrupt"',
+        'id="t-review"', 'id="t-reviewfix"', 'id="t-reviewcriteria"', 'id="t-reviewwrapup"',
+        'id="t-reviewstopbuild"', 'id="t-hold"', 'id="t-resume"',
+        'id="btn-save-tpl"',  # 只有一个主保存按钮
+    ):
+        assert piece in html, piece
+    assert html.count('id="btn-save-tpl"') == 1
+
+
+def test_app_js_templates_load_and_save_new_keys_with_split_runner_keepalive_put():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    for piece in (
+        "cfg.codex_quota_pause_text", "cfg.codex_resume_text", "cfg.codex_stop_background_text",
+        "cfg.review_resume_text", "cfg.review_hold_resume_text", "cfg.build_hold_resume_text",
+        "runners.claude && runners.claude.keepalive_text",
+        "runners.codex && runners.codex.keepalive_text",
+        "codex_quota_pause_text: $(\"t-codexquotapause\").value",
+        "review_resume_text: $(\"t-reviewresume\").value",
+        # 主体文案与 runner_keepalive_text 分两次 PUT，不因后者可选失败拖累前者
+        'return api("PUT", "./api/templates", { runner_keepalive_text: runnerKt });',
+    ):
+        assert piece in js, piece
+
+
+def test_index_warmup_label_is_claude_code_specific():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert "每天预热 Claude Code 五小时窗口" in html
+    assert "Codex 没有预热开关" in html
+
+
+def test_app_js_does_not_add_codex_warmup_toggle():
+    """不给 Codex 加预热开关：模板/预热相关代码里不出现 codex 预热字样。"""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "codex_warmup" not in js
+    assert "codexWarmup" not in js
+
+
+def test_overlays_support_escape_backdrop_close_and_focus_return():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    for piece in (
+        "function trackFocusBeforeOverlay()", "function restoreFocusAfterOverlay()",
+        "var OVERLAY_CLOSERS = ", '"Escape"',
+        "restoreFocusAfterOverlay();",
+    ):
+        assert piece in js, piece
+
+
+def test_css_mobile_wrap_and_no_horizontal_scroll():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    for piece in ("overflow-wrap: anywhere", "overflow-x: hidden", ".tpl-group"):
+        assert piece in css, piece
