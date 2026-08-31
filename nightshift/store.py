@@ -437,6 +437,17 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
     # S5：worktree 只有显式 true/false 两种
     if task.get("worktree") is not None and not isinstance(task.get("worktree"), bool):
         raise ValueError("worktree 必须是布尔值")
+    # S8：keepalive 是任务自己的长期显式覆盖（跟 guards.keepalive 那个全局
+    # 兜底开关并存，见 scheduler._maybe_keepalive），只认 enabled 一个键。
+    keepalive = task.get("keepalive")
+    if keepalive is not None:
+        if not isinstance(keepalive, dict):
+            raise ValueError("keepalive 必须是对象")
+        unknown = sorted(set(keepalive) - {"enabled"})
+        if unknown:
+            raise ValueError(f"keepalive 只认 enabled，多出：{'、'.join(unknown)}")
+        if "enabled" in keepalive and not isinstance(keepalive["enabled"], bool):
+            raise ValueError("keepalive.enabled 必须是布尔值")
     # S7：review 只认 REVIEW_KEYS 七个键；enabled=true 要求 worktree=true，
     # 且审稿方 runner/model/effort 必须真实存在于 config.runners（或旧配置
     # 合成的兼容视图）；enabled=false 继续接受 S5 的最小占位对象。
@@ -548,6 +559,14 @@ def create_task(task: dict, config: dict) -> str:
             "effort": review["effort"],
         })
         data["review"] = merged
+    # S8：新任务缺省 keepalive.enabled=true（长期开关，落盘归一成只含
+    # enabled 一个键的最小形状）；旧任务/未显式给的编辑路径不受影响
+    # （_api_update_task 只在 data 里带了 keepalive 键时才会走到这里）。
+    keepalive = data.get("keepalive")
+    if not isinstance(keepalive, dict) or not isinstance(keepalive.get("enabled"), bool):
+        data["keepalive"] = {"enabled": True}
+    else:
+        data["keepalive"] = {"enabled": keepalive["enabled"]}
     if not data.get("run_at"):
         data["run_at"] = utc_now_iso()  # after 任务：只当排序用
 

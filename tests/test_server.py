@@ -319,6 +319,78 @@ def test_put_templates_rejects_non_string(authed):
     assert status == 400
 
 
+# ---------- S8①：新恢复文案 + runners.*.keepalive_text 安全读改映射 ----------
+
+
+def test_api_config_exposes_new_resume_texts_and_runner_keepalive_text(authed):
+    status, _, body = authed.request("GET", "/api/config")
+    assert status == 200
+    assert body["review_resume_text"] == ""
+    assert body["review_hold_resume_text"] == ""
+    assert body["build_hold_resume_text"] == ""
+    assert body["runners"]["claude"]["keepalive_text"] is None
+
+
+def test_put_templates_accepts_new_resume_keys(authed, ns_home):
+    status, _, body = authed.request("PUT", "/api/templates", {
+        "review_resume_text": "继续审", "review_hold_resume_text": "看完了继续审",
+        "build_hold_resume_text": "看完了继续写",
+    })
+    assert status == 200, body
+    status, _, cfg = authed.request("GET", "/api/config")
+    assert cfg["review_resume_text"] == "继续审"
+    assert cfg["review_hold_resume_text"] == "看完了继续审"
+    assert cfg["build_hold_resume_text"] == "看完了继续写"
+
+
+def test_put_templates_runner_keepalive_text_updates_only_target_key(authed, ns_home):
+    cfg = store.load_config()
+    cfg["runners"] = {
+        "claude": {"bin": "claude", "models": {"claude-fable-5": {"context_limit": 500000}},
+                   "efforts": ["high"], "keepalive_idle_minutes": 50, "keepalive_text": "旧"},
+        "codex": {"bin": "codex", "profile": "nightowl",
+                  "models": {"gpt-5.6-luna": {"context_limit": None}},
+                  "efforts": ["high"], "keepalive_idle_minutes": 25, "keepalive_text": "旧codex"},
+    }
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    status, _, body = authed.request("PUT", "/api/templates", {
+        "runner_keepalive_text": {"claude": "新的保活探针"},
+    })
+    assert status == 200, body
+    after = json.loads((ns_home / "config.json").read_text(encoding="utf-8"))
+    assert after["runners"]["claude"]["keepalive_text"] == "新的保活探针"
+    # 兄弟键与另一个 runner 原样保留
+    assert after["runners"]["claude"]["bin"] == "claude"
+    assert after["runners"]["claude"]["keepalive_idle_minutes"] == 50
+    assert after["runners"]["claude"]["models"] == {"claude-fable-5": {"context_limit": 500000}}
+    assert after["runners"]["codex"] == cfg["runners"]["codex"]
+
+
+def test_put_templates_runner_keepalive_text_rejects_bad_shapes(authed, ns_home):
+    cfg = store.load_config()
+    cfg["runners"] = {"claude": {"bin": "claude", "models": {}, "efforts": ["high"]}}
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    status, _, _ = authed.request("PUT", "/api/templates", {"runner_keepalive_text": "不是对象"})
+    assert status == 400
+    status, _, _ = authed.request("PUT", "/api/templates", {"runner_keepalive_text": {"deepseek": "x"}})
+    assert status == 400
+    status, _, _ = authed.request("PUT", "/api/templates", {"runner_keepalive_text": {"claude": 123}})
+    assert status == 400
+    # codex 在这份 config.runners 里还没有真实分块（旧配置合成兼容视图不算）
+    status, _, body = authed.request("PUT", "/api/templates", {"runner_keepalive_text": {"codex": "x"}})
+    assert status == 400
+    assert "codex" in body["error"]
+
+
+def test_put_templates_runner_keepalive_text_requires_runners_block(authed):
+    """base CONFIG 没有 runners 键（旧式兼容配置）：拒绝而不是凭空造一个
+    只有 keepalive_text 的残缺分块（否则 store.runner_config 会把它当成
+    真实分块返回，丢失顶层 claude_bin/models/efforts 合成的兼容字段）。"""
+    status, _, body = authed.request("PUT", "/api/templates", {"runner_keepalive_text": {"claude": "x"}})
+    assert status == 400
+    assert "runners" in body["error"]
+
+
 # ---------- 预览与建任务 ----------
 
 
@@ -396,6 +468,53 @@ def test_create_task_value_errors_are_400(authed):
     )
     assert status == 400
     status, _, _ = authed.request("POST", "/api/tasks", {**base, "guards": "不是对象"})
+    assert status == 400
+
+
+# ---------- S8①：keepalive 表单落盘口 ----------
+
+
+def test_create_task_keepalive_default_and_explicit(authed):
+    task_id = make_task(authed, "缺省保活")
+    assert store.load_task(task_id)["keepalive"] == {"enabled": True}
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "关保活", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+        "keepalive": {"enabled": False},
+    })
+    assert status == 201, body
+    assert store.load_task(body["id"])["keepalive"] == {"enabled": False}
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "坏保活", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+        "keepalive": "不是对象",
+    })
+    assert status == 400
+
+
+def test_update_task_keepalive_editable_unrun_only(authed):
+    task_id = make_task(authed, "未跑改保活")
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {
+        "keepalive": {"enabled": False},
+    })
+    assert status == 200, body
+    assert store.load_task(task_id)["keepalive"] == {"enabled": False}
+    # 活跃态：keepalive 不在允许字段里，走 /keepalive 控制 API 而不是 PUT
+    store.update_status(task_id, state="working")
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {
+        "keepalive": {"enabled": True},
+    })
+    assert status == 400
+    assert store.load_task(task_id)["keepalive"] == {"enabled": False}
+
+
+def test_update_task_keepalive_rejects_extra_key(authed):
+    task_id = make_task(authed, "坏形状")
+    status, _, _ = authed.request("PUT", f"/api/tasks/{task_id}", {
+        "keepalive": {"enabled": True, "idle_minutes": 5},
+    })
     assert status == 400
 
 
@@ -2191,3 +2310,107 @@ def test_pipeline_fix_now_respects_round_limit(authed):
         "POST", f"/api/tasks/{build_id}/fix-now", {"instruction": "再改改"}
     )
     assert status == 409 and "到线" in body["error"]
+
+
+# ---------- S8①：GET /api/tasks/<id>/pipeline 只读展示快照 ----------
+
+
+def test_pipeline_detail_404_unknown_task(authed):
+    status, _, body = authed.request("GET", "/api/tasks/20260101-000000-dead/pipeline")
+    assert status == 404
+
+
+def test_pipeline_detail_basic_shape_and_effective_runner_model(authed):
+    build_id, review_id = make_review_pipeline(authed, build_state="held", review_state="working")
+    status, _, body = authed.request("GET", f"/api/tasks/{review_id}/pipeline")  # 任一成员 id 都能查
+    assert status == 200, body
+    assert body["pipeline_id"] == build_id
+    assert body["branch"] == "ns/x"
+    ids = {m["id"]: m for m in body["members"]}
+    assert set(ids) == {build_id, review_id}
+    assert ids[build_id]["role"] == "build"
+    assert ids[build_id]["state"] == "held"
+    assert ids[build_id]["runner"] == "claude"
+    assert ids[build_id]["checkpoint_sha"] == "a" * 40
+    assert ids[review_id]["role"] == "review"
+    assert ids[review_id]["state"] == "working"
+    assert ids[review_id]["runner"] == "claude"
+    # 展示 API 绝不透传本机路径/线程 id/后台细节
+    dumped = json.dumps(body)
+    assert "worktree_path" not in dumped
+    assert "/tmp/wt" not in dumped
+    assert "review_file" not in dumped
+    assert "handover_path" not in dumped
+
+
+def test_pipeline_detail_reads_handover_and_review_files_by_fixed_name_only(authed):
+    build_id, review_id = make_review_pipeline(authed, build_state="held", review_state="idle")
+    (store.task_dir(build_id) / "handover-1.md").write_text("第一班交接：把 A 做完了", encoding="utf-8")
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("看起来不错。\n\nNEXT: done", encoding="utf-8")
+    store.update_status(review_id, review_verdict="done", review_file=str(review_file))
+    # status 里塞一个指向任务目录之外的坏路径，绝不能被当成"实际要读的文件"
+    store.update_status(review_id, review_file=str(Path("/etc/passwd")))
+    store.update_status(review_id, review_verdict="done")
+
+    status, _, body = authed.request("GET", f"/api/tasks/{build_id}/pipeline")
+    assert status == 200
+    members = {m["id"]: m for m in body["members"]}
+    assert members[build_id]["handovers"] == [{"shift": 1, "text": "第一班交接：把 A 做完了"}]
+    assert members[review_id]["review"] == {
+        "round": 1, "verdict": "done", "text": "看起来不错。\n\nNEXT: done",
+    }
+
+
+def test_pipeline_detail_missing_docs_show_as_absent_not_500(authed):
+    build_id, review_id = make_review_pipeline(authed, build_state="held", review_state="idle")
+    status, _, body = authed.request("GET", f"/api/tasks/{build_id}/pipeline")
+    assert status == 200
+    members = {m["id"]: m for m in body["members"]}
+    assert members[build_id]["handovers"] == []
+    assert "review" not in members[review_id]  # 没有 verdict 也没有文件
+
+
+def test_pipeline_detail_caps_and_replaces_bad_utf8(authed):
+    build_id, review_id = make_review_pipeline(authed, build_state="held", review_state="idle")
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_bytes(b"NEXT: fix \xff\xfe" + b"a" * (300 * 1024))
+    store.update_status(review_id, review_verdict="fix", review_file=str(review_file))
+
+    status, _, body = authed.request("GET", f"/api/tasks/{build_id}/pipeline")
+    assert status == 200
+    text = next(m for m in body["members"] if m["id"] == review_id)["review"]["text"]
+    assert len(text.encode("utf-8", errors="replace")) <= 200 * 1024 + 8  # 替换字符可能变宽
+    assert "�" in text  # 坏字节被替换，不是 500
+
+
+def test_pipeline_detail_checkpoint_history_plus_current_round(authed):
+    build_id, review_id = make_review_pipeline(authed, build_state="held", review_state="idle")
+    store.update_status(build_id, checkpoint_history=[{"round": 1, "sha": "b" * 40}])
+    status, _, body = authed.request("GET", f"/api/tasks/{build_id}/pipeline")
+    assert status == 200
+    build_member = next(m for m in body["members"] if m["id"] == build_id)
+    assert build_member["checkpoints"] == [
+        {"round": 1, "sha": "b" * 40}, {"round": 1, "sha": "a" * 40},
+    ] or build_member["checkpoints"] == [{"round": 1, "sha": "b" * 40}]
+    # round 相同（都是 1）时不重复：history 里已有 round 1，当前轮不再重复追加
+    assert len(build_member["checkpoints"]) == 1
+
+
+def test_pipeline_detail_multiple_working_sets_warning(authed):
+    build_id, review_id = make_review_pipeline(authed, build_state="working", review_state="working")
+    status, _, body = authed.request("GET", f"/api/tasks/{build_id}/pipeline")
+    assert status == 200
+    assert "warning" in body
+
+
+def test_pipeline_detail_old_pipeline_falls_back_to_root_id(authed):
+    """S7 之前落盘的旧任务没有 pipeline_id 字段：只读兼容按 root_id 分组。"""
+    task_id = make_task(authed, "旧任务无pipeline_id")
+    task = store.load_task(task_id)
+    task.pop("pipeline_id", None)
+    store.atomic_write_json(store.task_dir(task_id) / "task.json", task)
+    status, _, body = authed.request("GET", f"/api/tasks/{task_id}/pipeline")
+    assert status == 200
+    assert body["pipeline_id"] == task_id
+    assert [m["id"] for m in body["members"]] == [task_id]

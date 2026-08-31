@@ -124,6 +124,9 @@
   "review_stop_build_text": "来自nightshift：审稿已经通过（NEXT: done），这条流水线收尾了，请停下不要再继续动代码。",
   "hold_text": "来自nightshift：工头要来看，停在这里别再动代码；有人问再答。",
   "resume_text": "来自nightshift：继续刚才的活。",
+  "review_resume_text": "来自nightshift：额度应已刷新，请继续完成这一轮审稿——结束时仍然只用 NEXT: done / NEXT: fix / NEXT: pending 三选一。",
+  "review_hold_resume_text": "来自nightshift：工头看完了，继续这一轮审稿——结束时仍然只用 NEXT: done / NEXT: fix / NEXT: pending 三选一。",
+  "build_hold_resume_text": "来自nightshift：工头看完了，继续刚才的工作——收工时照常写交接，末行 NEXT: done 或 NEXT: continue。",
   "warmup": {
     "enabled": false,
     "time_local": "07:00",

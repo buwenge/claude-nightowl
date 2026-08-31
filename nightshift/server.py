@@ -38,6 +38,12 @@ COOKIE_NAME = "ns_auth"
 CSRF_HEADER = "X-Requested-With"
 CSRF_VALUE = "nightshift"
 MAX_BODY_BYTES = 256 * 1024
+# S8：流水线展示 API 里每份交接/审稿意见正文的读取上限，防一份异常大的
+# 文件（或被写坏的文件）拖垮整条流水线的展示请求
+_PIPELINE_DOC_MAX_BYTES = 200 * 1024
+# 只认这个形状的文件名，不接受前端传路径、不跟 status 里任何字段拼路径
+_RE_HANDOVER_FILE = re.compile(r"^handover-([1-9][0-9]*)\.md$")
+_RE_REVIEW_FILE = re.compile(r"^review-([1-9][0-9]*)\.md$")
 
 # 任务 id 只认这个形状，杜绝路径拼接
 _TASK_ID_RE = r"[0-9]{8}-[0-9]{6}-[0-9a-f]{4}"
@@ -49,6 +55,8 @@ _RE_TASK_ACTION = re.compile(
 _RE_PIPELINE_ACTION = re.compile(
     rf"^/api/tasks/({_TASK_ID_RE})/(hold|continue|keepalive|review-now|skip-review|fix-now)$"
 )
+# S8：流水线只读展示快照，同样接受任一成员 task id
+_RE_PIPELINE_DETAIL = re.compile(rf"^/api/tasks/({_TASK_ID_RE})/pipeline$")
 _RE_TASK_MESSAGE = re.compile(rf"^/api/tasks/({_TASK_ID_RE})/message$")
 _RE_TASK_SESSION = re.compile(
     rf"^/api/tasks/({_TASK_ID_RE})/(interrupt|stop-background)$"
@@ -83,6 +91,7 @@ _EDITABLE_UNRUN = (
     "title", "project", "runner", "model", "effort", "run_at",
     "task_text", "prompt_final", "guards", "chain", "trigger",
     "worktree", "review",  # S5：没起跑还能改工作树/审稿占位形状
+    "keepalive",  # S8：长期保活开关——只在未跑状态可改，活跃态走 /keepalive 控制 API
 )
 # 活跃状态（launching/working/waiting_background/waiting_wakeup/idle）：
 # 只许改标题/任务内容/额度与上下文线/换班设置/触发方式
@@ -161,6 +170,67 @@ def _background_summary(task_id: str) -> dict:
         if r.get("state") in ("finished", "stopped") and r.get("notification_state") != "notified"
     )
     return {"running": running, "finished_pending": finished_pending}
+
+
+def _read_capped(path: Path) -> str:
+    """读一份文本文件，UTF-8 坏字节用替换字符，超过上限只截前一段——不因
+    一份坏文件/异常大文件让整条流水线的展示请求 500。文件不存在/读不了
+    返回空串。"""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    if len(data) > _PIPELINE_DOC_MAX_BYTES:
+        data = data[:_PIPELINE_DOC_MAX_BYTES]
+    return data.decode("utf-8", errors="replace")
+
+
+def _member_handovers(task_id: str) -> list[dict]:
+    """这一班（通常是可能横跨多个 shift 的 build）目录下所有
+    handover-<shift>.md，按 shift 升序——只按固定文件名形状枚举目录，不接
+    受前端传路径、不跟 status 里的 handover_path 字段拼。"""
+    out: list[dict] = []
+    d = store.task_dir(task_id)
+    if not d.is_dir():
+        return out
+    for entry in d.iterdir():
+        m = _RE_HANDOVER_FILE.match(entry.name)
+        if m and entry.is_file():
+            out.append({"shift": int(m.group(1)), "text": _read_capped(entry)})
+    out.sort(key=lambda item: item["shift"])
+    return out
+
+
+def _member_checkpoints(task: dict, status: dict) -> list[dict]:
+    """这一班历次存档点短记录：checkpoint_history（上一轮及更早，_review_fix
+    原地复用 build 时归档）+ 当前轮次的 checkpoint_sha（如果已存档）。"""
+    out: list[dict] = []
+    for item in status.get("checkpoint_history") or []:
+        sha = item.get("sha")
+        if sha:
+            out.append({"round": int(item.get("round") or 0), "sha": str(sha)})
+    cur_sha = status.get("checkpoint_sha")
+    if cur_sha and status.get("checkpoint_done"):
+        cur_round = store.round_of(task)
+        if not any(item["round"] == cur_round for item in out):
+            out.append({"round": cur_round, "sha": str(cur_sha)})
+    out.sort(key=lambda item: item["round"])
+    return out
+
+
+def _member_review(task: dict, status: dict) -> dict | None:
+    """review 角色这一轮的审稿意见：只读固定文件名 review-<round>.md，不
+    读 status.review_file 里记的路径（那是本机绝对路径，且理论上可能被
+    改坏指向任务目录之外）。没意见也没 verdict 就不给这个键。"""
+    if store.role_of(task) != "review":
+        return None
+    round_ = store.round_of(task)
+    verdict = status.get("review_verdict")
+    review_file = store.task_dir(task["id"]) / f"review-{round_}.md"
+    text = _read_capped(review_file) if review_file.is_file() else None
+    if verdict is None and text is None:
+        return None
+    return {"round": round_, "verdict": verdict, "text": text or ""}
 
 
 def _version_assets(html: bytes) -> bytes:
@@ -386,6 +456,11 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._require_auth():
                 return
             return self._api_screen(match.group(1))
+        match = _RE_PIPELINE_DETAIL.match(path)
+        if match:
+            if not self._require_auth():
+                return
+            return self._api_pipeline_detail(match.group(1))
         self._send_json(404, {"error": "没有这个路径"})
 
     # ---------- POST / PUT / DELETE 路由 ----------
@@ -526,6 +601,8 @@ class _Handler(BaseHTTPRequestHandler):
                     for mname, mspec in (rc.get("models") or {}).items()
                 },
                 "efforts": rc.get("efforts") or [],
+                # S8：模板页要能读改各自的保活探针文案
+                "keepalive_text": rc.get("keepalive_text"),
             }
             for name, rc in store.runner_config(cfg).items()
         }
@@ -557,6 +634,11 @@ class _Handler(BaseHTTPRequestHandler):
             "review_stop_build_text": cfg.get("review_stop_build_text", ""),
             "hold_text": cfg.get("hold_text", ""),
             "resume_text": cfg.get("resume_text", ""),
+            # S8：S7.1–S7.4 真正在读的三条恢复文案（语义各不相同，旧
+            # resume_text 是审稿额度刷新恢复，不能拿来冒充这三条）
+            "review_resume_text": cfg.get("review_resume_text", ""),
+            "review_hold_resume_text": cfg.get("review_hold_resume_text", ""),
+            "build_hold_resume_text": cfg.get("build_hold_resume_text", ""),
             # S7①：config.review 的默认值（max_rounds/on_no_quota/merge_policy），
             # 新建页折叠区要展示；缺整个对象时走代码 fallback（跟 store.review_config 一致）
             "review_defaults": {
@@ -577,6 +659,8 @@ class _Handler(BaseHTTPRequestHandler):
         "codex_quota_pause_text", "codex_resume_text", "codex_stop_background_text",
         "review_template", "review_fix_template", "review_criteria_text",
         "review_wrapup_text", "review_stop_build_text", "hold_text", "resume_text",
+        # S8
+        "review_resume_text", "review_hold_resume_text", "build_hold_resume_text",
     )
 
     def _api_templates(self) -> None:
@@ -584,15 +668,52 @@ class _Handler(BaseHTTPRequestHandler):
         if data is None:
             return
         updates = {k: data[k] for k in self._TEMPLATE_KEYS if k in data}
-        if not updates:
-            return self._send_json(400, {"error": "没有要改的模板键"})
         for key, value in updates.items():
             if not isinstance(value, str):
                 return self._send_json(400, {"error": f"{key} 必须是字符串"})
+        # S8：runners.<runner>.keepalive_text 的安全读改映射——先读整份
+        # config，只深更新目标 runner 的 keepalive_text 一个键，不覆盖
+        # bin/models/efforts/profile/keepalive 间隔或其他 runner；目标
+        # runner 在 config.runners 里还没有真实分块（旧配置的兼容合成
+        # 视图）时拒绝，不能凭空造一个只有 keepalive_text 的残缺分块。
+        runner_kt = data.get("runner_keepalive_text")
+        if runner_kt is not None:
+            if not isinstance(runner_kt, dict):
+                return self._send_json(400, {"error": "runner_keepalive_text 必须是对象"})
+            bad_runner = sorted(set(runner_kt) - set(store.RUNNERS))
+            if bad_runner:
+                return self._send_json(
+                    400,
+                    {"error": f"runner_keepalive_text 只认 {'/'.join(store.RUNNERS)}，"
+                              f"多出：{'、'.join(bad_runner)}"},
+                )
+            for value in runner_kt.values():
+                if not isinstance(value, str):
+                    return self._send_json(400, {"error": "runner_keepalive_text 的值必须是字符串"})
+        if not updates and not runner_kt:
+            return self._send_json(400, {"error": "没有要改的模板键"})
         cfg = store.load_config()  # 先读全量再改，别的键一个不碰
+        if runner_kt:
+            raw_runners = cfg.get("runners")
+            if not isinstance(raw_runners, dict):
+                return self._send_json(400, {"error": "config 还没有 runners 分块，不能改 keepalive_text"})
+            runners = dict(raw_runners)
+            for runner_name, text in runner_kt.items():
+                block = runners.get(runner_name)
+                if not isinstance(block, dict):
+                    return self._send_json(
+                        400, {"error": f"config.runners 里还没有 {runner_name} 分块，不能改 keepalive_text"}
+                    )
+                block = dict(block)
+                block["keepalive_text"] = text
+                runners[runner_name] = block
+            cfg["runners"] = runners
         cfg.update(updates)
         store.atomic_write_json(store.home() / "config.json", cfg)
-        logger.info("模板已更新：%s", "、".join(updates))
+        logger.info(
+            "模板已更新：%s",
+            "、".join(list(updates) + (["runners.*.keepalive_text"] if runner_kt else [])),
+        )
         return self._send_json(200, {"ok": True})
 
     def _api_warmup(self) -> None:
@@ -705,7 +826,7 @@ class _Handler(BaseHTTPRequestHandler):
         }
         if data.get("runner") is not None:
             task["runner"] = data["runner"]
-        for key in ("guards", "chain", "trigger", "review"):
+        for key in ("guards", "chain", "trigger", "review", "keepalive"):
             if data.get(key) is not None:
                 if not isinstance(data[key], dict):
                     return self._send_json(400, {"error": f"{key} 必须是对象"})
@@ -1016,6 +1137,73 @@ class _Handler(BaseHTTPRequestHandler):
             item for item in store.list_tasks()
             if store.pipeline_id_of(item["task"]) == pipeline_id
         ]
+
+    def _api_pipeline_detail(self, task_id: str) -> None:
+        """S8：流水线只读展示快照——专供前端渲染，不带本机路径/线程 id/
+        transcript/后台 argv 等敏感字段（见开工令"展示契约"）。
+
+        排序按（全局单调 shift、role、id）稳定排列；runner/model/effort 一律
+        走 effective_* 权威源，不直接读 task["runner"]（review 班要展示自己
+        的工人，不能显示成施工方的）。同一时刻多个 working 成员只标一条
+        warning，不改任何状态、不开告警窗。
+        """
+        pipeline_id = self._resolve_pipeline(task_id)
+        if pipeline_id is None:
+            return
+        members_raw = sorted(
+            self._pipeline_members(pipeline_id),
+            key=lambda item: (
+                int(item["task"].get("shift") or 1),
+                store.role_of(item["task"]),
+                item["task"]["id"],
+            ),
+        )
+        coordinator = store.read_status(pipeline_id)
+        branch = coordinator.get("branch")
+        if not branch:
+            for item in members_raw:
+                if (item["status"] or {}).get("branch"):
+                    branch = item["status"]["branch"]
+                    break
+
+        members = []
+        working = 0
+        for item in members_raw:
+            t, s = item["task"], item["status"] or {}
+            if s.get("state") == "working":
+                working += 1
+            entry = {
+                "id": t["id"],
+                "role": store.role_of(t),
+                "round": store.round_of(t),
+                "shift": int(t.get("shift") or 1),
+                "runner": store.effective_runner(t),
+                "model": store.effective_model(t),
+                "effort": store.effective_effort(t),
+                "state": s.get("state"),
+                "keepalive_paused": bool(s.get("keepalive_paused")),
+                "checkpoint_sha": s.get("checkpoint_sha"),
+                "checkpoints": _member_checkpoints(t, s),
+            }
+            if store.role_of(t) == "build":
+                entry["handovers"] = _member_handovers(t["id"])
+            else:
+                review = _member_review(t, s)
+                if review is not None:
+                    entry["review"] = review
+            members.append(entry)
+
+        out = {
+            "pipeline_id": pipeline_id,
+            "phase": coordinator.get("pipeline_phase"),
+            "hold_requested": bool(coordinator.get("hold_requested")),
+            "fix_count": int(coordinator.get("fix_count") or 0),
+            "branch": branch,
+            "members": members,
+        }
+        if working > 1:
+            out["warning"] = "这条流水线同时有多个班处于 working，展示可能不一致"
+        return self._send_json(200, out)
 
     def _api_pipeline_hold(self, task_id: str) -> None:
         """我来看：幂等设置 pipeline hold，向当前活窗口各敲一次 hold_text。

@@ -380,6 +380,49 @@ def test_worktree_review_validation_rejects_bad_shapes():
             store.create_task(make_task(**over), CONFIG)
 
 
+# ---------- S8：keepalive 表单落盘口 ----------
+
+
+def test_new_task_keepalive_defaults_to_enabled_true():
+    tid = store.create_task(make_task(), CONFIG)
+    assert store.load_task(tid)["keepalive"] == {"enabled": True}
+
+
+def test_create_task_keepalive_explicit_false_persists():
+    tid = store.create_task(make_task(keepalive={"enabled": False}), CONFIG)
+    assert store.load_task(tid)["keepalive"] == {"enabled": False}
+
+
+def test_create_task_keepalive_missing_enabled_key_defaults_true():
+    # {} 是合法形状（只认 enabled 一个键，不要求必给）；create_task 归一成
+    # 显式 true，不留下"给了 keepalive 对象但没有 enabled"的暧昧半吊子形状
+    tid = store.create_task(make_task(keepalive={}), CONFIG)
+    assert store.load_task(tid)["keepalive"] == {"enabled": True}
+
+
+def test_keepalive_validation_rejects_bad_shapes():
+    for over in (
+        {"keepalive": "true"},
+        {"keepalive": True},
+        {"keepalive": {"enabled": "yes"}},
+        {"keepalive": {"enabled": True, "idle_minutes": 10}},  # 只认 enabled 一个键
+    ):
+        with pytest.raises(ValueError):
+            store.create_task(make_task(**over), CONFIG)
+
+
+def test_old_task_json_missing_keepalive_stays_absent():
+    """旧任务（S8 上线前落盘）没有 keepalive 字段——不加载即回写，
+    scheduler._maybe_keepalive 读不到时按 guards.keepalive 的兜底走。"""
+    tid = store.create_task(make_task(), CONFIG)
+    task = store.load_task(tid)
+    del task["keepalive"]
+    store.atomic_write_json(store.task_dir(tid) / "task.json", task)
+    task = store.load_task(tid)
+    assert "keepalive" not in task
+    store.validate_task(task, CONFIG, task_id=tid)  # 缺字段仍合法
+
+
 def test_review_enabled_requires_worktree_and_valid_reviewer():
     config = dict(CONFIG)
     config["runners"] = {
