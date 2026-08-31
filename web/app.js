@@ -12,6 +12,8 @@ var HIGHLIGHT_ID = null;   // 新建成功后要高亮的任务
 var SCREEN_TASK = null;    // 正在看屏幕的任务 {id, title}
 var EDIT_TASK = null;      // 正在编辑的任务 {id, item, active}；null = 新建模式
 var MSG_TASK = null;       // 正在捎话的任务 {id, title}
+var FIXNOW_TASK = null;    // 正在"直接返工"的流水线 {id, title}（id 是 coordinator）
+var PIPELINE_DETAIL_CACHE = {};  // pipeline_id -> {loading:true} | {data: {...}}（按 pipeline_id 缓存，避免 5 秒重画重复请求）
 var screenTimer = null;
 var previewTimer = null;
 var LAST_ITEMS = [];       // 上一次 /api/tasks 的原始结果，供日期筛选本地重画用
@@ -129,10 +131,16 @@ var STATE_TEXT = {
   waiting_background: "等背景任务", waiting_wakeup: "等闹钟", idle: "一轮干完", chained: "已续班",
   exited: "已退出", finished: "已完成", failed: "已失败",
   cancelled: "已取消", needs_attention: "需要人工", chain_exhausted: "班次用尽",
-  awaiting_merge: "等你合并", merged: "已合并", discarded: "已丢弃"
+  awaiting_merge: "等你合并", merged: "已合并", discarded: "已丢弃",
+  held: "等待中"  // S7 引入；有 review 的流水线优先显示 pipelinePhaseInfo() 的阶段签
 };
 
-var ACTIVE_STATES = ["launching", "working", "waiting_background", "waiting_wakeup", "idle"];
+// S8③：held（S7 起流水线常见——build 收工等审稿 / review 等 build 返工 /
+// "我来看"打断后停在这里）会话仍活着只是明确不施工，跟 launching/working
+// 等一样算"活跃"：影响列表排序分组、编辑表单该走未跑全字段还是活跃四字段、
+// 中止/停后台按钮是否出现。旧版这里漏了 held，held 任务编辑会被服务器
+// 按活跃态口径 400（EDITABLE_ACTIVE 之外的字段）。
+var ACTIVE_STATES = ["launching", "working", "waiting_background", "waiting_wakeup", "idle", "held"];
 var RUNNOW_STATES = ["scheduled", "postponed", "failed", "cancelled"];
 var CANCEL_STATES = ["scheduled", "postponed"];
 var TERMINAL_STATES = ["exited", "finished", "failed", "cancelled",
@@ -356,7 +364,8 @@ function saveWarmup() {
     .catch(function () {});
 }
 
-function taskActions(item, chainIds) {
+function taskActions(item, chainIds, opts) {
+  opts = opts || {};
   var task = item.task, status = item.status;
   var state = status.state;
   var hasTree = !!status.worktree_path;
@@ -395,7 +404,9 @@ function taskActions(item, chainIds) {
     });
   }
   var live = status.window_id && !status.session_ended_at;  // 会话已关的窗口动不了
-  if (live) {
+  // S8③：审稿流水线可能同时有施工+审稿两扇活窗口，"看屏幕/捎话"改由
+  // pipelineWindowActions() 按角色分开出——这里不再重复出一份不分角色的。
+  if (live && !opts.suppressWindowActions) {
     add("看屏幕", "", function () { openScreen(task.id, task.title); });
     add("捎话", "", function () { openMsg(task.id, task.title, item.draft); });
   }
@@ -427,7 +438,7 @@ function taskActions(item, chainIds) {
     addDiscard();
     addKeep();
   }
-  if (ACTIVE_STATES.indexOf(state) >= 0 && live) {
+  if (ACTIVE_STATES.indexOf(state) >= 0 && live && !opts.suppressWindowActions) {
     add("中止", status.stuck ? "danger solid" : "danger", function () {
       if (!confirm("往窗口按一下 Esc？它会停下当前这轮，等你看了屏幕再说。")) return;
       api("POST", "./api/tasks/" + task.id + "/interrupt")
@@ -444,11 +455,287 @@ function taskActions(item, chainIds) {
   return box.childNodes.length ? box : null;
 }
 
+// S8③：同一条流水线可能同时有施工/审稿两扇活窗口，"看屏幕/捎话/中止/
+// 停后台"按角色分开出，绝不永远把最新一班当成唯一窗口、也不会敲错角色。
+function pipelineWindowActions(chain) {
+  var box = el("div", { class: "actions" });
+  function add(text, cls, handler) {
+    var btn = el("button", { type: "button", class: cls, text: text });
+    btn.addEventListener("click", function () {
+      btn.disabled = true;
+      btn.setAttribute("aria-busy", "true");
+      var p = handler();
+      var reset = function () { btn.disabled = false; btn.removeAttribute("aria-busy"); };
+      if (p && p.then) p.then(reset, reset); else reset();
+    });
+    box.appendChild(btn);
+  }
+  chain.shifts.forEach(function (item) {
+    var t = item.task, s = item.status || {};
+    var live = s.window_id && !s.session_ended_at;
+    if (!live) return;
+    var roleLabel = t.role === "review" ? "审稿" : "施工";
+    add("看" + roleLabel + "屏幕", "", function () {
+      openScreen(t.id, t.title + "（" + roleLabel + "）"); return null;
+    });
+    add("给" + roleLabel + "捎话", "", function () {
+      openMsg(t.id, t.title + "（" + roleLabel + "）", item.draft); return null;
+    });
+    if (ACTIVE_STATES.indexOf(s.state) >= 0) {
+      add("中止" + roleLabel, s.stuck ? "danger solid" : "danger", function () {
+        if (!confirm("往" + roleLabel + "窗口按一下 Esc？它会停下当前这轮，等你看了屏幕再说。")) return null;
+        return api("POST", "./api/tasks/" + t.id + "/interrupt")
+          .then(function () { banner("已发出，看屏幕确认"); refreshTasks(); })
+          .catch(function () {});
+      });
+      add("停" + roleLabel + "后台", "", function () {
+        if (!confirm("往" + roleLabel + "窗口敲停后台指令？")) return null;
+        return api("POST", "./api/tasks/" + t.id + "/stop-background")
+          .then(function () { banner("已发出，看屏幕确认"); refreshTasks(); })
+          .catch(function () {});
+      });
+    }
+  });
+  return box.childNodes.length ? box : null;
+}
+
+// ---------- S8③：六个流水线控制按钮 ----------
+
+function pipelineCoordinatorItem(chain) {
+  for (var i = 0; i < chain.shifts.length; i++) {
+    if (chain.shifts[i].task.id === chain.root) return chain.shifts[i];
+  }
+  return chain.shifts[0];
+}
+
+var PIPELINE_WRAPPED_STATES = ["finished", "merged", "discarded", "cancelled", "chain_exhausted"];
+
+// 前端只在"看起来可操作"的状态出按钮，不复制一套后端授权机——真正的
+// 权限/状态矩阵仍由后端六个控制 API 判，这里判错了顶多按钮出现/消失得不
+// 准，点了照样会拿到后端的 409/207 真实反馈（见各按钮 handler 的错误处理）。
+function pipelineControlActions(chain) {
+  var box = el("div", { class: "actions" });
+  function add(text, cls, handler) {
+    var btn = el("button", { type: "button", class: cls, text: text });
+    btn.addEventListener("click", function () {
+      btn.disabled = true;
+      btn.setAttribute("aria-busy", "true");
+      var p = handler();
+      var reset = function () { btn.disabled = false; btn.removeAttribute("aria-busy"); };
+      if (p && p.then) p.then(reset, reset); else reset();
+    });
+    box.appendChild(btn);
+  }
+  var coordId = chain.root;
+  var coordStatus = (pipelineCoordinatorItem(chain).status) || {};
+  var wrapped = chain.shifts.length > 0 && chain.shifts.every(function (it) {
+    return PIPELINE_WRAPPED_STATES.indexOf((it.status || {}).state) >= 0;
+  });
+
+  if (!wrapped && !coordStatus.hold_requested) {
+    add("我来看", "", function () {
+      if (!confirm("工头要来看：会往当前活窗口敲一句让它停在这里，不会 Esc 打断正在跑的工具调用。继续？")) return null;
+      return api("POST", "./api/tasks/" + coordId + "/hold")
+        .then(function () { banner("已请求，活窗口稍后会停下"); refreshTasks(); })
+        .catch(function () {});
+    });
+  }
+  if (coordStatus.hold_requested || coordStatus.pipeline_phase === "round_limit") {
+    add("继续", "primary", function () {
+      return api("POST", "./api/tasks/" + coordId + "/continue")
+        .then(function () { banner("已发出继续"); refreshTasks(); })
+        .catch(function () { refreshTasks(); });
+    });
+  }
+
+  var keepaliveEligible = chain.shifts.filter(function (it) {
+    return ["held", "waiting_background"].indexOf((it.status || {}).state) >= 0;
+  });
+  if (keepaliveEligible.length) {
+    var anyPaused = keepaliveEligible.some(function (it) { return !!(it.status || {}).keepalive_paused; });
+    add(anyPaused ? "恢复保活" : "暂停保活", "", function () {
+      return api("POST", "./api/tasks/" + coordId + "/keepalive", { paused: !anyPaused })
+        .then(function (data) {
+          if (data && data.failed_targets && data.failed_targets.length) {
+            banner("部分失败：" + data.failed_targets.join("、"));
+          } else {
+            banner(anyPaused ? "已恢复保活" : "已暂停保活");
+          }
+          refreshTasks();
+        })
+        .catch(function () { refreshTasks(); });
+    });
+  }
+
+  var postponedReview = chain.shifts.some(function (it) {
+    return it.task.role === "review" && (it.status || {}).state === "postponed";
+  });
+  if (postponedReview) {
+    add("现在就审", "", function () {
+      return api("POST", "./api/tasks/" + coordId + "/review-now")
+        .then(function () { banner("已请求，仍要过完整额度预检"); refreshTasks(); })
+        .catch(function () {});
+    });
+  }
+
+  var reviewMembers = chain.shifts.filter(function (it) { return it.task.role === "review"; });
+  var currentReview = reviewMembers.length ? reviewMembers[reviewMembers.length - 1] : null;
+  var buildMembers = chain.shifts.filter(function (it) { return (it.task.role || "build") === "build"; });
+  var currentBuild = buildMembers.length ? buildMembers[buildMembers.length - 1] : null;
+  var somethingWorking = chain.shifts.some(function (it) { return (it.status || {}).state === "working"; });
+
+  if (currentBuild && (currentBuild.status || {}).state === "held" && (currentBuild.status || {}).checkpoint_done &&
+      (!currentReview || ["scheduled", "postponed"].indexOf((currentReview.status || {}).state) >= 0)) {
+    add("跳过审稿直接收工", "danger", function () {
+      if (!confirm("跳过这一轮审稿，直接按完工后的策略处理？")) return null;
+      return api("POST", "./api/tasks/" + coordId + "/skip-review")
+        .then(function (data) {
+          banner(data && data.merge_ok === false ? "已跳过审稿，但自动合并失败，请看详情" : "已跳过审稿");
+          refreshTasks();
+        })
+        .catch(function () { refreshTasks(); });
+    });
+  }
+
+  if (!somethingWorking && currentReview &&
+      ["scheduled", "postponed", "idle", "held"].indexOf((currentReview.status || {}).state) >= 0) {
+    add("直接返工", "", function () {
+      openFixNow(coordId, chain.latest.task.title); return null;
+    });
+  }
+
+  return box.childNodes.length ? box : null;
+}
+
+// ---------- S8③：直接返工弹层（独立于"给窗口捎话"草稿） ----------
+
+function openFixNow(id, title) {
+  FIXNOW_TASK = { id: id, title: title };
+  $("fixnow-title").textContent = "直接返工 · " + title;
+  $("fixnow-text").value = "";
+  $("fixnow-overlay").classList.add("show");
+  $("fixnow-text").focus();
+}
+
+function closeFixNow() {
+  FIXNOW_TASK = null;
+  $("fixnow-overlay").classList.remove("show");
+}
+
+function sendFixNow() {
+  if (!FIXNOW_TASK) return;
+  var text = $("fixnow-text").value;
+  api("POST", "./api/tasks/" + FIXNOW_TASK.id + "/fix-now", { instruction: text })
+    .then(function () { closeFixNow(); banner("已提交返工"); refreshTasks(); })
+    .catch(function () {});
+}
+
+// ---------- S8③：每轮详情（懒加载 + 按 pipeline_id 缓存） ----------
+
+var REVIEW_VERDICT_TEXT = { done: "通过", fix: "退回", pending: "未审完" };
+
+function renderPipelineDetail(body, data) {
+  body.textContent = "";
+  var refreshBtn = el("button", { type: "button", class: "ghost", text: "刷新详情", onclick: function () {
+    PIPELINE_DETAIL_CACHE[data.pipeline_id] = null;
+    loadPipelineDetail(data.pipeline_id, body);
+  } });
+  body.appendChild(refreshBtn);
+  var members = data.members || [];
+  var byRound = {};
+  members.forEach(function (m) {
+    var r = m.round || 1;
+    (byRound[r] = byRound[r] || []).push(m);
+  });
+  var rounds = Object.keys(byRound).map(Number).sort(function (a, b) { return a - b; });
+  if (!rounds.length) {
+    body.appendChild(el("p", { class: "hint", text: "还没有数据" }));
+    return;
+  }
+  rounds.forEach(function (r) {
+    var roundBox = el("div", { class: "pipeline-round" }, [el("h4", { text: "第 " + r + " 轮" })]);
+    byRound[r].forEach(function (m) {
+      if (m.role === "build") {
+        var handovers = m.handovers || [];
+        if (!handovers.length) {
+          roundBox.appendChild(el("p", { class: "hint", text: "这班没有交接" }));
+        } else {
+          handovers.forEach(function (h) {
+            roundBox.appendChild(el("div", { class: "pipeline-doc" }, [
+              el("div", { class: "hint", text: "第 " + h.shift + " 班交接" }),
+              el("pre", { text: h.text || "" })
+            ]));
+          });
+        }
+        (m.checkpoints || []).forEach(function (c) {
+          var full = c.sha || "";
+          roundBox.appendChild(el("div", {
+            class: "pipeline-doc mono", text: "📌 存档点 " + full.slice(0, 10) + "（点击复制完整 sha）",
+            onclick: function () {
+              copyText(full).then(function () { banner("完整 sha 已复制"); }, function () { banner("复制失败"); });
+            },
+          }));
+        });
+      } else {
+        var review = m.review;
+        if (!review) {
+          roundBox.appendChild(el("p", { class: "hint", text: "这轮还没有意见" }));
+        } else {
+          var verdictText = REVIEW_VERDICT_TEXT[review.verdict] || "未审完";
+          roundBox.appendChild(el("div", { class: "pipeline-doc" }, [
+            el("div", { class: "hint", text: "审稿意见（" + verdictText + "）" }),
+            el("pre", { text: review.text || "" })
+          ]));
+        }
+      }
+    });
+    body.appendChild(roundBox);
+  });
+}
+
+function loadPipelineDetail(pipelineId, body) {
+  var cached = PIPELINE_DETAIL_CACHE[pipelineId];
+  if (cached && cached.data) { renderPipelineDetail(body, cached.data); return; }
+  if (cached && cached.loading) return;
+  PIPELINE_DETAIL_CACHE[pipelineId] = { loading: true };
+  api("GET", "./api/tasks/" + pipelineId + "/pipeline").then(function (data) {
+    PIPELINE_DETAIL_CACHE[pipelineId] = { data: data };
+    renderPipelineDetail(body, data);
+  }).catch(function (err) {
+    PIPELINE_DETAIL_CACHE[pipelineId] = null;
+    body.textContent = "";
+    body.appendChild(el("p", { class: "warn-reason", text: "加载失败：" + err.message }));
+  });
+}
+
+// 只在用户首次展开时懒加载，按 pipeline_id 缓存；5 秒重画只是命中缓存
+// 重渲染，不会对每张卡造成 N+1 详情请求（同一 pipeline_id 缓存过就不重发）。
+function pipelineDetailPanel(chain) {
+  var body = el("div", { class: "pipeline-detail-body" }, [el("p", { class: "hint", text: "展开后加载…" })]);
+  var wrap = el("details", { class: "pipeline-detail" }, [
+    el("summary", { text: "流水线详情" }),
+    body
+  ]);
+  var key = "pdetail:" + chain.root;
+  if (UI_OPEN[key]) {
+    wrap.open = true;
+    loadPipelineDetail(chain.root, body);
+  }
+  wrap.addEventListener("toggle", function () {
+    UI_OPEN[key] = wrap.open;
+    if (wrap.open) loadPipelineDetail(chain.root, body);
+  });
+  return wrap;
+}
+
 // 一个任务的几班（root_id 相同）合成一条链：卡片以最新一班为准，里面列各班状态
+// S8③：按 pipeline_id 组链（S7 起 build/review 角色轮转仍是同一条链）；
+// 旧任务缺 pipeline_id 按 root_id 兼容，再缺按自身 id——跟
+// store.pipeline_id_of() 同一个兼容口径。
 function groupChains(items) {
   var byRoot = {};
   items.forEach(function (item) {
-    var root = item.task.root_id || item.task.id;
+    var root = item.task.pipeline_id || item.task.root_id || item.task.id;
     (byRoot[root] = byRoot[root] || []).push(item);
   });
   return Object.keys(byRoot).map(function (root) {
@@ -551,25 +838,69 @@ function renderTasks(items) {
   });
 }
 
+// S8③：八类阶段签——不直接拿"最新成员 state"充当整体阶段，靠 coordinator
+// （pipeline_id 对应那个任务，永远是 chain.shifts 里 id===chain.root 的那个）
+// 的 hold_requested/pipeline_phase 加上当前一代 build/review 成员统一导出。
+// 只有开着联动审稿的流水线才导出阶段签；纯施工任务返回 null，卡片仍用
+// 原始 STATE_TEXT[state] 文案（不变）。
+function pipelinePhaseInfo(chain) {
+  var reviewRecipe = chain.latest.task.review || {};
+  if (!reviewRecipe.enabled) return null;
+  var latestState = (chain.latest.status || {}).state;
+  if (latestState === "merged") return { text: "已合并", cls: "st-merged" };
+  if (latestState === "discarded") return { text: "已丢弃", cls: "st-discarded" };
+  var coord = (pipelineCoordinatorItem(chain).status) || {};
+  if (coord.hold_requested) return { text: "等你来看", cls: "st-held" };
+  var phase = coord.pipeline_phase;
+  if (phase === "round_limit") return { text: "返工次数到线（等你继续）", cls: "st-needs_attention" };
+  if (phase === "reviewing") {
+    var reviews = chain.shifts.filter(function (it) { return it.task.role === "review"; });
+    var current = reviews.length ? reviews[reviews.length - 1] : null;
+    if (current && (current.status || {}).state === "postponed") {
+      return { text: "等审稿额度", cls: "st-postponed" };
+    }
+    return { text: "审稿中", cls: "st-working" };
+  }
+  if (phase === "build") {
+    var builds = chain.shifts.filter(function (it) { return (it.task.role || "build") === "build"; });
+    var b = builds.length ? builds[builds.length - 1] : null;
+    return { text: "返工中（第 " + (b ? (b.task.round || 1) : 1) + " 轮）", cls: "st-working" };
+  }
+  if (phase === "held") return { text: "等你来看", cls: "st-held" };
+  if (phase === "done") return { text: "等你合并", cls: "st-awaiting_merge" };
+  if (phase === "stop_failed") return { text: "收尾失败，需要人工", cls: "st-needs_attention" };
+  return null;
+}
+
 function chainCard(chain, now) {
   var ids = chain.shifts.map(function (it) { return it.task.id; });
-  var card = taskCard(chain.latest, now, ids);
+  var hasReview = !!(chain.latest.task.review && chain.latest.task.review.enabled);
+  var phaseInfo = pipelinePhaseInfo(chain);
+  var card = taskCard(chain.latest, now, ids, { suppressWindowActions: hasReview, phaseInfo: phaseInfo });
   if (chain.shifts.length > 1) {
     var row = el("div", { class: "shifts" });
     chain.shifts.forEach(function (it, i) {
       var st = it.status.state || "-";
       row.appendChild(el("span", { class: "shift-item" }, [
-        el("span", { text: "第 " + (it.task.shift || i + 1) + " 班 " }),
+        el("span", { text: "第 " + (it.task.shift || i + 1) + " 班 " + (it.task.role === "review" ? "（审）" : "") }),
         el("span", { class: "chip st-" + st, text: STATE_TEXT[st] || st })
       ]));
     });
     // 插在标题行之后
     card.insertBefore(row, card.children[1]);
   }
+  if (hasReview) {
+    var winActions = pipelineWindowActions(chain);
+    if (winActions) card.appendChild(winActions);
+    var ctrlActions = pipelineControlActions(chain);
+    if (ctrlActions) card.appendChild(ctrlActions);
+    card.appendChild(pipelineDetailPanel(chain));
+  }
   return card;
 }
 
-function taskCard(item, now, chainIds) {
+function taskCard(item, now, chainIds, opts) {
+  opts = opts || {};
   var task = item.task, status = item.status;
   var state = status.state || "-";
   var runner = task.runner || "claude";
@@ -577,11 +908,16 @@ function taskCard(item, now, chainIds) {
   var card = el("article", { class: "card" + (task.id === HIGHLIGHT_ID ? " flash" : "") });
 
   var headKids = [
-    el("span", { class: "chip st-" + state, text: STATE_TEXT[state] || state }),
-    el("span", { class: "chip runner-chip", text: "施工：" + runnerLabel + " · " + task.model }),
+    el("span", { class: "chip st-" + state, text: STATE_TEXT[state] || state })
+  ];
+  if (opts.phaseInfo) {
+    headKids.push(el("span", { class: "chip phase-chip " + opts.phaseInfo.cls, text: opts.phaseInfo.text }));
+  }
+  headKids.push(
+    el("span", { class: "chip runner-chip", text: "施工：" + runnerLabel + " · " + task.model + " · " + task.effort }),
     el("span", { class: "task-title", text: task.title }),
     el("span", { class: "task-id", text: task.id })
-  ];
+  );
   if (status.stuck) {  // S4①：疑似卡住——黄色徽章 + 中止按钮高亮（见 taskActions）
     var mins = status.stuck_since ?
       Math.max(0, Math.round((now - new Date(status.stuck_since)) / 60000)) : 0;
@@ -595,6 +931,15 @@ function taskCard(item, now, chainIds) {
     metaText += " · 会话 …" + String(status.thread_id).slice(-8);
   }
   card.appendChild(el("div", { class: "task-meta", text: metaText }));
+
+  // S8③：卡头固定两行——开审稿才显示这一行"审稿：<工人> · <模型> · <档位>"，
+  // review 对象跟顶层 runner/model/effort 一样由 _copy_common_fields 复制
+  // 到流水线每个成员，latest 成员上读到的就是这条流水线唯一的审稿配方。
+  if (task.review && task.review.enabled) {
+    var reviewRunnerLabel = task.review.runner === "codex" ? "Codex" : "Claude Code";
+    card.appendChild(el("div", { class: "task-meta review-meta",
+      text: "审稿：" + reviewRunnerLabel + " · " + task.review.model + " · " + task.review.effort }));
+  }
 
   // S6⑤：Codex 额度到线等刷新的具体时间点；waiting_wakeup 对 Claude 走
   // ScheduleWakeup（会话自己缓存闹钟），不落 quota_paused_until，这条只对
@@ -708,7 +1053,7 @@ function taskCard(item, now, chainIds) {
     card.appendChild(det);
   }
 
-  var actions = taskActions(item, chainIds);
+  var actions = taskActions(item, chainIds, opts);
   if (actions) card.appendChild(actions);
   return card;
 }
@@ -1308,6 +1653,9 @@ function start() {
   $("btn-msg-send").addEventListener("click", sendMessage);
   $("btn-msg-save").addEventListener("click", saveDraft);
   $("btn-msg-delete").addEventListener("click", deleteDraft);
+  // S8③：直接返工弹层——独立于捎话弹层，不共用 MSG_TASK/草稿状态
+  $("btn-fixnow-close").addEventListener("click", closeFixNow);
+  $("btn-fixnow-send").addEventListener("click", sendFixNow);
   $("btn-logout").addEventListener("click", function () {
     if (!confirm("退出登录？之后打开夜班页要重新输口令。要回主站首页请用左上角的链接。")) return;
     api("POST", "./api/logout").catch(function () {}).then(function () {

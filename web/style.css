@@ -196,6 +196,10 @@ input:focus, select:focus, textarea:focus, button:focus-visible {
 .chip.st-awaiting_merge { background: var(--warn); color: #201a00; }
 .chip.st-merged { background: var(--ok); }
 .chip.st-discarded { background: var(--chip-cancel); }
+/* S7/S8③：held（会话活着但明确不施工，等审稿/等返工/"我来看"打断）+
+   阶段签复用同色但另开一类，跟原始 state chip 区分开 */
+.chip.st-held { background: var(--purple); }
+.chip.phase-chip { border: 1px solid rgba(255,255,255,0.5); }
 
 .task-when { font-size: 15px; margin-top: 8px; }
 .task-when .count { color: var(--accent); font-weight: 600; }
@@ -255,6 +259,38 @@ details.events pre {
 
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
 .actions button { min-width: 96px; }
+
+/* S8③：审稿配方行——跟施工行同款 task-meta 字号，颜色区分开一点 */
+.review-meta { color: var(--purple); }
+
+/* S8③：每轮详情——折叠区，手机上不横滚 */
+.pipeline-detail { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 6px; }
+.pipeline-detail summary {
+  cursor: pointer; min-height: 40px; line-height: 40px; color: var(--muted); font-size: 14px;
+  touch-action: manipulation;
+}
+.pipeline-detail-body { padding-top: 4px; }
+.pipeline-round { margin: 8px 0; padding: 8px 10px; background: var(--bg); border-radius: 10px; }
+.pipeline-round h4 { margin: 0 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; }
+.pipeline-doc { margin: 6px 0; font-size: 13px; overflow-wrap: anywhere; }
+.pipeline-doc pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: hidden;
+  margin: 4px 0 0;
+  padding: 8px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 12.5px;
+}
+.pipeline-doc.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  cursor: pointer;
+  color: var(--accent);
+  min-height: 32px;
+  line-height: 32px;
+}
 
 /* ---------- 新建页 ---------- */
 

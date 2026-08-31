@@ -205,3 +205,102 @@ def test_app_js_review_block_helpers_and_submission_fields():
 def test_css_has_review_fields_nesting_style():
     css = (WEB / "style.css").read_text(encoding="utf-8")
     assert "#review-fields" in css
+
+
+# ---------- S8③：任务卡——流水线阶段、六个控制与每轮详情 ----------
+
+
+def test_index_has_fixnow_overlay():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    for piece in (
+        'id="fixnow-overlay"', 'id="fixnow-title"', 'id="fixnow-text"',
+        'id="btn-fixnow-close"', 'id="btn-fixnow-send"',
+    ):
+        assert piece in html, piece
+
+
+def test_app_js_groups_by_pipeline_id():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'var root = item.task.pipeline_id || item.task.root_id || item.task.id;' in js
+
+
+def test_app_js_has_eight_phase_labels():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    for piece in (
+        "function pipelinePhaseInfo(chain)",
+        '"审稿中"', '"返工中（第 "', '"等审稿额度"', '"等你来看"',
+        "返工次数到线", '"等你合并"', '"已合并"', '"已丢弃"',
+    ):
+        assert piece in js, piece
+
+
+def test_app_js_has_six_pipeline_control_actions():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    for piece in (
+        "function pipelineControlActions(chain)",
+        '"./api/tasks/" + coordId + "/hold"',
+        '"./api/tasks/" + coordId + "/continue"',
+        '"./api/tasks/" + coordId + "/keepalive"',
+        '"./api/tasks/" + coordId + "/review-now"',
+        '"./api/tasks/" + coordId + "/skip-review"',
+        "function openFixNow(id, title)",
+        '"我来看"', '"继续"', '"暂停保活"', '"恢复保活"',
+        '"现在就审"', '"跳过审稿直接收工"', '"直接返工"',
+    ):
+        assert piece in js, piece
+
+
+def test_app_js_pipeline_window_actions_are_role_aware():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    for piece in (
+        "function pipelineWindowActions(chain)",
+        'var roleLabel = t.role === "review" ? "审稿" : "施工";',
+        '"看" + roleLabel + "屏幕"',
+        '"给" + roleLabel + "捎话"',
+        '"中止" + roleLabel',
+        '"停" + roleLabel + "后台"',
+    ):
+        assert piece in js, piece
+
+
+def test_app_js_pipeline_detail_lazy_loads_and_caches_by_pipeline_id():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    for piece in (
+        "var PIPELINE_DETAIL_CACHE = {};",
+        "function pipelineDetailPanel(chain)",
+        "function loadPipelineDetail(pipelineId, body)",
+        "if (cached && cached.data)", "if (cached && cached.loading) return;",
+        '"./api/tasks/" + pipelineId + "/pipeline"',
+        "这班没有交接", "这轮还没有意见",
+        "function renderPipelineDetail(body, data)",
+    ):
+        assert piece in js, piece
+
+
+def test_app_js_pipeline_docs_use_text_node_not_innerhtml():
+    """交接/审稿意见正文只走 textContent（el() 的 text 属性），不拼 innerHTML——
+    含 <script>/& 之类字符只当文字显示，不会被当成标签执行。"""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "innerHTML" not in js
+
+
+def test_app_js_review_meta_line_and_effort_in_build_chip():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    for piece in (
+        '"施工：" + runnerLabel + " · " + task.model + " · " + task.effort',
+        "task.review && task.review.enabled",
+        '"审稿：" + reviewRunnerLabel',
+    ):
+        assert piece in js, piece
+
+
+def test_app_js_held_state_is_active_and_labeled():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert '"waiting_wakeup", "idle", "held"];' in js
+    assert 'held: "等待中"' in js
+
+
+def test_css_has_phase_chip_held_and_pipeline_detail_styles():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    for piece in ("st-held", "phase-chip", "pipeline-detail", "pipeline-doc", "overflow-wrap: anywhere"):
+        assert piece in css, piece
