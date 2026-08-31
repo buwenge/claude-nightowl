@@ -266,6 +266,16 @@ fieldset.box {
 }
 fieldset.box summary { cursor: pointer; min-height: 44px; line-height: 44px; font-weight: 600; }
 
+/* S8②：details.box 用的是原生 <details>，不是 fieldset，选择器要覆盖到 */
+details.box {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  margin: 14px 0 0;
+  padding: 4px 14px 14px;
+}
+details.box summary { cursor: pointer; min-height: 44px; line-height: 44px; font-weight: 600; }
+#review-fields { margin-top: 6px; padding-left: 12px; border-left: 2px solid var(--line); }
+
 .prompt-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
 .prompt-head label { margin: 0; }
 .tag-edited {

@@ -38,7 +38,9 @@ def test_app_js_has_merge_discard_orphan_and_state_texts():
         "task.worktree === true",
         # POST/PUT/preview 都带 worktree
         "worktree: $(\"f-worktree\").checked",
-        "worktree: wt.worktree, review: wt.review",
+        # S8②：提交体扩成 worktree + keepalive + review 三件套（旧断言字符串
+        # 同步更新，新字符串见 test_app_js_review_block_helpers_and_submission_fields）
+        "worktree: wt.worktree, keepalive: wt.keepalive, review: wt.review",
         # 有树时不展示必然被后端 409 的“删除”假按钮
         "TERMINAL_STATES.indexOf(state) >= 0 && !hasTree",
     ):
@@ -157,3 +159,49 @@ def test_app_js_loads_and_saves_review_templates():
         'resume_text: $("t-resume").value',
     ):
         assert piece in js, piece
+
+
+# ---------- S8②：新建页施工/工作树/审稿三块收齐 ----------
+
+
+def test_index_has_keepalive_and_review_form_controls():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    for piece in (
+        'id="f-keepalive"',
+        'id="box-review"', 'id="f-review-enabled"', 'id="f-review-worktree-hint"',
+        'id="review-fields"',
+        'name="f-review-runner"',
+        'id="f-review-model"', 'id="f-review-model-custom"', 'id="f-review-effort"',
+        'id="f-review-maxrounds"',
+        'name="f-review-onnoquota"', 'value="release"', 'value="hold"',
+        'id="f-review-criteria"',
+        'id="f-mergepolicy-label"',
+    ):
+        assert piece in html, piece
+
+
+def test_app_js_review_block_helpers_and_submission_fields():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    for piece in (
+        "function currentReviewRunner()",
+        "function currentReviewModel()",
+        "function populateReviewModelEffort(runner)",
+        "function syncReviewUI()",
+        # 关工作树时提交强制 review.enabled=false，不只靠 disabled 样式
+        "var reviewOn = wtOn && $(\"f-review-enabled\").checked;",
+        "review.on_no_quota = (onnq && onnq.value) || rd.on_no_quota || \"release\";",
+        # 提交体：worktree + keepalive + review 一起发
+        "worktree: wt.worktree, keepalive: wt.keepalive, review: wt.review",
+        "keepalive: { enabled: $(\"f-keepalive\").checked }",
+        # 预览带 runner，Codex 任务不会仍按 Claude 上下文渲染
+        "worktree: $(\"f-worktree\").checked, runner: currentRunner()",
+        # 编辑旧任务（无 runner/model/effort 等字段的 S5 占位 review）也要完整回填
+        "$(\"f-review-enabled\").checked = !!review.enabled;",
+        "var rd = (CFG && CFG.review_defaults) || {};",
+    ):
+        assert piece in js, piece
+
+
+def test_css_has_review_fields_nesting_style():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "#review-fields" in css

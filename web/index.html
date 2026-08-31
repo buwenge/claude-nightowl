@@ -110,15 +110,56 @@
       <div class="choice-row">
         <label class="inline"><input type="checkbox" id="f-worktree" checked> 隔离工作树（在 <code>&lt;项目&gt;/.claude/worktrees/</code> 里施工，每班收工自动打存档点）</label>
       </div>
-      <p class="hint" id="f-worktree-off-hint" hidden>老式模式：直接在项目目录施工，不打存档点。</p>
+      <p class="hint" id="f-worktree-off-hint" hidden>老式模式：直接在项目目录施工，不打存档点；联动审稿只能关。</p>
+
+      <div class="choice-row">
+        <label class="inline"><input type="checkbox" id="f-keepalive" checked> 保活（施工/审稿会话长时间没动静时探一下；这是长期开关，运行中"暂停/恢复保活"在任务卡上单独控制）</label>
+      </div>
+
       <div id="merge-row">
-        <label for="f-mergepolicy"><b>完工后</b></label>
+        <label for="f-mergepolicy"><b id="f-mergepolicy-label">完工后</b></label>
         <select id="f-mergepolicy">
           <option value="manual">等我合并（存档后停在工作树，由你合并或丢弃）</option>
           <option value="auto">自动合并（最后一班存档后自动并进主线）</option>
         </select>
-        <p class="hint">联动审稿要到 S7 才开放；现在的任务都只施工、不审稿。</p>
+        <p class="hint" id="f-mergepolicy-hint">不开联动审稿时，这个策略在施工班存档后就生效。</p>
       </div>
+
+      <details class="box" id="box-review">
+        <summary>联动审稿（开着才会在施工收工后自动起一班只读审查）</summary>
+        <div class="choice-row">
+          <label class="inline"><input type="checkbox" id="f-review-enabled"> 开启联动审稿</label>
+        </div>
+        <p class="hint" id="f-review-worktree-hint" hidden>老式模式（关了隔离工作树）不能联动审稿。</p>
+
+        <div id="review-fields" hidden>
+          <label><b>用谁审稿</b></label>
+          <div class="choice-row" id="review-runner-radios">
+            <label class="inline"><input type="radio" name="f-review-runner" value="claude" checked> Claude Code</label>
+            <label class="inline"><input type="radio" name="f-review-runner" value="codex"> Codex</label>
+          </div>
+
+          <label for="f-review-model"><b>审稿模型</b></label>
+          <select id="f-review-model"></select>
+          <input type="text" id="f-review-model-custom" placeholder="手输模型名" hidden>
+
+          <label for="f-review-effort"><b>审稿思考档位</b></label>
+          <select id="f-review-effort"></select>
+
+          <label for="f-review-maxrounds"><b>最多自动返工几次</b></label>
+          <input type="number" id="f-review-maxrounds" min="1" step="1">
+          <p class="hint">到线后需要在任务卡上点"继续"放行一轮，不会一直自动返工下去。</p>
+
+          <label><b>审稿人没额度时</b></label>
+          <div class="choice-row">
+            <label class="inline"><input type="radio" name="f-review-onnoquota" value="release" checked> 施工先收工（等审稿方有额度再另起一班审）</label>
+            <label class="inline"><input type="radio" name="f-review-onnoquota" value="hold"> 施工保活等（窗口留着，省一次重开）</label>
+          </div>
+
+          <label for="f-review-criteria"><b>通过标准补充一句（可空）</b></label>
+          <textarea id="f-review-criteria" rows="3" placeholder="留空只用默认通过标准"></textarea>
+        </div>
+      </details>
 
       <label for="f-text"><b>任务内容</b></label>
       <textarea id="f-text" class="tall" rows="8" required

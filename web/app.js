@@ -783,7 +783,7 @@ function schedulePreview() {
     var text = $("f-text").value;
     if (!project || !text) return;
     api("POST", "./api/preview", { title: title, project: project, model: model,
-      task_text: text, worktree: $("f-worktree").checked })
+      task_text: text, worktree: $("f-worktree").checked, runner: currentRunner() })
       .then(function (data) {
         if (PROMPT_EDITED) return;
         $("f-prompt").value = data.prompt_final;
@@ -804,21 +804,86 @@ function unmarkPromptEdited() {
   $("btn-regen").hidden = true;
 }
 
-/* ---------- S5③：工作树开关与完工后选择 ---------- */
+/* ---------- S5③/S8②：工作树、保活开关与联动审稿折叠块 ---------- */
+
+// S8②：审稿方 runner 决定审稿模型/档位下拉——跟施工方的 currentRunner()/
+// populateModelEffortForRunner() 是两套独立 helper，绝不共用同一组 DOM，
+// 切换任何一边都不能串到另一边的选值。
+function currentReviewRunner() {
+  var r = document.querySelector('input[name="f-review-runner"]:checked');
+  return r ? r.value : "claude";
+}
+
+function currentReviewModel() {
+  return $("f-review-model").value === "__custom__" ?
+    $("f-review-model-custom").value.trim() : $("f-review-model").value;
+}
+
+function populateReviewModelEffort(runner) {
+  var rc = runnerModelsEfforts(runner);
+  var model = $("f-review-model");
+  model.textContent = "";
+  Object.keys(rc.models || {}).forEach(function (name) {
+    model.appendChild(el("option", { value: name, text: name }));
+  });
+  model.appendChild(el("option", { value: "__custom__", text: "自定义…" }));
+  var effort = $("f-review-effort");
+  effort.textContent = "";
+  (rc.efforts || []).forEach(function (name) {
+    effort.appendChild(el("option", { value: name, text: name }));
+  });
+  if ((rc.efforts || []).indexOf("high") >= 0) effort.value = "high";
+}
+
+// 关工作树：审稿区整块 disabled + 明示提示，但不清空里面已经填的值——
+// 重新开工作树后原表单值还在（syncReviewUI 只切 disabled/hidden，不碰 .value/.checked）。
+function syncReviewUI() {
+  var wtOn = $("f-worktree").checked;
+  var active = !!(EDIT_TASK && EDIT_TASK.active);
+  $("f-review-enabled").disabled = !wtOn || active;
+  $("f-review-worktree-hint").hidden = wtOn;
+  var reviewOn = wtOn && $("f-review-enabled").checked;
+  var fields = $("review-fields");
+  fields.hidden = !reviewOn;
+  Array.prototype.forEach.call(fields.querySelectorAll("input,select,textarea"), function (node) {
+    node.disabled = !reviewOn || active;
+  });
+  $("f-mergepolicy-label").textContent = reviewOn ? "审稿通过后" : "完工后";
+  $("f-mergepolicy-hint").textContent = reviewOn ?
+    "开审稿时，这个策略在审稿判定通过（NEXT: done）后生效。" :
+    "不开联动审稿时，这个策略在施工班存档后就生效。";
+  if (reviewOn) populateReviewModelEffort(currentReviewRunner());
+}
 
 function syncWorktreeUI() {
   var on = $("f-worktree").checked;
   $("f-worktree-off-hint").hidden = on;
   $("merge-row").hidden = !on;
   $("f-mergepolicy").disabled = !on || !!(EDIT_TASK && EDIT_TASK.active);
+  syncReviewUI();
   schedulePreview();
 }
 
-// 表单 → {worktree, review}；S5 只接受 review.enabled=false（审稿 S7 才有）
+// 表单 → {worktree, keepalive, review}；关工作树时提交强制 review.enabled=false
+// （不只靠 disabled 样式——防手改 DOM/竞态漏发真值）。
 function worktreeFromForm() {
+  var wtOn = $("f-worktree").checked;
+  var reviewOn = wtOn && $("f-review-enabled").checked;
+  var review = { enabled: reviewOn, merge_policy: $("f-mergepolicy").value || "manual" };
+  if (reviewOn) {
+    var rd = (CFG && CFG.review_defaults) || {};
+    var onnq = document.querySelector('input[name="f-review-onnoquota"]:checked');
+    review.runner = currentReviewRunner();
+    review.model = currentReviewModel();
+    review.effort = $("f-review-effort").value;
+    review.max_rounds = Number($("f-review-maxrounds").value || rd.max_rounds || 5);
+    review.on_no_quota = (onnq && onnq.value) || rd.on_no_quota || "release";
+    review.criteria_text = $("f-review-criteria").value || "";
+  }
   return {
-    worktree: $("f-worktree").checked,
-    review: { enabled: false, merge_policy: $("f-mergepolicy").value || "manual" }
+    worktree: wtOn,
+    keepalive: { enabled: $("f-keepalive").checked },
+    review: review
   };
 }
 
@@ -851,6 +916,7 @@ function applyEditMode() {
   $("f-prompt").required = !active;
   // S5③：活跃编辑不许改工作树开关（这一班已经在某个目录里干了）
   $("f-worktree").disabled = active;
+  $("f-keepalive").disabled = active;  // S8：长期开关只在未跑状态可改
   setTriggerMode(document.querySelector('input[name="f-trigger"]:checked').value);
   syncWorktreeUI();
 }
@@ -864,7 +930,17 @@ function enterCreate() {
   document.querySelector('input[name="f-runner"][value="claude"]').checked = true;
   populateModelEffortForRunner("claude");
   $("f-worktree").checked = true;   // 新建默认建树
+  $("f-keepalive").checked = true;  // 新建默认开保活
   $("f-mergepolicy").value = "manual";
+  $("f-review-enabled").checked = false;  // 新建默认关审稿
+  var reviewRadio = document.querySelector('input[name="f-review-runner"][value="claude"]');
+  if (reviewRadio) reviewRadio.checked = true;
+  populateReviewModelEffort("claude");
+  var rd = (CFG && CFG.review_defaults) || {};
+  $("f-review-maxrounds").value = rd.max_rounds || 5;
+  var onnq = document.querySelector('input[name="f-review-onnoquota"][value="' + (rd.on_no_quota || "release") + '"]');
+  if (onnq) onnq.checked = true;
+  $("f-review-criteria").value = "";
   syncWorktreeUI();
   showView("new");
 }
@@ -900,7 +976,36 @@ function enterEdit(item) {
 
   // S5③：编辑旧任务缺 worktree 字段必须显示关，不能因新建默认而误翻成开
   $("f-worktree").checked = task.worktree === true;
-  $("f-mergepolicy").value = (task.review && task.review.merge_policy) || "manual";
+  // S8②：keepalive 缺字段（旧任务）按开显示，跟 scheduler 的兜底口径一致
+  $("f-keepalive").checked = !task.keepalive || task.keepalive.enabled !== false;
+  var review = task.review || {};
+  $("f-mergepolicy").value = review.merge_policy || "manual";
+  // 未跑任务必须完整回填 review，包括关闭审稿的旧 S5 任务（占位对象没有
+  // runner/model/effort/max_rounds/on_no_quota/criteria_text，用 config 默认
+  // 兜底，免得用户一开审稿开关看到的是空表单）
+  $("f-review-enabled").checked = !!review.enabled;
+  var reviewRunner = review.runner || "claude";
+  var reviewRunnerRadio = document.querySelector('input[name="f-review-runner"][value="' + reviewRunner + '"]');
+  if (reviewRunnerRadio) reviewRunnerRadio.checked = true;
+  populateReviewModelEffort(reviewRunner);
+  var reviewRc = runnerModelsEfforts(reviewRunner);
+  if (review.model && reviewRc.models && reviewRc.models[review.model]) {
+    $("f-review-model").value = review.model;
+    $("f-review-model-custom").hidden = true;
+  } else if (review.model) {
+    $("f-review-model").value = "__custom__";
+    $("f-review-model-custom").hidden = false;
+    $("f-review-model-custom").value = review.model;
+  }
+  if (review.effort && (reviewRc.efforts || []).indexOf(review.effort) >= 0) {
+    $("f-review-effort").value = review.effort;
+  }
+  var rd = (CFG && CFG.review_defaults) || {};
+  $("f-review-maxrounds").value = review.max_rounds || rd.max_rounds || 5;
+  var onnqVal = review.on_no_quota || rd.on_no_quota || "release";
+  var onnq = document.querySelector('input[name="f-review-onnoquota"][value="' + onnqVal + '"]');
+  if (onnq) onnq.checked = true;
+  $("f-review-criteria").value = review.criteria_text || "";
 
   $("f-warntokens").value = guards.context_warn_tokens != null ? guards.context_warn_tokens : "";
   $("f-warntext").value = guards.context_warn_text != null ?
@@ -1120,7 +1225,7 @@ function submitNewForm(ev) {
       title: title, project: project, runner: currentRunner(), model: model, effort: effort,
       task_text: text, prompt_final: prompt, guards: guards, chain: chain,
       trigger: trigger || { type: "time" },
-      worktree: wt.worktree, review: wt.review
+      worktree: wt.worktree, keepalive: wt.keepalive, review: wt.review
     };
     if (mode !== "after") body.run_at = runAtIso;  // after 模式不发
   }
@@ -1260,6 +1365,13 @@ function start() {
 
   $("new-form").addEventListener("submit", submitNewForm);
   $("f-worktree").addEventListener("change", syncWorktreeUI);
+  $("f-review-enabled").addEventListener("change", function () { syncReviewUI(); schedulePreview(); });
+  Array.prototype.forEach.call(document.querySelectorAll('input[name="f-review-runner"]'), function (r) {
+    r.addEventListener("change", function () { populateReviewModelEffort(currentReviewRunner()); });
+  });
+  $("f-review-model").addEventListener("change", function () {
+    $("f-review-model-custom").hidden = $("f-review-model").value !== "__custom__";
+  });
   $("f-title").addEventListener("input", schedulePreview);
   $("f-project").addEventListener("change", schedulePreview);
   Array.prototype.forEach.call(document.querySelectorAll('input[name="f-runner"]'), function (r) {
