@@ -647,6 +647,11 @@ function sendFixNow() {
 
 var REVIEW_VERDICT_TEXT = { done: "通过", fix: "退回", pending: "未审完" };
 
+// S8.1 阻断四：按每条 handover/checkpoint/review 条目自己的 round 字段
+// 分桶，不按整个成员当前的 round 一锅端——同一 build task id 被
+// `_review_fix` 原地复用横跨多轮时，历史交接/存档点必须留在它们产生时
+// 所属的那一轮（后端 `_round_for_shift` 已经给每条 handover 算好了
+// round；checkpoints[] 里的 round 是 checkpoint_history 本来就有的）。
 function renderPipelineDetail(body, data) {
   body.textContent = "";
   var refreshBtn = el("button", { type: "button", class: "ghost", text: "刷新详情", onclick: function () {
@@ -656,9 +661,17 @@ function renderPipelineDetail(body, data) {
   body.appendChild(refreshBtn);
   var members = data.members || [];
   var byRound = {};
+  function bucket(r) {
+    r = r || 1;
+    return (byRound[r] = byRound[r] || { handovers: [], checkpoints: [], reviews: [] });
+  }
   members.forEach(function (m) {
-    var r = m.round || 1;
-    (byRound[r] = byRound[r] || []).push(m);
+    if (m.role === "build") {
+      (m.handovers || []).forEach(function (h) { bucket(h.round || m.round).handovers.push(h); });
+      (m.checkpoints || []).forEach(function (c) { bucket(c.round || m.round).checkpoints.push(c); });
+    } else if (m.review) {
+      bucket(m.review.round || m.round).reviews.push(m.review);
+    }
   });
   var rounds = Object.keys(byRound).map(Number).sort(function (a, b) { return a - b; });
   if (!rounds.length) {
@@ -666,59 +679,66 @@ function renderPipelineDetail(body, data) {
     return;
   }
   rounds.forEach(function (r) {
+    var b = byRound[r];
     var roundBox = el("div", { class: "pipeline-round" }, [el("h4", { text: "第 " + r + " 轮" })]);
-    byRound[r].forEach(function (m) {
-      if (m.role === "build") {
-        var handovers = m.handovers || [];
-        if (!handovers.length) {
-          roundBox.appendChild(el("p", { class: "hint", text: "这班没有交接" }));
-        } else {
-          handovers.forEach(function (h) {
-            roundBox.appendChild(el("div", { class: "pipeline-doc" }, [
-              el("div", { class: "hint", text: "第 " + h.shift + " 班交接" }),
-              el("pre", { text: h.text || "" })
-            ]));
-          });
-        }
-        (m.checkpoints || []).forEach(function (c) {
-          var full = c.sha || "";
-          roundBox.appendChild(el("div", {
-            class: "pipeline-doc mono", text: "📌 存档点 " + full.slice(0, 10) + "（点击复制完整 sha）",
-            onclick: function () {
-              copyText(full).then(function () { banner("完整 sha 已复制"); }, function () { banner("复制失败"); });
-            },
-          }));
-        });
-      } else {
-        var review = m.review;
-        if (!review) {
-          roundBox.appendChild(el("p", { class: "hint", text: "这轮还没有意见" }));
-        } else {
-          var verdictText = REVIEW_VERDICT_TEXT[review.verdict] || "未审完";
-          roundBox.appendChild(el("div", { class: "pipeline-doc" }, [
-            el("div", { class: "hint", text: "审稿意见（" + verdictText + "）" }),
-            el("pre", { text: review.text || "" })
-          ]));
-        }
-      }
+    if (!b.handovers.length) {
+      roundBox.appendChild(el("p", { class: "hint", text: "这班没有交接" }));
+    } else {
+      b.handovers.forEach(function (h) {
+        roundBox.appendChild(el("div", { class: "pipeline-doc" }, [
+          el("div", { class: "hint", text: "第 " + h.shift + " 班交接" }),
+          el("pre", { text: h.text || "" })
+        ]));
+      });
+    }
+    b.checkpoints.forEach(function (c) {
+      var full = c.sha || "";
+      roundBox.appendChild(el("div", {
+        class: "pipeline-doc mono", text: "📌 存档点 " + full.slice(0, 10) + "（点击复制完整 sha）",
+        onclick: function () {
+          copyText(full).then(function () { banner("完整 sha 已复制"); }, function () { banner("复制失败"); });
+        },
+      }));
     });
+    if (!b.reviews.length) {
+      roundBox.appendChild(el("p", { class: "hint", text: "这轮还没有意见" }));
+    } else {
+      b.reviews.forEach(function (review) {
+        var verdictText = REVIEW_VERDICT_TEXT[review.verdict] || "未审完";
+        roundBox.appendChild(el("div", { class: "pipeline-doc" }, [
+          el("div", { class: "hint", text: "审稿意见（" + verdictText + "）" }),
+          el("pre", { text: review.text || "" })
+        ]));
+      });
+    }
     body.appendChild(roundBox);
   });
 }
 
+// S8.1 非阻断竞态收尾：同一 pipeline_id 请求飞行中时，5 秒重画产生的新
+// body（旧 body 已脱离 DOM）必须挂到同一个 Promise 的完成/失败分支上，
+// 不能只是"命中 loading 就直接返回"——那样新 body 会永远停在"展开后
+// 加载…"，只有再等一次外部刷新才会偶然恢复。
 function loadPipelineDetail(pipelineId, body) {
   var cached = PIPELINE_DETAIL_CACHE[pipelineId];
   if (cached && cached.data) { renderPipelineDetail(body, cached.data); return; }
-  if (cached && cached.loading) return;
-  PIPELINE_DETAIL_CACHE[pipelineId] = { loading: true };
-  api("GET", "./api/tasks/" + pipelineId + "/pipeline").then(function (data) {
-    PIPELINE_DETAIL_CACHE[pipelineId] = { data: data };
-    renderPipelineDetail(body, data);
-  }).catch(function (err) {
-    PIPELINE_DETAIL_CACHE[pipelineId] = null;
+  var showError = function (err) {
     body.textContent = "";
     body.appendChild(el("p", { class: "warn-reason", text: "加载失败：" + err.message }));
+  };
+  if (cached && cached.promise) {
+    cached.promise.then(function (data) { renderPipelineDetail(body, data); }, showError);
+    return;
+  }
+  var promise = api("GET", "./api/tasks/" + pipelineId + "/pipeline").then(function (data) {
+    PIPELINE_DETAIL_CACHE[pipelineId] = { data: data };
+    return data;
+  }, function (err) {
+    PIPELINE_DETAIL_CACHE[pipelineId] = null;
+    throw err;
   });
+  PIPELINE_DETAIL_CACHE[pipelineId] = { promise: promise };
+  promise.then(function (data) { renderPipelineDetail(body, data); }, showError);
 }
 
 // 只在用户首次展开时懒加载，按 pipeline_id 缓存；5 秒重画只是命中缓存
@@ -1196,8 +1216,18 @@ function populateReviewModelEffort(runner) {
   if ((rc.efforts || []).indexOf("high") >= 0) effort.value = "high";
 }
 
+// S8.1 阻断二：syncReviewUI() 只管 hidden/disabled/提示文案，绝不重建下拉
+// 选项——populateReviewModelEffort() 会清空 select 再重建，谁调用它就会
+// 把当前选中值打回"该 runner 第一个模型 + high"。这个函数在工作树开关/
+// 审稿开关每次变化时都会跑（包括跟审稿 runner 无关的场景，比如单纯把
+// 工作树关了又开、编辑旧任务时 applyEditMode() 收尾也会经过这里），所以
+// 绝不能在这里 populate。真正需要重建选项的三个时机——新建默认值
+// （enterCreate）、编辑旧任务回填（enterEdit）、用户手动切换审稿 runner
+// （runner change 监听）——各自显式调用 populateReviewModelEffort()，
+// 且都在设置完 .value 之前调用，不会覆盖已经填好的值。
+//
 // 关工作树：审稿区整块 disabled + 明示提示，但不清空里面已经填的值——
-// 重新开工作树后原表单值还在（syncReviewUI 只切 disabled/hidden，不碰 .value/.checked）。
+// 重新开工作树后原表单值还在。
 function syncReviewUI() {
   var wtOn = $("f-worktree").checked;
   var active = !!(EDIT_TASK && EDIT_TASK.active);
@@ -1213,7 +1243,6 @@ function syncReviewUI() {
   $("f-mergepolicy-hint").textContent = reviewOn ?
     "开审稿时，这个策略在审稿判定通过（NEXT: done）后生效。" :
     "不开联动审稿时，这个策略在施工班存档后就生效。";
-  if (reviewOn) populateReviewModelEffort(currentReviewRunner());
 }
 
 function syncWorktreeUI() {

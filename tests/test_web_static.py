@@ -4,9 +4,53 @@
 防"改了后端忘了前端"或反过来。
 """
 
+from html.parser import HTMLParser
 from pathlib import Path
 
 WEB = Path(__file__).resolve().parent.parent / "web"
+
+# S8.1 阻断三：字符串级检查测不出"重复 id / 孤儿节点游离在 section 外"这
+# 类结构问题（旧字符串断言在重复内容存在时照样全部通过）——用标准库
+# html.parser 做一次真正的结构解析，锁住 id 唯一性和"新建表单控件只应该
+# 出现在 #new-form 内、任务页看不到它们"这两条。
+
+
+class _IdCollector(HTMLParser):
+    _VOID_TAGS = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.stack: list[str | None] = []
+        self.id_count: dict[str, int] = {}
+        self.id_ancestors: dict[str, set[str]] = {}
+
+    def _record(self, this_id):
+        if not this_id:
+            return
+        self.id_count[this_id] = self.id_count.get(this_id, 0) + 1
+        self.id_ancestors.setdefault(this_id, set()).update(a for a in self.stack if a)
+
+    def handle_starttag(self, tag, attrs):
+        this_id = dict(attrs).get("id")
+        self._record(this_id)
+        if tag not in self._VOID_TAGS:
+            self.stack.append(this_id)
+
+    def handle_startendtag(self, tag, attrs):
+        self._record(dict(attrs).get("id"))
+
+    def handle_endtag(self, tag):
+        if self.stack:
+            self.stack.pop()
+
+
+def _parse_ids(html_text: str) -> _IdCollector:
+    parser = _IdCollector()
+    parser.feed(html_text)
+    return parser
 
 
 def test_index_has_worktree_switch_merge_choice_and_orphan_box():
@@ -269,7 +313,10 @@ def test_app_js_pipeline_detail_lazy_loads_and_caches_by_pipeline_id():
         "var PIPELINE_DETAIL_CACHE = {};",
         "function pipelineDetailPanel(chain)",
         "function loadPipelineDetail(pipelineId, body)",
-        "if (cached && cached.data)", "if (cached && cached.loading) return;",
+        "if (cached && cached.data)",
+        # S8.1 非阻断竞态收尾：飞行中的请求改存 Promise，新 body 挂到同一个
+        # Promise 的完成/失败分支，不是命中 loading 哨兵就直接返回
+        "if (cached && cached.promise)",
         '"./api/tasks/" + pipelineId + "/pipeline"',
         "这班没有交接", "这轮还没有意见",
         "function renderPipelineDetail(body, data)",
@@ -369,3 +416,101 @@ def test_css_mobile_wrap_and_no_horizontal_scroll():
     css = (WEB / "style.css").read_text(encoding="utf-8")
     for piece in ("overflow-wrap: anywhere", "overflow-x: hidden", ".tpl-group"):
         assert piece in css, piece
+
+
+# ---------- S8.1 阻断三：index.html 重复表单结构反例 ----------
+
+
+def test_index_all_ids_unique():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    parser = _parse_ids(html)
+    dups = {k: v for k, v in parser.id_count.items() if v > 1}
+    assert dups == {}, dups
+
+
+def test_index_new_form_controls_appear_exactly_once_inside_new_form():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    parser = _parse_ids(html)
+    for target in (
+        "f-sessionleft", "f-weekleft", "f-modelleft", "f-autointerrupt",
+        "f-chainmax", "f-nohandover", "f-mergepolicy", "f-prompt",
+        "new-err", "new-submit", "prompt-box", "tag-edited", "btn-regen",
+    ):
+        assert parser.id_count.get(target) == 1, target
+        assert "new-form" in parser.id_ancestors.get(target, set()), target
+
+
+def test_index_task_page_has_no_orphan_new_form_controls():
+    """阻断三反例：commit③ 合并 patch 时曾把 f-sessionleft/f-prompt/
+    new-submit 等一整段新建表单尾段重复插在 </section> 之外，变成游离节点，
+    浏览器解析后会作为任务页的兄弟内容一直显示（不受 view-new 的
+    hidden 属性控制）。"""
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    parser = _parse_ids(html)
+    for target in ("f-sessionleft", "f-prompt", "new-submit", "f-nohandover", "f-mergepolicy"):
+        ancestors = parser.id_ancestors.get(target, set())
+        assert "view-tasks" not in ancestors, target
+        assert "view-new" in ancestors, target
+
+
+def test_index_view_new_appears_exactly_once():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert html.count('<section id="view-new"') == 1
+
+
+# ---------- S8.1 阻断二：syncReviewUI() 不得重建审稿模型/档位下拉 ----------
+
+
+def _extract_js_function_body(js: str, name: str) -> str:
+    """粗糙但够用的花括号配平提取：找 `function <name>(...) {`，从那对
+    应的 `{` 数括号配平到函数体结束。测试专用，不追求处理任意 JS 语法。"""
+    marker = f"function {name}("
+    start = js.index(marker)
+    brace_start = js.index("{", start)
+    depth = 0
+    i = brace_start
+    while i < len(js):
+        if js[i] == "{":
+            depth += 1
+        elif js[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[brace_start:i + 1]
+        i += 1
+    raise AssertionError(f"未找到 {name} 的完整函数体（花括号未配平）")
+
+
+def test_sync_review_ui_never_rebuilds_model_effort_options():
+    """阻断二：syncReviewUI() 以前无条件调用 populateReviewModelEffort()，
+    每次工作树/审稿开关变化（包括跟 runner 无关的场景）都会清空重建两个
+    下拉，把用户已经选好的非默认模型/档位打回第一个选项。修复后
+    syncReviewUI() 只管 hidden/disabled/文案，不碰选项内容。"""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    body = _extract_js_function_body(js, "syncReviewUI")
+    assert "populateReviewModelEffort" not in body
+
+
+def test_review_model_effort_only_populated_at_three_legitimate_entry_points():
+    """真正需要重建选项的三处——新建默认值、编辑回填、用户手动切换审稿
+    runner——各自显式调用，且编辑回填先 populate 后设置 .value（不会被
+    后续任何调用覆盖）。"""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    create_body = _extract_js_function_body(js, "enterCreate")
+    edit_body = _extract_js_function_body(js, "enterEdit")
+    assert 'populateReviewModelEffort("claude")' in create_body
+    assert "populateReviewModelEffort(reviewRunner)" in edit_body
+    # 编辑回填：populate 必须先于设值，否则会覆盖掉刚设好的 .value
+    populate_pos = edit_body.index("populateReviewModelEffort(reviewRunner)")
+    set_model_pos = edit_body.index('$("f-review-model").value = review.model')
+    assert populate_pos < set_model_pos
+    assert 'r.addEventListener("change", function () { populateReviewModelEffort(currentReviewRunner()); });' in js
+
+
+def test_review_worktree_toggle_round_trip_preserves_non_default_selection():
+    """用一次真实的"关工作树再开"序列核对：populateReviewModelEffort 只在
+    三个合法入口出现，不在 syncWorktreeUI/syncReviewUI 调用链路上——静态
+    核对调用图，浏览器交互回归见监理真机复核记录。"""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    sync_wt_body = _extract_js_function_body(js, "syncWorktreeUI")
+    assert "populateReviewModelEffort" not in sync_wt_body
+    assert "syncReviewUI()" in sync_wt_body  # 仍然要调用，只是它自己不再重建选项

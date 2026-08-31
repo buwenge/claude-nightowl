@@ -215,47 +215,6 @@
     </form>
   </section>
 
-        <label for="f-sessionleft"><b>五小时额度剩余低于多少 % 就暂停等刷新</b></label>
-        <input type="number" id="f-sessionleft" min="0" max="100" step="1">
-        <p class="hint">到线时注入"停下、定缓存闹钟等刷新"，刷新后自动继续。</p>
-
-        <label for="f-weekleft"><b>周额度剩余低于多少 % 就收尾交接</b></label>
-        <input type="number" id="f-weekleft" min="0" max="100" step="1">
-        <p class="hint">七日全模型线或该模型单独周线任一到线，注入"收尾写交接"，本周不续班。起跑前预检也按这两条线放行/推迟。</p>
-
-        <label for="f-modelleft"><b>该模型单独周额度剩余低于多少 % 就收尾交接</b></label>
-        <input type="number" id="f-modelleft" min="0" max="100" step="1">
-        <p class="hint">比如 Fable 有自己的周线。别的模型的周线到了不叫停本会话，只提示一句"别再派它的子 agent"。</p>
-
-        <label for="f-autointerrupt"><b>疑似卡住几分钟后自动按 Esc 中止</b></label>
-        <input type="number" id="f-autointerrupt" min="1" step="1">
-        <p class="hint">留空 = 不自动中止。正经的长构建也会显示卡住，默认不自动中止。</p>
-
-        <label for="f-chainmax"><b>一晚最多几班</b></label>
-        <input type="number" id="f-chainmax" min="1" max="20" step="1">
-
-        <label for="f-nohandover"><b>没交接时</b></label>
-        <select id="f-nohandover">
-          <option value="continue">续班（自己看 git log 判断进度）</option>
-          <option value="stop">停下等我（标 needs_attention）</option>
-        </select>
-      </details>
-
-      <div id="prompt-box">
-        <div class="prompt-head">
-          <label for="f-prompt"><b>最终提示词（会原样发给会话）</b></label>
-          <span id="tag-edited" class="tag-edited">已手改</span>
-          <button type="button" id="btn-regen" class="ghost" hidden>按模板重新生成</button>
-        </div>
-        <textarea id="f-prompt" class="mono tall" rows="10" required></textarea>
-        <p class="hint">标题 / 项目 / 模型 / 任务内容一变就自动按模板刷新；你一旦手改就不再覆盖。</p>
-      </div>
-
-      <p id="new-err" class="err" role="alert"></p>
-      <button type="submit" id="new-submit" class="primary" style="width:100%">建任务</button>
-    </form>
-  </section>
-
   <!-- ============ 模板页 ============ -->
   <section id="view-tpl" hidden>
     <p class="hint">下面按用途分了组；每条文案下面写着它的占位符和真实用途，改完统一点最下面「保存模板」。</p>

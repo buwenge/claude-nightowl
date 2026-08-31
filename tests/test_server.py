@@ -2356,7 +2356,9 @@ def test_pipeline_detail_reads_handover_and_review_files_by_fixed_name_only(auth
     status, _, body = authed.request("GET", f"/api/tasks/{build_id}/pipeline")
     assert status == 200
     members = {m["id"]: m for m in body["members"]}
-    assert members[build_id]["handovers"] == [{"shift": 1, "text": "第一班交接：把 A 做完了"}]
+    assert members[build_id]["handovers"] == [
+        {"shift": 1, "round": 1, "text": "第一班交接：把 A 做完了"}
+    ]
     assert members[review_id]["review"] == {
         "round": 1, "verdict": "done", "text": "看起来不错。\n\nNEXT: done",
     }
@@ -2369,6 +2371,85 @@ def test_pipeline_detail_missing_docs_show_as_absent_not_500(authed):
     members = {m["id"]: m for m in body["members"]}
     assert members[build_id]["handovers"] == []
     assert "review" not in members[review_id]  # 没有 verdict 也没有文件
+
+
+# ---------- S8.1 阻断一：固定名 symlink/非普通文件不跟随读取 ----------
+
+
+def test_pipeline_detail_handover_symlink_not_followed(authed, tmp_path):
+    build_id, review_id = make_review_pipeline(authed, build_state="held", review_state="idle")
+    secret = tmp_path / "outside-secret.txt"
+    secret.write_text("越界机密内容，绝不能出现在响应里", encoding="utf-8")
+    (store.task_dir(build_id) / "handover-1.md").symlink_to(secret)
+
+    status, _, body = authed.request("GET", f"/api/tasks/{build_id}/pipeline")
+    assert status == 200
+    members = {m["id"]: m for m in body["members"]}
+    assert members[build_id]["handovers"] == []  # symlink 整条不列，不泄露正文
+    assert "越界机密" not in json.dumps(body, ensure_ascii=False)
+
+
+def test_pipeline_detail_review_symlink_not_followed(authed, tmp_path):
+    build_id, review_id = make_review_pipeline(authed, build_state="held", review_state="idle")
+    secret = tmp_path / "outside-secret2.txt"
+    secret.write_text("审稿越界机密", encoding="utf-8")
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.symlink_to(secret)
+    store.update_status(review_id, review_verdict="fix", review_file=str(review_file))
+
+    status, _, body = authed.request("GET", f"/api/tasks/{build_id}/pipeline")
+    assert status == 200
+    members = {m["id"]: m for m in body["members"]}
+    # verdict 仍在（来自 status），但 text 不能含越界正文——symlink 当正文缺失
+    assert members[review_id]["review"]["verdict"] == "fix"
+    assert "越界机密" not in members[review_id]["review"]["text"]
+    assert members[review_id]["review"]["text"] == ""
+
+
+def test_pipeline_detail_non_regular_file_not_read(authed):
+    """FIFO/设备/目录等非普通文件——用 mkfifo 造一个，O_NOFOLLOW 本身挡不住
+    （FIFO 不是 symlink），必须靠 fstat 的 S_ISREG 二次把关。"""
+    build_id, review_id = make_review_pipeline(authed, build_state="held", review_state="idle")
+    fifo_path = store.task_dir(build_id) / "handover-1.md"
+    os.mkfifo(fifo_path)
+    try:
+        status, _, body = authed.request("GET", f"/api/tasks/{build_id}/pipeline")
+        assert status == 200
+        members = {m["id"]: m for m in body["members"]}
+        assert members[build_id]["handovers"] == []
+    finally:
+        fifo_path.unlink(missing_ok=True)
+
+
+def test_pipeline_detail_directory_named_like_handover_not_read(authed):
+    build_id, review_id = make_review_pipeline(authed, build_state="held", review_state="idle")
+    (store.task_dir(build_id) / "handover-1.md").mkdir()
+    status, _, body = authed.request("GET", f"/api/tasks/{build_id}/pipeline")
+    assert status == 200
+    members = {m["id"]: m for m in body["members"]}
+    assert members[build_id]["handovers"] == []
+
+
+def test_pipeline_detail_file_disappearing_between_scan_and_open_not_500(authed, monkeypatch):
+    """检查与打开之间文件消失（真实 TOCTOU 窗口的最坏情况）：不能 500，
+    按正文缺失处理。"""
+    build_id, review_id = make_review_pipeline(authed, build_state="held", review_state="idle")
+    handover_path = store.task_dir(build_id) / "handover-1.md"
+    handover_path.write_text("马上就要消失的交接", encoding="utf-8")
+
+    real_open = os.open
+
+    def racy_open(path, flags, *a, **kw):
+        p = str(path)
+        if p.endswith("handover-1.md"):
+            os.unlink(p)  # 在真正 open() 之前把文件删掉，模拟竞态
+        return real_open(path, flags, *a, **kw)
+
+    monkeypatch.setattr(server.os, "open", racy_open)
+    status, _, body = authed.request("GET", f"/api/tasks/{build_id}/pipeline")
+    assert status == 200
+    members = {m["id"]: m for m in body["members"]}
+    assert members[build_id]["handovers"] == []
 
 
 def test_pipeline_detail_caps_and_replaces_bad_utf8(authed):
@@ -2395,6 +2476,88 @@ def test_pipeline_detail_checkpoint_history_plus_current_round(authed):
     ] or build_member["checkpoints"] == [{"round": 1, "sha": "b" * 40}]
     # round 相同（都是 1）时不重复：history 里已有 round 1，当前轮不再重复追加
     assert len(build_member["checkpoints"]) == 1
+
+
+# ---------- S8.1 阻断四：多轮详情按各条目自己的 round 归属 ----------
+
+
+def test_pipeline_detail_handover_and_checkpoint_attributed_to_correct_round(authed):
+    """第 1 轮 build 经过一次同角色续班（build_id_a → build_id_b，两班都算
+    round 1）；build_id_b 收工存档、被审后又被 `_review_fix` 原地复用进
+    round 2（同一个 task id，只改 round/shift）。build_id_b 目录下因此攒了
+    round 1 的旧交接（handover-2.md，产生于它还在 round 1 时的 shift=2）和
+    round 2 正在进行的新交接（handover-4.md，shift=4）——API 必须把这两份
+    分别标成 round 1 / round 2，不能因为 build_id_b 现在的 task.round==2
+    就把 round 1 的旧交接也算进 round 2。"""
+    cfg = store.load_config()
+    build_a = {
+        "title": "多轮归属核对", "project": "demo", "runner": "claude",
+        "model": "claude-fable-5", "effort": "high", "run_at": "2026-08-31T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词", "worktree": True,
+        "review": {"enabled": True, "runner": "claude", "model": "claude-fable-5", "effort": "high"},
+    }
+    build_id_a = store.create_task(build_a, cfg)
+    data_a = store.load_task(build_id_a)
+    data_a.update({"shift": 1})
+    store.atomic_write_json(store.task_dir(build_id_a) / "task.json", data_a)
+    (store.task_dir(build_id_a) / "handover-1.md").write_text("第1班(A)round1交接", encoding="utf-8")
+    store.update_status(build_id_a, state="chained")
+
+    build_b_seed = {
+        "title": data_a["title"], "project": data_a["project"], "runner": data_a["runner"],
+        "model": data_a["model"], "effort": data_a["effort"], "run_at": "2026-08-31T18:00:00Z",
+        "task_text": data_a["task_text"], "prompt_final": "提示词B",
+        "review": dict(data_a["review"]), "worktree": True,
+    }
+    build_id_b = store.create_task(build_b_seed, cfg)
+    data_b = store.load_task(build_id_b)
+    # round 1 时刻：shift=2（还在 round 1，产出 handover-2.md）
+    data_b.update({"role": "build", "round": 1, "shift": 2, "pipeline_id": build_id_a,
+                   "parent_id": build_id_a})
+    store.atomic_write_json(store.task_dir(build_id_b) / "task.json", data_b)
+    (store.task_dir(build_id_b) / "handover-2.md").write_text("第2班(B)round1交接", encoding="utf-8")
+
+    review_seed = dict(build_b_seed)
+    review_id = store.create_task(review_seed, cfg)
+    data_r = store.load_task(review_id)
+    data_r.update({"role": "review", "round": 1, "shift": 3, "pipeline_id": build_id_a,
+                   "parent_id": build_id_b})
+    store.atomic_write_json(store.task_dir(review_id) / "task.json", data_r)
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("round1意见：退回", encoding="utf-8")
+    store.update_status(review_id, state="chained", review_verdict="fix", review_file=str(review_file))
+
+    # _review_fix 原地复用 build_id_b 进 round 2：round/shift 前推，round 1
+    # 的存档点归档进 checkpoint_history，round 2 当前存档另记
+    sha_r1 = "a" * 40
+    sha_r2 = "b" * 40
+    data_b2 = store.load_task(build_id_b)
+    data_b2.update({"round": 2, "shift": 4})
+    store.atomic_write_json(store.task_dir(build_id_b) / "task.json", data_b2)
+    store.update_status(
+        build_id_b, state="held", checkpoint_done=True, checkpoint_sha=sha_r2,
+        checkpoint_history=[{"round": 1, "sha": sha_r1}],
+    )
+    (store.task_dir(build_id_b) / "handover-4.md").write_text("第2班(B)round2在途交接", encoding="utf-8")
+
+    status, _, body = authed.request("GET", f"/api/tasks/{build_id_b}/pipeline")
+    assert status == 200, body
+    members = {m["id"]: m for m in body["members"]}
+
+    assert members[build_id_a]["handovers"] == [
+        {"shift": 1, "round": 1, "text": "第1班(A)round1交接"}
+    ]
+    build_b_handovers = sorted(members[build_id_b]["handovers"], key=lambda h: h["shift"])
+    assert build_b_handovers == [
+        {"shift": 2, "round": 1, "text": "第2班(B)round1交接"},
+        {"shift": 4, "round": 2, "text": "第2班(B)round2在途交接"},
+    ]
+    assert members[build_id_b]["checkpoints"] == [
+        {"round": 1, "sha": sha_r1}, {"round": 2, "sha": sha_r2},
+    ]
+    assert members[review_id]["review"] == {
+        "round": 1, "verdict": "fix", "text": "round1意见：退回",
+    }
 
 
 def test_pipeline_detail_multiple_working_sets_warning(authed):

@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
+import stat
 import urllib.parse
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie
@@ -172,31 +174,109 @@ def _background_summary(task_id: str) -> dict:
     return {"running": running, "finished_pending": finished_pending}
 
 
-def _read_capped(path: Path) -> str:
+def _read_capped(path: Path) -> str | None:
     """读一份文本文件，UTF-8 坏字节用替换字符，超过上限只截前一段——不因
-    一份坏文件/异常大文件让整条流水线的展示请求 500。文件不存在/读不了
-    返回空串。"""
+    一份坏文件/异常大文件让整条流水线的展示请求 500。
+
+    S8.1 阻断一：symlink / FIFO / 设备 / 目录等非普通文件一律当"正文缺失"
+    处理（返回 None），绝不跟随读出目标内容。用 O_NOFOLLOW 打开——是
+    symlink 直接在内核层失败（ELOOP），不是"先 resolve() 判断再打开"那种
+    检查与打开之间存在窗口期的可竞态写法；打开成功后再用 fstat 确认
+    S_ISREG，兜底 O_NOFOLLOW 挡不住的其它非普通文件类型（Linux 上目录用
+    O_RDONLY|O_NOFOLLOW 仍可能打开成功，靠 fstat 二次把关）。文件在这中间
+    消失（ENOENT）或任何其它 OSError 同样按正文缺失处理，不 500。
+
+    必须带 O_NONBLOCK：固定文件名如果被换成 FIFO，裸 O_RDONLY 打开会一直
+    阻塞等对端写者（POSIX 语义），直接把处理请求的线程挂死——O_NONBLOCK
+    让"打开一个疑似 FIFO 的东西"永远立即返回（FIFO 无写者时打开成功但
+    读到 EOF，或依系统立即报错），对普通文件的读行为没有任何影响。
+    """
     try:
-        data = path.read_bytes()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
-        return ""
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        data = os.read(fd, _PIPELINE_DOC_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
     if len(data) > _PIPELINE_DOC_MAX_BYTES:
         data = data[:_PIPELINE_DOC_MAX_BYTES]
     return data.decode("utf-8", errors="replace")
 
 
-def _member_handovers(task_id: str) -> list[dict]:
-    """这一班（通常是可能横跨多个 shift 的 build）目录下所有
-    handover-<shift>.md，按 shift 升序——只按固定文件名形状枚举目录，不接
-    受前端传路径、不跟 status 里的 handover_path 字段拼。"""
+def _handover_round_boundaries(members_raw: list[dict]) -> list[tuple[int, int]]:
+    """按 shift 升序排列的 (round, review_shift) 边界表——每个 review 成员
+    自己的 round/shift 就是"这一轮审的是哪个 round，从哪个全局 shift 开始
+    审"，天然标出了它前面那段 build shift 属于哪一轮。
+
+    S8.1 阻断四：一个 build task id 会被 `_review_fix` 原地复用横跨多个
+    round（只改 round/shift，不换 id），同一目录下会攒出多份
+    `handover-<shift>.md`，但文件名只有 shift、没有 round，旧版前端只能
+    按"这个成员现在的 round"一锅端，把历史轮次的交接错记成当前轮。这里
+    用同一条流水线里所有 review 成员的 (round, shift) 作为分界点，反推每
+    份历史 handover 文件产生时真正所属的 round——不改 S7 状态机，不回写
+    任何 task/status，纯读时聚合。
+    """
+    boundaries = [
+        (store.round_of(item["task"]), int(item["task"].get("shift") or 1))
+        for item in members_raw
+        if store.role_of(item["task"]) == "review"
+    ]
+    boundaries.sort(key=lambda pair: pair[1])
+    return boundaries
+
+
+def _round_for_shift(shift: int, boundaries: list[tuple[int, int]], fallback_round: int) -> int:
+    """给一份 handover 文件的 shift 号判定所属 round：找第一个"审这一轮的
+    shift 比这份 handover 的 shift 大"的边界，那条边界的 round 就是答案
+    （build 总是先产生 handover 再被审，同一轮里 build 的 shift 必然小于
+    审它那一轮 review 的 shift）；比所有已知审稿的 shift 都大，说明这份
+    handover 属于还没有审完的当前进行中的 round（用调用方传入的
+    fallback_round，即该 build 成员自己此刻的 round 字段）。
+    """
+    for round_, review_shift in boundaries:
+        if shift < review_shift:
+            return round_
+    return fallback_round
+
+
+def _member_handovers(
+    task_id: str, boundaries: list[tuple[int, int]], fallback_round: int
+) -> list[dict]:
+    """这一班（可能横跨多个 shift/round，同一 task id 被原地复用）目录下
+    所有 handover-<shift>.md，按 shift 升序——只按固定文件名形状枚举目录，
+    不接受前端传路径、不跟 status 里的 handover_path 字段拼。每条额外带
+    `round`（见 `_round_for_shift`），前端按这个字段归轮，不是按整个成员
+    当前的 round 一锅端。
+
+    S8.1 阻断一：不再用 `entry.is_file()` 判断——那是先 `stat()`（跟随
+    symlink）再决定要不要读的两步式检查，`_read_capped` 内部的
+    `open(O_NOFOLLOW)` 之间仍有 TOCTOU 窗口；直接尝试 `_read_capped`，
+    读不到规规矩矩的普通文件（symlink 等）就整条不列进去，不留一条空
+    正文的幽灵记录。
+    """
     out: list[dict] = []
     d = store.task_dir(task_id)
     if not d.is_dir():
         return out
     for entry in d.iterdir():
         m = _RE_HANDOVER_FILE.match(entry.name)
-        if m and entry.is_file():
-            out.append({"shift": int(m.group(1)), "text": _read_capped(entry)})
+        if not m:
+            continue
+        text = _read_capped(entry)
+        if text is None:
+            continue
+        shift = int(m.group(1))
+        out.append({
+            "shift": shift,
+            "round": _round_for_shift(shift, boundaries, fallback_round),
+            "text": text,
+        })
     out.sort(key=lambda item: item["shift"])
     return out
 
@@ -221,13 +301,17 @@ def _member_checkpoints(task: dict, status: dict) -> list[dict]:
 def _member_review(task: dict, status: dict) -> dict | None:
     """review 角色这一轮的审稿意见：只读固定文件名 review-<round>.md，不
     读 status.review_file 里记的路径（那是本机绝对路径，且理论上可能被
-    改坏指向任务目录之外）。没意见也没 verdict 就不给这个键。"""
+    改坏指向任务目录之外）。没意见也没 verdict 就不给这个键。
+
+    S8.1 阻断一：不再用 `review_file.is_file()` 前置判断（跟随 symlink 的
+    两步式检查），直接交给 `_read_capped` 内部的 O_NOFOLLOW+fstat 把关。
+    """
     if store.role_of(task) != "review":
         return None
     round_ = store.round_of(task)
     verdict = status.get("review_verdict")
     review_file = store.task_dir(task["id"]) / f"review-{round_}.md"
-    text = _read_capped(review_file) if review_file.is_file() else None
+    text = _read_capped(review_file)
     if verdict is None and text is None:
         return None
     return {"round": round_, "verdict": verdict, "text": text or ""}
@@ -1166,6 +1250,11 @@ class _Handler(BaseHTTPRequestHandler):
                     branch = item["status"]["branch"]
                     break
 
+        # S8.1 阻断四：同一 build task id 跨轮复用时，历史 handover 文件的
+        # round 归属要靠全条流水线的 review 成员 (round, shift) 边界反推，
+        # 一次性算好传给每个 build 成员，不逐个成员各扫一遍流水线。
+        boundaries = _handover_round_boundaries(members_raw)
+
         members = []
         working = 0
         for item in members_raw:
@@ -1186,7 +1275,9 @@ class _Handler(BaseHTTPRequestHandler):
                 "checkpoints": _member_checkpoints(t, s),
             }
             if store.role_of(t) == "build":
-                entry["handovers"] = _member_handovers(t["id"])
+                entry["handovers"] = _member_handovers(
+                    t["id"], boundaries, store.round_of(t)
+                )
             else:
                 review = _member_review(t, s)
                 if review is not None:
