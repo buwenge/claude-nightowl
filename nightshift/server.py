@@ -1302,6 +1302,13 @@ class _Handler(BaseHTTPRequestHandler):
         S7.1 阻断六：流水线所有成员都已经彻底收尾（`_PIPELINE_WRAPPED_
         STATES`）时拒绝——没有什么可"停在这里"的；send-keys 真失败的窗口
         不计入 pinged，事件文案要如实反映"敲了几个"而不是"看到几个活窗口"。
+
+        F3：只敲当前真正活跃的班（working/waiting_background/waiting_
+        wakeup/held）——chained/idle/exited 等历史或已经停下的成员即使
+        窗口还开着也不敲：它们收到 hold_text 之后的 Stop 会被 hook 无条件
+        转成 held，变成"同流水线 held 的同角色"挡住下一轮同角色起跑，还会
+        白吃保活。idle 的班由 `_hold_blocks` 在它自己下一个决策点拦，不需
+        要靠这里直接敲。
         """
         pipeline_id = self._resolve_pipeline(task_id)
         if pipeline_id is None:
@@ -1320,6 +1327,10 @@ class _Handler(BaseHTTPRequestHandler):
             pinged = []
             for item in members:
                 t, s = item["task"], item["status"] or {}
+                if s.get("state") not in (
+                    "working", "waiting_background", "waiting_wakeup", "held"
+                ):
+                    continue  # F3：历史/已停成员不敲，见上面 docstring
                 wid = s.get("window_id")
                 if not (wid and launcher.window_alive(str(wid), cfg)):
                     continue
