@@ -514,3 +514,20 @@ def test_review_worktree_toggle_round_trip_preserves_non_default_selection():
     sync_wt_body = _extract_js_function_body(js, "syncWorktreeUI")
     assert "populateReviewModelEffort" not in sync_wt_body
     assert "syncReviewUI()" in sync_wt_body  # 仍然要调用，只是它自己不再重建选项
+
+
+def test_after_task_dropdown_hides_ended_chains_and_lists_newest_first():
+    """9/1 工头要求：前置任务下拉不列已结束的链（终态或等合并），新建的排最上。
+
+    字符串级锁：过滤常量由 TERMINAL_STATES 派生并补 awaiting_merge；填充前先
+    filter 再按 root 倒排；编辑态当前选中的前置即使已结束也保留。
+    """
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'var AFTER_HIDDEN_STATES = TERMINAL_STATES.concat(["awaiting_merge"]);' in js
+    body = js[js.index("function refreshTriggerChoices()"):]
+    body = body[:body.index("\n}\n")]
+    assert "AFTER_HIDDEN_STATES.indexOf(st) < 0 || chain.root === want" in body
+    assert "chains.sort(function (a, b) { return a.root < b.root ? 1 : (a.root > b.root ? -1 : 0); });" in body
+    assert body.index(".filter(") < body.index("chains.sort(") < body.index("chains.forEach(")
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert "前置任务（最新在前；已结束的链不列）" in html

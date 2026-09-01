@@ -1416,13 +1416,22 @@ function enterEdit(item) {
 }
 
 // 前置任务下拉：按链只列根任务，显示"标题（id 后 4 位）"
+// 9/1 工头要求：已结束的链（最新一班在终态或等合并）不再列出，免得越攒越多；
+// 剩下的按新建在前排序（任务 id 自带时间戳，字典序倒排即最新在前）。
+// 编辑态里当前选中的前置即使已结束也保留一项，免得静默丢。
+var AFTER_HIDDEN_STATES = TERMINAL_STATES.concat(["awaiting_merge"]);
 function refreshTriggerChoices() {
   api("GET", "./api/tasks").then(function (items) {
     var sel = $("f-after-task");
     var want = EDIT_TASK ?
       String((EDIT_TASK.item.task.trigger || {}).task || "") : "";
     sel.textContent = "";
-    groupChains(items || []).forEach(function (chain) {
+    var chains = groupChains(items || []).filter(function (chain) {
+      var st = (chain.latest.status || {}).state;
+      return AFTER_HIDDEN_STATES.indexOf(st) < 0 || chain.root === want;
+    });
+    chains.sort(function (a, b) { return a.root < b.root ? 1 : (a.root > b.root ? -1 : 0); });
+    chains.forEach(function (chain) {
       var rep = chain.first.task;  // 展示用：链根任务的标题
       sel.appendChild(el("option", {
         value: chain.root,
