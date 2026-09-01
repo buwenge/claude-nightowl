@@ -5,6 +5,7 @@
 """
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -698,3 +699,45 @@ def test_reconcile_flags_branch_mismatch(repo):
     status = store.read_status(task["id"])
     assert status["state"] == "needs_attention"
     assert "分支对不上" in status["error"]
+
+
+# ---------- S8 审查 B：树被人 rm -rf 之后 ----------
+
+
+def _branch_exists(proj: Path, branch: str) -> bool:
+    return subprocess.run(
+        ["git", "-C", str(proj), "rev-parse", "--verify", f"refs/heads/{branch}"],
+        capture_output=True,
+    ).returncode == 0
+
+
+def test_merge_after_tree_rm_rf_reports_needs_attention_not_exception(repo):
+    """树被人 rm -rf 后 merge_task 必须返回 (False, 人话) 并落 needs_attention，不能让
+    GitError 逃到调度器 tick（_finalize_done 没接它，会中断整轮、饿死后面的任务）。"""
+    proj, config = repo
+    task = make_task(config)
+    meta = worktree.ensure_worktree(task, proj)
+    store.update_status(task["id"], **meta)
+    (Path(meta["worktree_path"]) / "work.txt").write_text("活\n", encoding="utf-8")
+    assert worktree.checkpoint(task, meta["worktree_path"])  # 分支领先主线，不走"已合并"捷径
+    shutil.rmtree(meta["worktree_path"])
+    ok, note = worktree.merge_task(task, proj, store.read_status(task["id"]), config)
+    assert ok is False and "不见了" in note
+    status = store.read_status(task["id"])
+    assert status["state"] == "needs_attention" and status["error"] == note
+    assert _branch_exists(proj, meta["branch"])  # 活还在分支上，没丢
+
+
+def test_discard_after_tree_rm_rf_prunes_and_deletes_branch(repo):
+    """树被人 rm -rf 后丢弃：先 prune 残留登记再 branch -D，终态 discarded，而不是
+    "丢弃做了一半…used by worktree"。"""
+    proj, config = repo
+    task = make_task(config)
+    meta = worktree.ensure_worktree(task, proj)
+    store.update_status(task["id"], **meta)
+    shutil.rmtree(meta["worktree_path"])
+    ok, note = worktree.discard_task(task, proj, store.read_status(task["id"]), config)
+    assert ok is True, note
+    assert store.read_status(task["id"])["state"] == "discarded"
+    assert not _branch_exists(proj, meta["branch"])
+    assert worktree.registered_worktree(proj, meta["worktree_path"]) is None

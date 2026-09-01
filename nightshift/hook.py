@@ -321,6 +321,76 @@ def _refresh_context(task: dict, payload: dict, fields: dict) -> None:
         fields["context_pct"] = round(100 * tokens / limit)
 
 
+# S8 审查 B：上下文水位不再只按"固定每 20 次工具调用"刷。审稿班一次 Read 吞
+# 两三万 token，20 次之间上下文能从警戒线下直接越过硬上限（9/1 实测第 20 次
+# 67k、第 30 次真值 249k），提醒来得再晚也没用。增量触发：transcript 自上次
+# 刷新后长了超过"上限的 5%（按 4 字节/token 折算，实测中文为主的 transcript
+# 约 5.3 字节/token，折算偏保守）"就提前刷一次；最少 32 KB。每 20 次照旧。
+_REFRESH_EVERY_CALLS = 20
+_REFRESH_GROWTH_RATIO = 0.05
+_REFRESH_GROWTH_BYTES_PER_TOKEN = 4
+_REFRESH_GROWTH_MIN_BYTES = 32 * 1024
+# 判断"这次工具调用是不是主会话自己的"时只看主 transcript 尾部这么多字节
+_MAIN_TRANSCRIPT_TAIL_BYTES = 512 * 1024
+
+
+def _transcript_size(payload: dict) -> int | None:
+    """payload 里 transcript 的当前字节数；没有/读不到 → None（增量触发退化成每 20 次）。"""
+    path = payload.get("transcript_path")
+    if not path:
+        return None
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return None
+
+
+def _refresh_growth_bytes(task: dict) -> int:
+    """transcript 长多少字节就该提前刷一次水位。config/上限读不到就退回 32 KB 的
+    保守值——宁可多刷几次（一次刷新只是读 transcript 尾部 512 KB）。"""
+    try:
+        limit = _context_limit(task, store.load_config())
+    except Exception:
+        limit = None
+    if not limit:
+        return _REFRESH_GROWTH_MIN_BYTES
+    return max(
+        _REFRESH_GROWTH_MIN_BYTES,
+        int(limit * _REFRESH_GROWTH_RATIO * _REFRESH_GROWTH_BYTES_PER_TOKEN),
+    )
+
+
+def _is_subagent_call(payload: dict) -> bool:
+    """这次 PostToolUse 是不是子 agent 的工具调用。
+
+    CC 对子 agent 的工具调用同样触发本 hook（tool_calls 计数里混着它们，
+    8/28 一个任务 1002 次里 880 次是子 agent 的），payload.transcript_path 仍是
+    主会话的（9/1 本机实证：子 agent 体内那次刷新写下的水位是主会话的值），
+    但 stdout 回注只会进**子 agent**的工具结果，主会话根本看不见——9/1 本机
+    真机：五小时额度暂停提醒 #1/#2 全进了一个一次性 haiku 探针，主会话继续
+    烧额度，status 却已记 quota_paused_until，调度器按"它已停下"处理。
+    上下文提醒同理：子 agent 消费掉提醒、context_warned_at 落盘，主会话没写
+    交接就收工，调度器按"提醒过没交接"走 on_no_handover。
+
+    判据：payload.tool_use_id 在主 transcript 尾部找不到。主会话自己的调用，
+    assistant 那条 tool_use 记录在工具执行前就已落盘；子 agent 的记录在它
+    自己的 agent-<id>.jsonl 里。payload 没有 tool_use_id（老版本 CC）或
+    transcript 读不了 → 按主会话算（回到原有行为，不会把提醒吞掉）。
+    """
+    tool_use_id = payload.get("tool_use_id")
+    path = payload.get("transcript_path")
+    if not tool_use_id or not path:
+        return False
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - _MAIN_TRANSCRIPT_TAIL_BYTES))
+            tail = f.read()
+    except OSError:
+        return False
+    return str(tool_use_id).encode("utf-8") not in tail
+
+
 def _over_warn_line(task: dict, tokens: int | None) -> bool:
     """Stop 用：当前水位是否已过回注警戒线（写进 status 供调度器换班判断）。"""
     if tokens is None:
@@ -887,9 +957,12 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
 
     elif event == "PostToolUse":
         refresh = False
+        was_pending = False
+        size = _transcript_size(payload)
+        growth_limit = _refresh_growth_bytes(task)
 
         def bump_tool_calls(status: dict) -> None:
-            nonlocal refresh
+            nonlocal refresh, was_pending
             calls = int(status.get("tool_calls") or 0) + 1
             status["tool_calls"] = calls
             # S4：有事件就是缓过来了，疑似卡住解除；
@@ -898,12 +971,36 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             status.pop("auto_interrupted", None)
             status.pop("stuck_since", None)
             status["last_event_at"] = now
-            if calls % 20 == 0:  # 每 20 次工具调用刷新一次上下文水位
-                refresh = True
+            was_pending = bool(status.get("context_refresh_pending"))
+            if calls % _REFRESH_EVERY_CALLS == 0 or was_pending:
+                refresh = True  # 每 20 次一刷；或上次该刷的那次落在子 agent 里，欠着
+            elif size is not None:
+                base = status.get("context_refresh_size")
+                if base is None or size < base:
+                    # 没基线（或换了文件/被截断）：只登记基线，不刷
+                    status["context_refresh_size"] = size
+                elif size - base >= growth_limit:
+                    refresh = True  # transcript 长得太快，提前刷（见 _REFRESH_GROWTH_*）
+            if refresh:
+                status.pop("context_refresh_pending", None)
+                if size is not None:
+                    status["context_refresh_size"] = size
 
         status = store.modify_status(task_id, bump_tool_calls)
-        if refresh:  # 锁内算出的新值；上下文字段不是计数，锁外合并即可
-            return _post_tool_use_refresh(task, status, payload)
+        if not refresh:
+            return None
+        if _is_subagent_call(payload):
+            # 回注会进子 agent 的工具结果、主会话看不见（见 _is_subagent_call）：
+            # 这次不刷不注，记一笔"欠着"，主会话下一次工具调用立刻补刷。
+            store.update_status(task_id, context_refresh_pending=True)
+            if not was_pending:
+                store.append_event(
+                    task_id,
+                    f"hook PostToolUse #{status['tool_calls']} 该刷新但落在子 agent 的"
+                    "工具调用里，不回注；留待主会话下一次工具调用",
+                )
+            return None
+        return _post_tool_use_refresh(task, status, payload)  # 锁内算出的新值；上下文字段不是计数，锁外合并即可
 
     elif event == "PreCompact":
         store.append_event(task_id, "hook PreCompact（有人开了 compact？）")

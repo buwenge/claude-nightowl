@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import time
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -601,8 +602,18 @@ def test_notice_window_suffix_and_send_keys(tmp_path, monkeypatch):
     assert "(失败)" in new_window[new_window.index("-n") + 1]
 
     calls.clear()
+    stdin_calls = []
+    monkeypatch.setattr(
+        launcher, "_tmux_stdin",
+        lambda text, *a: stdin_calls.append((text, a)) or subprocess.CompletedProcess(a, 0, "", ""),
+    )
+    monkeypatch.setattr(launcher, "_SEND_ENTER_DELAY_SECONDS", 0)
     launcher.send_keys("@7", "保活探针")
-    assert calls == [("send-keys", "-t", "@7", "保活探针", "Enter")]
+    # S8 审查 B：文本走 load-buffer 的 stdin、paste-buffer 写进 pane，Enter 单独一条
+    assert len(stdin_calls) == 1 and stdin_calls[0][0] == "保活探针"
+    assert stdin_calls[0][1][0] == "load-buffer" and stdin_calls[0][1][-1] == "-"
+    assert [a[0] for a in calls] == ["paste-buffer", "send-keys"]
+    assert calls[1] == ("send-keys", "-t", "@7", "Enter")
 
 
 def test_launch_worktree_cwd_and_transcript(tmp_path, monkeypatch):
@@ -647,7 +658,9 @@ def test_launch_worktree_cwd_and_transcript(tmp_path, monkeypatch):
     assert status2["state"] == "launching"
     run_sh2 = (store.task_dir(task_id2) / "run.sh").read_text(encoding="utf-8")
     assert f"cd '{proj}'" in run_sh2
-    assert ".claude/worktrees" not in run_sh2
+    # 只看 cd 目标：仓库本身可能就住在某个 .claude/worktrees/ 里（run.sh 的
+    # export PYTHONPATH 会带这串，9/1 审稿班在工作树里跑测试就是这么误报的）
+    assert str(proj / ".claude" / "worktrees") not in run_sh2
     st2 = store.read_status(task_id2)
     assert "worktree_path" not in st2
     encoded2 = str(proj).replace("/", "-").replace(".", "-")
@@ -991,3 +1004,131 @@ def test_codex_resume_thread_id_cross_role_never_resumes():
     }
     store.update_status("review-parent", thread_id="review-thread-xyz")
     assert launcher.codex_resume_thread_id(store_home_task) is None
+
+
+# ---------- S8 审查 B：send_keys 通道（文本走 stdin 缓冲，Enter 单独发） ----------
+
+
+def _stub_tmux(monkeypatch, calls, stdin_calls, *, fail_step=None):
+    """桩掉 _tmux/_tmux_stdin，fail_step 指定哪一条 tmux 子命令返回失败。"""
+    def fake_tmux(*args):
+        calls.append(args)
+        rc = 1 if fail_step == args[0] else 0
+        return subprocess.CompletedProcess(args, rc, "", "boom" if rc else "")
+
+    def fake_tmux_stdin(text, *args):
+        stdin_calls.append((text, args))
+        rc = 1 if fail_step == args[0] else 0
+        return subprocess.CompletedProcess(args, rc, "", "boom" if rc else "")
+
+    monkeypatch.setattr(launcher, "_tmux", fake_tmux)
+    monkeypatch.setattr(launcher, "_tmux_stdin", fake_tmux_stdin)
+    monkeypatch.setattr(launcher, "_SEND_ENTER_DELAY_SECONDS", 0)
+
+
+def test_send_keys_text_goes_by_stdin_buffer_then_separate_enter(monkeypatch):
+    """9/1 靶测：文本与 Enter 放同一条 tmux 命令时 CC 按粘贴处理、回车变换行，永远不提交。
+    文本必须走 load-buffer 的 stdin（不经命令行解析：-开头/尾分号/键名/16KB 上限四个坑
+    一起绕开），paste-buffer 写进 pane，Enter 单独一条 send-keys。"""
+    calls, stdin_calls = [], []
+    _stub_tmux(monkeypatch, calls, stdin_calls)
+    text = "-foo; 来自nightshift：" + "长" * 20000 + "\nreturn x;"
+    proc = launcher.send_keys("@7", text)
+    assert proc.returncode == 0
+    assert len(stdin_calls) == 1 and stdin_calls[0][0] == text
+    load_args = stdin_calls[0][1]
+    assert load_args[0] == "load-buffer" and load_args[-1] == "-"
+    buf = load_args[load_args.index("-b") + 1]
+    assert [a[0] for a in calls] == ["paste-buffer", "send-keys"]
+    assert calls[0] == ("paste-buffer", "-d", "-r", "-b", buf, "-t", "@7")
+    assert calls[1] == ("send-keys", "-t", "@7", "Enter")
+    assert all(text not in " ".join(a) for a in calls)  # 文本绝不进 tmux 命令行
+
+
+def test_send_keys_stops_before_enter_when_text_not_delivered(monkeypatch):
+    """文本没进去就不许发 Enter（会把 pane 里现有的半截输入提交出去）；paste 失败还要清缓冲。"""
+    calls, stdin_calls = [], []
+    _stub_tmux(monkeypatch, calls, stdin_calls, fail_step="load-buffer")
+    proc = launcher.send_keys("@7", "x")
+    assert proc.returncode != 0 and calls == []
+
+    calls, stdin_calls = [], []
+    _stub_tmux(monkeypatch, calls, stdin_calls, fail_step="paste-buffer")
+    proc = launcher.send_keys("@7", "x")
+    assert proc.returncode != 0
+    assert [a[0] for a in calls] == ["paste-buffer", "delete-buffer"]
+
+
+def test_send_keys_real_tmux_long_text_and_special_chars(tmux_session, tmp_path, monkeypatch):
+    """真 tmux（ns-selftest）：pane 里跑 `stty raw -echo; cat > 文件`，50KB 文本 + -开头 +
+    尾分号 + 换行 + 键名单词全部原样到达，最后单独一个回车（\\r）。修前 send-keys 对这段
+    文本直接报 "command too long" / "unknown flag"，什么都到不了。"""
+    monkeypatch.setattr(launcher, "_SEND_ENTER_DELAY_SECONDS", 0.05)
+    out = tmp_path / "keys.txt"
+    proc = subprocess.run(
+        ["tmux", "new-window", "-d", "-P", "-F", "#{window_id}", "-t", f"{tmux_session}:",
+         f"stty raw -echo; cat > {launcher._sq(out)}"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    wid = proc.stdout.strip()
+    deadline = time.time() + 5
+    while not out.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    assert out.exists(), "pane 里的 cat 没起来"
+    text = "-foo; 来自nightshift：审稿意见\n" + "审稿意见" * 12000 + "\nEnter\nreturn x;"
+    proc = launcher.send_keys(wid, text)
+    assert proc.returncode == 0, proc.stderr
+    expected = (text + "\r").encode("utf-8")
+    deadline = time.time() + 10
+    while time.time() < deadline and out.read_bytes() != expected:
+        time.sleep(0.1)
+    got = out.read_bytes()
+    assert got == expected, (len(got), len(expected), got[:60], got[-40:])
+
+
+# ---------- S8 审查 B：Codex 信任条目冲突 ----------
+
+
+def test_ensure_codex_trusted_refuses_duplicate_table_when_entry_not_trusted():
+    """同名 [projects."<wt>"] 已在但 trust_level 不是 trusted：追加会让整份 config.toml
+    解析失败（TOML 不允许同名表两次，工头自己的 Codex 也会挂）。必须拒绝、文件原样。"""
+    config_path = launcher.codex_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    wt = "/tmp/proj/.claude/worktrees/abcd-slug"
+    original = f'model = "x"\n\n[projects."{wt}"]\ntrust_level = "untrusted"\n'
+    config_path.write_text(original, encoding="utf-8")
+    with pytest.raises(launcher.CodexTrustError, match="不是 trusted"):
+        launcher.ensure_codex_trusted(wt)
+    assert config_path.read_text(encoding="utf-8") == original
+    tomllib.loads(config_path.read_text(encoding="utf-8"))  # 仍然可解析
+
+
+def test_ensure_codex_trusted_refuses_unparsable_config():
+    """config.toml 本身解析不了：不盲写追加（Codex 照样起不来，还让人以为信任已处理）。"""
+    config_path = launcher.codex_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    original = "this is = not [ toml\n"
+    config_path.write_text(original, encoding="utf-8")
+    with pytest.raises(launcher.CodexTrustError, match="解析失败"):
+        launcher.ensure_codex_trusted("/tmp/proj/.claude/worktrees/x")
+    assert config_path.read_text(encoding="utf-8") == original
+
+
+def test_launch_codex_trust_conflict_fails_task_with_reason(tmp_path, monkeypatch):
+    """launch() 把 CodexTrustError 收成 failed + 人话，不去起一个注定卡死的窗口。"""
+    proj = tmp_path / "proj"
+    init_git_repo(proj)
+    config_path = launcher.codex_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(f'[projects."{proj}"]\ntrust_level = "untrusted"\n', encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(
+        launcher, "_tmux",
+        lambda *a: calls.append(a) or subprocess.CompletedProcess(a, 0, "@1\n", ""),
+    )
+    task_id, config = make_task_codex(project_path=str(proj), worktree=False)
+    status = launcher.launch(task_id, config)
+    assert status["state"] == "failed"
+    assert "写 Codex 信任配置失败" in status["error"] and "不是 trusted" in status["error"]
+    assert not any(a[0] == "new-window" and "run.sh" in " ".join(a) for a in calls)

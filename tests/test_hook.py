@@ -1505,3 +1505,78 @@ def test_codex_hook_never_prints_stdout_injection():
         proc = run_codex_hook(task_id, "PostToolUse", fixture("codex_hook_posttooluse.json"))
         assert proc.stdout == ""
     assert store.read_status(task_id)["tool_calls"] == 25
+
+
+# ---------- S8 审查 B：水位刷新按增量触发；子 agent 体内不回注 ----------
+
+
+def test_post_tool_use_refreshes_early_when_transcript_grows(tmp_path):
+    """第 20 次刷到线下之后几次大 Read 把 transcript 撑过硬上限——不能等到第 40 次才提醒。
+    transcript 自上次刷新长了 ≥ max(32KB, 上限×5%×4B) 就提前刷一次；没再长就不刷（不刷屏）。"""
+    task_id = make_task(
+        guards={"session_pct_max": 80, "context_limit_tokens": 2000, "context_warn_tokens": 1600}
+    )
+    transcript = tmp_path / "transcript.jsonl"
+    payload = make_transcript(transcript, 500)
+    for _ in range(20):
+        run_hook(task_id, "PostToolUse", payload)
+    status = store.read_status(task_id)
+    assert status["tool_calls"] == 20 and status["context_tokens"] == 500
+    assert status["context_refresh_size"] == transcript.stat().st_size
+    # 两次大 Read：transcript 涨 80KB，最后一条 usage 报 2500（已越过硬上限 2000）
+    with transcript.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "user", "message": {"content": "R" * 40000}}) + "\n")
+        f.write(json.dumps({"type": "assistant", "message": {"usage": {"input_tokens": 1000}}}) + "\n")
+        f.write(json.dumps({"type": "user", "message": {"content": "R" * 40000}}) + "\n")
+        f.write(json.dumps({"type": "assistant", "message": {"usage": {"input_tokens": 2500}}}) + "\n")
+    proc = run_hook(task_id, "PostToolUse", payload)  # 第 21 次：增量触发，立刻刷新并回注
+    assert proc.returncode == 0, proc.stderr
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "2k" in ctx
+    status = store.read_status(task_id)
+    assert status["tool_calls"] == 21 and status["context_tokens"] == 2500
+    assert status["context_warn_count"] == 1
+    proc = run_hook(task_id, "PostToolUse", payload)  # 第 22 次：没再长，不刷不注
+    assert proc.stdout == ""
+    assert store.read_status(task_id)["context_warn_count"] == 1
+
+
+def test_post_tool_use_subagent_call_defers_injection_to_main(tmp_path):
+    """9/1 本机真机复现：第 20 次落在子 agent 的工具调用里时，回注只会进子 agent 的工具
+    结果，主会话看不见、status 却已记 warned/paused。判据：payload.tool_use_id 不在主
+    transcript 尾部 → 这次不刷不注、记欠账；主会话下一次工具调用立刻补刷补注。"""
+    task_id = make_task(
+        guards={"session_pct_max": 80, "context_warn_tokens": 400, "context_limit_tokens": 2000}
+    )
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "usage": {"input_tokens": 1200},
+                "content": [{"type": "tool_use", "id": "toolu_main_001", "name": "Bash", "input": {}}],
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+    base = json.loads(fixture("hook_userpromptsubmit.json"))
+    base["transcript_path"] = str(transcript)
+    main_payload = json.dumps({**base, "tool_use_id": "toolu_main_001"})
+    sub_payload = json.dumps({**base, "tool_use_id": "toolu_sub_999"})
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", main_payload)
+    proc = run_hook(task_id, "PostToolUse", sub_payload)  # 第 20 次在子 agent 里
+    assert proc.returncode == 0 and proc.stdout == ""
+    status = store.read_status(task_id)
+    assert status["tool_calls"] == 20
+    assert status.get("context_warned_at") is None and status.get("context_tokens") is None
+    assert status["context_refresh_pending"] is True
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "落在子 agent" in events
+    proc = run_hook(task_id, "PostToolUse", main_payload)  # 第 21 次回到主会话：补刷补注
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "1k" in ctx
+    status = store.read_status(task_id)
+    assert status["context_warned_at"] and status["context_warn_count"] == 1
+    assert status["context_tokens"] == 1200
+    assert "context_refresh_pending" not in status

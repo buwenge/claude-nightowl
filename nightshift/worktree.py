@@ -538,7 +538,11 @@ def check_task_tree(
         return reason
     wt = status["worktree_path"]
     branch = status["branch"]
-    entry = registered_worktree(project_path, wt)
+    try:
+        entry = registered_worktree(project_path, wt)
+    except WorktreeError as exc:
+        # 项目仓库本身 Git 出错：说人话返回，不让异常逃到调度器 tick 里
+        return f"核对工作树登记时 Git 出错：{exc}"
     if entry is None:
         return f"这个路径不是项目登记的工作树：{wt}"
     if entry.get("branch") != f"refs/heads/{branch}":
@@ -612,9 +616,19 @@ def merge_task(
         fresh_status = store.read_status(task["id"])
         if fresh_status.get("state") == "merged":
             return True, "已经合并进主线，工作树与分支已清理"
-        return _merge_task_locked(
-            task, project_path, fresh_status, config, close_windows=close_windows,
-        )
+        try:
+            return _merge_task_locked(
+                task, project_path, fresh_status, config, close_windows=close_windows,
+            )
+        except WorktreeError as exc:
+            # S8 审查 B：任何一步 Git 出错（典型：工作树被人 rm -rf 后 `git -C <树>`
+            # 进不去目录）都收成 needs_attention + 人话，绝不让异常逃出去——
+            # 调度器 tick 的 _finalize_done 没接这个异常，逃出去会中断整轮
+            # tick，排在后面的任务全部饿死。
+            return _merge_fail(
+                task["id"], f"合并过程中 Git 出错，已停手（树与分支保留）：{exc}",
+                fresh_status.get("merge_sha"),
+            )
 
 
 def _merge_task_locked(
@@ -653,6 +667,14 @@ def _merge_task_locked(
     if not (already_merged or fully_gone):
         reason = check_task_tree(task, project_path, status)
         if reason:
+            return _merge_fail(task_id, reason, merge_sha)
+        if not Path(wt).is_dir():
+            # 登记还在（git worktree list 仍列着、可 prune）但目录没了：存档点后
+            # 有没有改动无从核对，不替人拍板，说清楚等人来
+            reason = (
+                f"工作树目录不见了（被人删了？）：{wt}；没敢合并，分支 {branch} 保留着，"
+                "请人工核对后在网页合并或丢弃"
+            )
             return _merge_fail(task_id, reason, merge_sha)
         if not worktree_clean(wt):
             reason = "存档点后工作树又有改动，没敢合并；先处理掉再点'合并进主线'"
@@ -714,6 +736,11 @@ def _cleanup_tree(project_path: str | Path, wt: str, branch: str) -> str | None:
         proc = _git(project_path, "worktree", "remove", wt)
         if proc.returncode != 0:
             return f"worktree remove：{_tail(proc)}"
+    elif wt:
+        # 目录已经不在但 .git/worktrees 里可能还登记着（被人 rm -rf 的树）：不 prune
+        # 的话 branch -d 会报 "used by worktree" 删不掉。prune 只清"目录已不存在"
+        # 的登记项，不碰任何文件；失败也不拦（下一步 branch -d 会给出真实原因）。
+        _git(project_path, "worktree", "prune")
     if branch and _branch_exists(project_path, branch):
         proc = _git(project_path, "branch", "-d", branch)
         if proc.returncode != 0:
@@ -742,9 +769,13 @@ def discard_task(
         fresh_status = store.read_status(task["id"])
         if fresh_status.get("state") == "discarded":
             return True, "已经丢弃：工作树与 ns 分支已删除"
-        return _discard_task_locked(
-            task, project_path, fresh_status, config, close_windows=close_windows,
-        )
+        try:
+            return _discard_task_locked(
+                task, project_path, fresh_status, config, close_windows=close_windows,
+            )
+        except WorktreeError as exc:
+            # 同 merge_task：Git 出错只在核验阶段发生（删除之前），收成人话返回
+            return False, f"丢弃失败（什么都没删）：{exc}"
 
 
 def _discard_task_locked(
@@ -773,6 +804,9 @@ def _discard_task_locked(
         if proc.returncode != 0:
             reason = f"丢弃失败（什么都没删成，树保留）：worktree remove：{_tail(proc)}"
             return False, reason
+    else:
+        # 目录已被人删掉：先 prune 掉残留登记，否则 branch -D 报 "used by worktree"
+        _git(project_path, "worktree", "prune")
     if _branch_exists(project_path, branch):
         proc = _git(project_path, "branch", "-D", branch)
     else:
