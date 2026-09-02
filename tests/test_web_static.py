@@ -531,3 +531,47 @@ def test_after_task_dropdown_hides_ended_chains_and_lists_newest_first():
     assert body.index(".filter(") < body.index("chains.sort(") < body.index("chains.forEach(")
     html = (WEB / "index.html").read_text(encoding="utf-8")
     assert "前置任务（最新在前；已结束的链不列）" in html
+
+
+# ---------- 9/1 Fable 审查 C 组：前端六处 ----------
+
+import re as _re
+
+
+def _js_fn(name: str) -> str:
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    m = _re.search(rf"\nfunction {name}\(.*?\n}}\n", js, _re.S)
+    assert m, name
+    return m.group(0)
+
+
+def test_submit_button_disabled_while_request_in_flight():
+    """手机双击「建任务」不能建出两个任务（工作树任务互不排斥，两个都会起）。"""
+    body = _js_fn("submitNewForm")
+    assert "SUBMIT_INFLIGHT" in body
+    assert _re.search(r'\$\("new-submit"\)\.disabled\s*=\s*true', body)
+    assert "rescheduled" in body  # 编辑 failed/cancelled 后如实说有没有重排
+
+
+def test_enter_create_resets_form_left_over_from_edit():
+    body = _js_fn("enterCreate")
+    assert "reset()" in body and "FORM_STALE" in body
+    assert "FORM_STALE = true" in _js_fn("enterEdit")
+
+
+def test_task_card_uses_runner_aware_model_limit():
+    body = _js_fn("taskCard")
+    assert "modelLimit(task.model" in body and "CFG.models[task.model]" not in body
+
+
+def test_pipeline_detail_cache_invalidated_when_members_change():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "function pipelineSignature(" in js
+    body = _js_fn("pipelineDetailPanel")
+    assert "PIPELINE_DETAIL_CACHE[chain.root] = null" in body
+
+
+def test_refresh_tasks_guards_stale_response_and_reports_failure():
+    body = _js_fn("refreshTasks")
+    assert "TASKS_SEQ" in body
+    assert _re.search(r"catch\(function \(err\)\s*\{[^}]*banner\(", body, _re.S)

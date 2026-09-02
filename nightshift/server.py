@@ -963,13 +963,34 @@ class _Handler(BaseHTTPRequestHandler):
         return self._send_json(200, {"ok": True})
 
     def _api_cancel(self, task_id: str) -> None:
-        if self._load_existing(task_id) is None:
+        task = self._load_existing(task_id)
+        if task is None:
             return
         state = store.read_status(task_id).get("state")
         if state not in ("scheduled", "postponed"):
             return self._send_json(
                 409,
                 {"error": f"只有 scheduled/postponed 的任务能取消，当前是 {state or '-'}"},
+            )
+        # 9/1 审查 C1：流水线卡片上"最新一班"往往是还没起跑的审稿班，它的
+        # 「取消」按钮跟单任务一模一样，但单独取消它会让同流水线 held 着等它
+        # 的那一班（build 等审稿 / review 等返工）永远等下去：skip-review 与
+        # fix-now 都因"审稿已 cancelled"而 409，held 班每个保活间隔吃一轮额度
+        # 直到天亮，阶段签仍显示"审稿中"。有人 held 着等它就拒绝，并把人指向
+        # 真正能收掉整条流水线的动作。没人等（对侧已 exited/结束）照旧可取消。
+        waiting = [
+            item for item in self._pipeline_members(store.pipeline_id_of(task))
+            if item["task"]["id"] != task_id
+            and (item["status"] or {}).get("state") == "held"
+        ]
+        if waiting:
+            me = "审稿" if store.role_of(task) == "review" else "施工"
+            other = "施工" if store.role_of(waiting[0]["task"]) == "build" else "审稿"
+            return self._send_json(
+                409,
+                {"error": f"这一班是流水线里被等着的{me}班，{other}班正 held 着等它，"
+                          f"单独取消会让它永远等下去。要收掉整条流水线请用"
+                          "「跳过审稿直接收工」或「直接返工」，或先「我来看」再决定"},
             )
         store.update_status(task_id, state="cancelled", last_event_at=store.utc_now_iso())
         store.append_event(task_id, "网页：已取消")
@@ -1008,18 +1029,35 @@ class _Handler(BaseHTTPRequestHandler):
                 )
         task.update(data)
         try:
-            store.validate_task(task, store.load_config(), task_id=task_id)
+            ttype = store.validate_task(task, store.load_config(), task_id=task_id)
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
+        # 9/1 审查 C2：failed/cancelled 跟 postponed 一样算"未跑可编辑"，但以前
+        # 只有 postponed 编辑后回 scheduled——改了 failed 任务的开跑时间，task.json
+        # 变了、state 还是 failed，tick 对 failed 不做任何事，卡片却显示"计划
+        # 23:00（还有 2 小时）"。现在三种状态编辑后一律重排；为防"只改个标题就
+        # 按早已过去的时间悄悄立刻起跑"（cancelled 的任务多半 run_at 已过），
+        # failed/cancelled 且按时间触发时，新时间必须在未来，否则 400 让人明确
+        # 选择：改时间，或用「现在就跑」。postponed 保持原口径（它本来就在等重试）。
+        reschedule = state in ("postponed", "failed", "cancelled")
+        if (
+            state in ("failed", "cancelled") and ttype == "time"
+            and str(task.get("run_at") or "") <= store.utc_now_iso()
+        ):
+            return self._send_json(
+                400,
+                {"error": f"任务是{state}，保存会重新排班，但开跑时间 {task.get('run_at')} "
+                          "已经过了：请改成将来的时间，或直接点「现在就跑」"},
+            )
         store.atomic_write_json(store.task_dir(task_id) / "task.json", task)
-        if state == "postponed":
-            # 改完回到 scheduled，旧的"下次尝试"与推迟原因作废
+        if reschedule:
+            # 改完回到 scheduled，旧的"下次尝试"/推迟原因/失败原因/重试计数作废
             def mut(status: dict) -> None:
                 status["state"] = "scheduled"
+                status["retries"] = 0
                 status["last_event_at"] = store.utc_now_iso()
-                status.pop("next_attempt_at", None)
-                status.pop("postpone_reason", None)
-                status.pop("error", None)
+                for key in ("next_attempt_at", "retry_at", "postpone_reason", "error"):
+                    status.pop(key, None)
 
             store.modify_status(task_id, mut)
         if "trigger" in data:
@@ -1030,9 +1068,14 @@ class _Handler(BaseHTTPRequestHandler):
 
             store.modify_status(task_id, mut_trigger)
         keys = "、".join(sorted(data.keys()))
-        store.append_event(task_id, f"网页编辑：改了 {keys}")
-        logger.info("网页编辑任务：%s（%s）", task_id, keys)
-        return self._send_json(200, {"ok": True})
+        note = f"；从 {state} 重新排班" if reschedule and state != "postponed" else ""
+        store.append_event(task_id, f"网页编辑：改了 {keys}{note}")
+        logger.info("网页编辑任务：%s（%s%s）", task_id, keys, note)
+        return self._send_json(
+            200,
+            {"ok": True, "state": store.read_status(task_id).get("state"),
+             "rescheduled": bool(reschedule)},
+        )
 
     def _read_draft(self, task_id: str) -> str | None:
         """读捎话草稿；没有/读不了返回 None。"""
@@ -1067,7 +1110,18 @@ class _Handler(BaseHTTPRequestHandler):
             return
         # 多行折成单行：tmux send-keys 一次敲进去，换行会变成提前回车
         single_line = " ".join(text.splitlines()) or text
-        launcher.send_keys(str(window_id), single_line)
+        proc = launcher.send_keys(str(window_id), single_line)
+        # 9/1 审查 N-d：tmux 真失败（窗口刚死、文本被当参数解析等）不能假装
+        # 已发出——把这段话存成草稿保住，回非 2xx 让前端如实提示
+        if getattr(proc, "returncode", 0) != 0:
+            store.atomic_write_text(store.task_dir(task_id) / "draft.txt", text)
+            store.append_event(
+                task_id, f"捎话：send-keys 失败（returncode={proc.returncode}），已存为草稿"
+            )
+            logger.warning("网页捎话 send-keys 失败：%s（returncode=%s）", task_id, proc.returncode)
+            return self._send_json(
+                502, {"error": "没敲进去（tmux send-keys 失败），这段话已存成草稿，稍后再试"}
+            )
         (store.task_dir(task_id) / "draft.txt").unlink(missing_ok=True)
         # S4.1：事件日志记折行后的单行文本，多行捎话不再把 events.log 拆成多行
         store.append_event(task_id, f"捎话：{single_line[:80]}")
@@ -1642,13 +1696,19 @@ class _Handler(BaseHTTPRequestHandler):
         actions = scheduler._finalize_done(
             t, cfg, datetime.now(timezone.utc), skip_review=True
         )
-        merge_ok = store.read_status(t["id"]).get("state") != "needs_attention"
+        build_status = store.read_status(t["id"])
+        merge_ok = build_status.get("state") != "needs_attention"
         store.append_event(t["id"], "网页：跳过审稿，直接按 merge policy 收工")
         logger.info("网页跳过审稿：%s → %s", pipeline_id, t["id"])
-        status_code = 200 if merge_ok else 409
-        return self._send_json(
-            status_code, {"ok": merge_ok, "task_id": t["id"], "merge_ok": merge_ok, "actions": actions}
-        )
+        out = {"ok": merge_ok, "task_id": t["id"], "merge_ok": merge_ok, "actions": actions}
+        if not merge_ok:
+            # 9/1 审查 N-c：409 体里没有 error 键时前端只能显示"请求失败（409）"，
+            # 而待审班已经取消、build 已经收尾——要把"做了什么、哪一步没成"说清
+            out["error"] = (
+                f"已跳过审稿（取消了 {len(pending_reviews)} 个待审班），但自动收尾没成："
+                f"{build_status.get('error') or '见任务详情'}"
+            )
+        return self._send_json(200 if merge_ok else 409, out)
 
     def _api_pipeline_fix_now(self, task_id: str) -> None:
         """直接返工：不等审稿，带用户给的非空 instruction（或复用这一轮已有
@@ -1688,9 +1748,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         text = (instruction or "").strip()
         if not text:
-            latest = rs.get("review_file")
-            if latest and Path(latest).is_file():
-                text = Path(latest).read_text(encoding="utf-8", errors="replace")
+            # 9/1 审查 N-e：跟 _member_review 同一口径——只读固定文件名
+            # review-<round>.md（O_NOFOLLOW + 上限），不照 status.review_file 里
+            # 的绝对路径读，S8.1 的展示契约在这条写路径上同样成立
+            text = _read_capped(
+                store.task_dir(rt["id"]) / f"review-{store.round_of(rt)}.md"
+            ) or ""
         if not text:
             return self._send_json(
                 400, {"error": "instruction 不能为空，且这一轮也没有可用的审稿意见"}
