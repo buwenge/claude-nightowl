@@ -1399,6 +1399,15 @@ def test_quota_warn_text_from_config(tmp_path):
     assert ctx == "自定义暂停：剩15，线20"
 
 
+def test_quota_wrapup_text_constant_includes_no_alarm_heads_up():
+    """H9：build 周额度收尾话术的兜底常量得提醒别再挂闹钟——挂着闹钟
+    调度器会当它还没停（9/2 真机事故②的另一半根因）。"""
+    from nightshift.hook import QUOTA_WRAPUP_TEXT, _NO_ALARM_HEADS_UP
+
+    assert "不要再挂" in _NO_ALARM_HEADS_UP
+    assert _NO_ALARM_HEADS_UP in QUOTA_WRAPUP_TEXT
+
+
 def test_weekly_quota_wrapup_beats_pause(tmp_path):
     """周线到了 → 收尾交接（哪怕五小时也到了，收尾优先）；写 context_warned_at 供换班判定。"""
     task_id = make_task(guards={
@@ -1412,7 +1421,10 @@ def test_weekly_quota_wrapup_beats_pause(tmp_path):
     proc = run_hook(task_id, "PostToolUse", payload)
     ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "周额度只剩 3%" in ctx and "NEXT: done" in ctx and "handover-1.md" in ctx
-    assert "ScheduleWakeup" not in ctx
+    assert "连续设" not in ctx  # 五小时暂停那套"用 ScheduleWakeup 连续设…"没混进来
+    # H9：收尾话术要提醒别再挂闹钟——挂着闹钟调度器会当它还没停（9/2 真机
+    # 事故②的另一半根因）
+    assert "不要再挂" in ctx
     status = store.read_status(task_id)
     assert status["quota_warn_count"] == 1 and status["context_warned_at"]
 

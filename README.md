@@ -105,8 +105,9 @@ hook 的 stdout 平时沉默；唯一例外见下一节——`PostToolUse` 回�
 
 > [nightshift] 上下文已 412k / 500k，到警戒线了。现在收尾：①把已完成/未完成/
 > 下一步写进 ~/.nightshift/tasks/<任务id>/handover-1.md，末行写 NEXT: continue
-> 或 NEXT: done；②未提交的改动 commit；③然后停下，不要再开新的活。调度器会
-> 按交接开下一班。
+> 或 NEXT: done；②未提交的改动 commit；③然后停下，不要再开新的活。停下时不要
+> 再挂 ScheduleWakeup 闹钟（已经设了的先用 ScheduleWakeup stop 撤掉），挂着
+> 闹钟调度器会当你还没停。调度器会按交接开下一班。
 
 文案可在 `config.context_warn_text`（或任务级 `guards.context_warn_text`）里改。
 每过 20 次工具调用仍在线上就再注一次，直到模型真的收尾。
@@ -149,6 +150,13 @@ hook 的 stdout 平时沉默；唯一例外见下一节——`PostToolUse` 回�
 文件：`continue` → 走一遍完整预检（额度不够就推迟，绝不硬起）→ 开下一班窗口，
 提示词 = `chain_template` 渲染的"第 N 班 + 上一班交接"；`done` → 任务 finished。
 会话在写完交接后崩了/被关了（exited）也一样认交接。
+
+写完交接但还挂着缓存闹钟（`waiting_wakeup`，比如收尾前设过闹钟没撤）的班同样
+按交接换班；换班成功后调度器会往父窗口敲一句让它用 `ScheduleWakeup stop` 撤
+掉闹钟，不然闹钟每次响都会把已经换班的窗口拉起来一次。交接文件在评估过之后
+又被重写（比如人工在同一个窗口继续聊天、让它把交接改了）会触发重新评估一次；
+如果没有重写，人工聊完这个窗口会被调度器摁回评估时的原状态（比如又变回
+`finished`），不会一直悬在"working"里出不来。
 
 **没留交接怎么办（`chain.on_no_handover`）。** 这班收到过提醒却没写交接：
 

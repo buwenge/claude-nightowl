@@ -109,9 +109,9 @@
     "background_heartbeat_stale_seconds": 90
   },
   "prompt_template": "你在无人值守的定时会话里工作，项目目录 {project_path}。任务：{title}\n\n{task}\n\n{worktree_instruction}没有人在场：遇到问题按合理判断继续，不要停下来等确认。长于 20 分钟的外部命令请用后台方式跑。本会话上下文上限约 {context_limit} tokens，快到线时调度器会提醒你收尾。",
-  "context_warn_text": "[nightshift] 上下文已 {ctx_k}k / {limit_k}k，到警戒线了。现在收尾：①把已完成/未完成/下一步写进 {handover_path}，末行写 NEXT: continue 或 NEXT: done；②{commit_step}然后停下，不要再开新的活。调度器会按交接开下一班。",
+  "context_warn_text": "[nightshift] 上下文已 {ctx_k}k / {limit_k}k，到警戒线了。现在收尾：①把已完成/未完成/下一步写进 {handover_path}，末行写 NEXT: continue 或 NEXT: done；②{commit_step}然后停下，不要再开新的活。停下时不要再挂 ScheduleWakeup 闹钟（已经设了的先用 ScheduleWakeup stop 撤掉），挂着闹钟调度器会当你还没停。调度器会按交接开下一班。",
   "quota_pause_text": "[nightshift] 五小时额度只剩 {session_left}%（线 {session_line_left}%），约 {resets_in} 分钟后刷新。现在停止干活，不要再开新的工具调用：按家规定缓存闹钟——用 ScheduleWakeup 连续设 {alarm_plan}，每个闹钟醒来只输出一个“·”再设下一个，最后一个闹钟醒来后从刚才停下的地方继续。若有子 agent 在跑，先让它收尾或停掉，再执行上面的动作。",
-  "quota_wrapup_text": "[nightshift] 周额度只剩 {week_left}%（线 {week_line_left}%）{model_note}，一时半会儿刷新不了。现在收尾：把已完成/未完成/下一步写进 {handover_path}，末行写 NEXT: done（本周不再续班，交接留给下次）；{commit_step}然后停下。若有子 agent 在跑，先让它收尾或停掉，再执行上面的动作。",
+  "quota_wrapup_text": "[nightshift] 周额度只剩 {week_left}%（线 {week_line_left}%）{model_note}，一时半会儿刷新不了。现在收尾：把已完成/未完成/下一步写进 {handover_path}，末行写 NEXT: done（本周不再续班，交接留给下次）；{commit_step}然后停下。停下时不要再挂 ScheduleWakeup 闹钟（已经设了的先用 ScheduleWakeup stop 撤掉），挂着闹钟调度器会当你还没停。若有子 agent 在跑，先让它收尾或停掉，再执行上面的动作。",
   "quota_other_model_text": "[nightshift] 提示：{label} 的周额度只剩 {left}%（线 {line_left}%）。本会话的模型不受影响，但接下来别再派 {label} 的子 agent、也别切到它。",
   "subagent_quota_notice_text": "来自nightshift：账号额度已到线（五小时剩 {session_left}% / 七日剩 {week_left}%），请立刻收尾，把已有结果汇报给主会话后停下，不要再开新的工具调用。",
   "chain_template": "你在无人值守的定时会话里工作，项目目录 {project_path}。任务：{title}\n\n{task}\n\n这是第 {shift} 班。上一班交接如下：\n{handover}\n\n先核对交接里说的状态再动手。{worktree_instruction}没有人在场：遇到问题按合理判断继续，不要停下来等确认。长于 20 分钟的外部命令请用后台方式跑。本会话上下文上限约 {context_limit} tokens，快到线时调度器会提醒你收尾。",

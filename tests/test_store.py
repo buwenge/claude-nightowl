@@ -362,6 +362,15 @@ def test_config_example_json_valid():
         assert spec["context_limit"] is None
 
 
+def test_config_example_json_no_alarm_heads_up_present():
+    """H9：写完交接、然后停下时不该顺手留着 ScheduleWakeup 闹钟——build
+    的收尾话术（上下文到线、周额度收尾）统一补一句提醒。"""
+    example = Path(__file__).resolve().parent.parent / "config.example.json"
+    config = json.loads(example.read_text(encoding="utf-8"))
+    assert "不要再挂" in config["context_warn_text"]
+    assert "不要再挂" in config["quota_wrapup_text"]
+
+
 # ---------- S5：worktree / review 字段 ----------
 
 

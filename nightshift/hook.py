@@ -36,6 +36,14 @@ __all__ = [
 # 文案（build 的 pause/wrapup、review 的 pause/wrapup）末尾都加这句。
 _SUBAGENT_HEADS_UP = "若有子 agent 在跑，先让它收尾或停掉，再执行上面的动作。"
 
+# H9：build 收尾（写完交接、然后停下）时若还挂着 ScheduleWakeup 缓存闹钟，
+# 调度器会一直当它没停下（9/2 真机事故②：waiting_wakeup 只要交接没被摸到
+# 就永远不换班）——收尾话术里明说一句，提醒顺手撤掉。
+_NO_ALARM_HEADS_UP = (
+    "停下时不要再挂 ScheduleWakeup 闹钟（已经设了的先用 ScheduleWakeup stop 撤掉），"
+    "挂着闹钟调度器会当你还没停。"
+)
+
 # 五小时额度到线：停下等刷新（缓存闹钟）；周额度到线：收尾交接。文案在 config 里可改。
 QUOTA_PAUSE_TEXT = (
     "[nightshift] 五小时额度只剩 {session_left}%（线 {session_line_left}%），约 {resets_in} 分钟后刷新。"
@@ -52,6 +60,7 @@ QUOTA_WRAPUP_TEXT = (
     "[nightshift] 周额度只剩 {week_left}%（线 {week_line_left}%）{model_note}，一时半会儿刷新不了。"
     "现在收尾：把已完成/未完成/下一步写进 {handover_path}，末行写 NEXT: done（本周不再续班，交接留给下次）；"
     "{commit_step}然后停下。"
+    f"{_NO_ALARM_HEADS_UP}"
     f"{_SUBAGENT_HEADS_UP}"
 )
 # S7：审稿班（role=review）额度到线收尾，跟 build 的收尾话术不同——
