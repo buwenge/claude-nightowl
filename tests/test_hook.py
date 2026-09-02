@@ -1643,6 +1643,44 @@ def test_post_tool_use_refreshes_early_when_transcript_grows(tmp_path):
     assert store.read_status(task_id)["context_warn_count"] == 1
 
 
+def test_post_tool_use_time_triggered_refresh_fires_after_5_minutes(tmp_path):
+    """总review F5：每次工具调用都跑几分钟测试的班，"每 20 次"之间可能一
+    小时都不刷一次水位/额度（B 组报告 B-2）。距上次刷新决定成立 ≥ 5 分钟
+    要提前刷一次，不等到第 20 次。"""
+    task_id = make_task(guards={
+        "session_pct_max": 80, "weekly_pct_max": 95,
+        "context_warn_tokens": 100000, "context_limit_tokens": 200000,
+    })
+    payload = make_transcript(tmp_path / "transcript.jsonl", 100)
+    for _ in range(4):
+        run_hook(task_id, "PostToolUse", payload)
+    assert "context_refreshed_at" in store.read_status(task_id)  # 首次调用只登记
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.update_status(task_id, context_refreshed_at=stale)
+    proc = run_hook(task_id, "PostToolUse", payload)  # 第 5 次：距上次刷新 6 分钟 → 刷
+    assert proc.returncode == 0
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "hook PostToolUse #5 刷新上下文" in events
+    assert store.read_status(task_id)["context_refreshed_at"] != stale
+
+
+def test_post_tool_use_time_triggered_refresh_does_not_fire_before_5_minutes(tmp_path):
+    task_id = make_task(guards={
+        "session_pct_max": 80, "weekly_pct_max": 95,
+        "context_warn_tokens": 100000, "context_limit_tokens": 200000,
+    })
+    payload = make_transcript(tmp_path / "transcript.jsonl", 100)
+    for _ in range(4):
+        run_hook(task_id, "PostToolUse", payload)
+    fresh = (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.update_status(task_id, context_refreshed_at=fresh)
+    run_hook(task_id, "PostToolUse", payload)  # 第 5 次：距上次刷新只 1 分钟 → 不刷
+    events_path = store.task_dir(task_id) / "events.log"
+    events = events_path.read_text(encoding="utf-8") if events_path.is_file() else ""
+    assert "hook PostToolUse #5 刷新上下文" not in events
+    assert store.read_status(task_id)["context_refreshed_at"] == fresh
+
+
 def test_post_tool_use_subagent_call_defers_injection_to_main(tmp_path):
     """9/1 本机真机复现：第 20 次落在子 agent 的工具调用里时，回注只会进子 agent 的工具
     结果，主会话看不见、status 却已记 warned/paused。判据：payload.tool_use_id 不在主

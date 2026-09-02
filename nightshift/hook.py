@@ -371,6 +371,10 @@ _REFRESH_GROWTH_BYTES_PER_TOKEN = 4
 _REFRESH_GROWTH_MIN_BYTES = 32 * 1024
 # 判断"这次工具调用是不是主会话自己的"时只看主 transcript 尾部这么多字节
 _MAIN_TRANSCRIPT_TAIL_BYTES = 512 * 1024
+# 总review F5：每次工具调用跑几分钟测试的班，"每 20 次"之间可能一小时都
+# 不查一次额度/水位（B 组报告 B-2：注入不够及时）。距上次刷新决定成立
+# 超过这么多秒也提前刷一次，跟"每 20 次"/"transcript 增量"两个条件并列。
+_REFRESH_MAX_INTERVAL_SECONDS = 300
 
 
 def _transcript_size(payload: dict) -> int | None:
@@ -1071,8 +1075,19 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             status.pop("stuck_since", None)
             status["last_event_at"] = now
             was_pending = bool(status.get("context_refresh_pending"))
-            if calls % _REFRESH_EVERY_CALLS == 0 or was_pending:
-                refresh = True  # 每 20 次一刷；或上次该刷的那次落在子 agent 里，欠着
+            refreshed_at = status.get("context_refreshed_at")
+            time_trigger = False
+            if refreshed_at:
+                try:
+                    elapsed = (
+                        datetime.fromisoformat(now.replace("Z", "+00:00"))
+                        - datetime.fromisoformat(refreshed_at.replace("Z", "+00:00"))
+                    ).total_seconds()
+                    time_trigger = elapsed >= _REFRESH_MAX_INTERVAL_SECONDS
+                except ValueError:
+                    time_trigger = False
+            if calls % _REFRESH_EVERY_CALLS == 0 or was_pending or time_trigger:
+                refresh = True  # 每 20 次一刷；或欠着的补刷；或距上次刷新太久了
             elif size is not None:
                 base = status.get("context_refresh_size")
                 if base is None or size < base:
@@ -1084,6 +1099,11 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
                 status.pop("context_refresh_pending", None)
                 if size is not None:
                     status["context_refresh_size"] = size
+                status["context_refreshed_at"] = now
+            elif refreshed_at is None:
+                # F5：从没记过刷新时刻（老状态/这一班第一次调用）——先登记
+                # 一个起点，不强行触发刷新（不然每个任务第一次调用就必刷）。
+                status["context_refreshed_at"] = now
 
         status = store.modify_status(task_id, bump_tool_calls)
         if not refresh:
