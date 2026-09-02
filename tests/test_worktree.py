@@ -441,12 +441,29 @@ def test_merge_refuses_fully_gone_without_persisted_proof(repo):
     assert store.read_status(task["id"])["state"] == "needs_attention"
 
 
-def test_merge_task_dirty_main_refuses(repo):
+def test_merge_task_dirty_main_untracked_no_longer_blocks(repo):
+    """总review二 G6：主线只看已跟踪文件——一个临时笔记这类 untracked 杂物
+    不该拦自动合并。"""
+    proj, config = repo
+    task, meta = _tree_with_canary(repo)
+    # 主线有 untracked（工头自己的东西，不是 git 管的）
+    (proj / "工头的笔记.txt").write_text("别动\n", encoding="utf-8")
+    ok, note = worktree.merge_task(
+        task, proj, store.read_status(task["id"]), config)
+    assert ok, note
+    status = store.read_status(task["id"])
+    assert status["state"] == "merged"
+    # 工头的笔记还在，没被合并动作碰过
+    assert (proj / "工头的笔记.txt").read_text(encoding="utf-8") == "别动\n"
+
+
+def test_merge_task_dirty_main_tracked_change_still_refuses(repo):
+    """已跟踪文件的改动（不是 untracked 杂物）仍然拦自动合并。"""
     proj, config = repo
     task, meta = _tree_with_canary(repo)
     base_count = _gitSimple("rev-list", "--count", "HEAD", cwd=proj).strip()
-    # 主线有 untracked（工头自己的东西）
-    (proj / "工头的笔记.txt").write_text("别动\n", encoding="utf-8")
+    # 改动已跟踪文件（README.md 在 init_git_repo 建仓库时已提交）
+    (proj / "README.md").write_text("别动，这是已跟踪文件\n", encoding="utf-8")
     ok, note = worktree.merge_task(
         task, proj, store.read_status(task["id"]), config)
     assert not ok

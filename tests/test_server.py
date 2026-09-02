@@ -1667,7 +1667,9 @@ def test_merge_api_dirty_main_409_keeps_everything(authed, ns_home, tmp_path):
     cfg["projects"] = {"demo": str(proj)}
     store.atomic_write_json(ns_home / "config.json", cfg)
     task_id, wt, meta = _worktree_task(authed, proj, tmp_path)
-    (proj / "工头的改动.txt").write_text("别动\n", encoding="utf-8")
+    # 总review二 G6：主线只看已跟踪文件——改的是已提交过的 README.md（不是
+    # untracked 杂物），这才该拦自动合并。
+    (proj / "README.md").write_text("别动\n", encoding="utf-8")
 
     status, _, body = authed.request("POST", f"/api/tasks/{task_id}/merge")
     assert status == 409
@@ -1677,10 +1679,27 @@ def test_merge_api_dirty_main_409_keeps_everything(authed, ns_home, tmp_path):
     assert task_status["error"] == body["error"]  # 卡片红字与接口一致
     assert Path(wt).exists() and "worktree_path" in task_status
     # 处理完主线 → needs_attention 也能重试同一 API
-    (proj / "工头的改动.txt").unlink()
+    subprocess.run(["git", "-C", str(proj), "checkout", "--", "README.md"],
+                    check=True, capture_output=True)
     status, _, body = authed.request("POST", f"/api/tasks/{task_id}/merge")
     assert status == 200, body
     assert store.read_status(task_id)["state"] == "merged"
+
+
+def test_merge_api_dirty_main_untracked_no_longer_blocks(authed, ns_home, tmp_path):
+    """总review二 G6：主线上一个 untracked 杂物（工头自己的笔记）不该拦
+    自动合并。"""
+    proj = _make_git_repo(tmp_path)
+    cfg = store.load_config()
+    cfg["projects"] = {"demo": str(proj)}
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    task_id, wt, meta = _worktree_task(authed, proj, tmp_path)
+    (proj / "工头的改动.txt").write_text("别动\n", encoding="utf-8")
+
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/merge")
+    assert status == 200, body
+    assert store.read_status(task_id)["state"] == "merged"
+    assert (proj / "工头的改动.txt").read_text(encoding="utf-8") == "别动\n"
 
 
 def test_merge_api_wrong_state_409(authed, ns_home, tmp_path):

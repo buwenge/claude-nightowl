@@ -468,10 +468,20 @@ def _project_of(task: dict) -> str:
 # ---------- 收工存档点（S5②） ----------
 
 
-def worktree_clean(worktree_path: str | Path) -> bool:
+def worktree_clean(worktree_path: str | Path, *, include_untracked: bool = True) -> bool:
     """工作树是否干净：`git status --porcelain` 为空才算——tracked 修改、
-    删除和 untracked 新文件全看得见；只用 git diff --quiet 会漏 untracked，禁止。"""
-    return not git_out(worktree_path, "status", "--porcelain").strip()
+    删除和 untracked 新文件全看得见；只用 git diff --quiet 会漏 untracked，禁止。
+
+    总review二 G6：`include_untracked=False` 只看已跟踪文件的改动
+    （`--untracked-files=no`）——只给"检查主线目录"那几处调用方用：主线上
+    一个临时笔记/`.orig` 这类 untracked 杂物不该拦自动合并，已跟踪文件被
+    改过仍然拦。检查**工作树自身**"存档点后又有没有改动"不能用这个口子：
+    untracked 新文件就是改动本身。
+    """
+    args = ["status", "--porcelain"]
+    if not include_untracked:
+        args.append("--untracked-files=no")
+    return not git_out(worktree_path, *args).strip()
 
 
 def checkpoint(task: dict, worktree_path: str | Path) -> str | None:
@@ -679,7 +689,7 @@ def _merge_task_locked(
         if not worktree_clean(wt):
             reason = "存档点后工作树又有改动，没敢合并；先处理掉再点'合并进主线'"
             return _merge_fail(task_id, reason, merge_sha)
-        if not worktree_clean(project_path):
+        if not worktree_clean(project_path, include_untracked=False):
             reason = "主线有你没提交的改动，没敢自动合并；处理完按'合并进主线'"
             return _merge_fail(task_id, reason, merge_sha)
         proc = _git(project_path, "merge", "--no-ff", "--no-edit", branch)
@@ -688,12 +698,12 @@ def _merge_task_locked(
                 abort_proc = _git(project_path, "merge", "--abort")
                 if abort_proc.returncode != 0 or _merge_in_progress(project_path):
                     reason = "合并冲突，且 merge --abort 后主线仍有合并进行态，需要人工处理"
-                elif not worktree_clean(project_path):
+                elif not worktree_clean(project_path, include_untracked=False):
                     reason = "合并冲突虽已 abort，但主线仍留下未提交改动，需要人工处理"
                 else:
                     reason = f"合并冲突，已放弃合并（merge --abort），树与分支保留：{_tail(proc)}"
             else:
-                if worktree_clean(project_path):
+                if worktree_clean(project_path, include_untracked=False):
                     reason = f"合并失败（主线未动）：{_tail(proc)}"
                 else:
                     reason = f"合并失败且主线留下未提交改动，需要人工处理：{_tail(proc)}"

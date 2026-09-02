@@ -1256,8 +1256,9 @@ def test_worktree_auto_dirty_main_needs_attention_exact_text(tmp_path, monkeypat
     tid = make_task(review={"enabled": False, "merge_policy": "auto"})
     wt = _register_tree(proj, tid, "夜间重构")
     (wt / "canary.txt").write_text("活\n", encoding="utf-8")
-    # 主线有工头自己的 untracked 改动
-    (proj / "note.txt").write_text("别动\n", encoding="utf-8")
+    # 总review二 G6：主线只看已跟踪文件——改的是已提交过的 README.md，
+    # 不是 untracked 杂物，这才该拦自动合并。
+    (proj / "README.md").write_text("别动\n", encoding="utf-8")
     _go_idle(tid)
     _write_handover(tid, "干完了。\nNEXT: done")
 
@@ -1274,7 +1275,8 @@ def test_worktree_auto_dirty_main_needs_attention_exact_text(tmp_path, monkeypat
         capture_output=True, text=True, check=True).stdout.strip()
     assert merges == "0"
     # 工头清完主线 → 网页重试（同一 helper）→ merged
-    (proj / "note.txt").unlink()
+    subprocess.run(["git", "-C", str(proj), "checkout", "--", "README.md"],
+                    check=True, capture_output=True)
     ok, note = worktree.merge_task(
         store.load_task(tid), proj, store.read_status(tid), cfg,
         close_windows=lambda ids: launcher.close_windows(ids, cfg))
