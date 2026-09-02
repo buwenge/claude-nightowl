@@ -54,13 +54,21 @@ function el(tag, attrs, children) {
   return node;
 }
 
+// G16：opts.sticky 时横幅不自动消失，靠右上角的关闭按钮手动收起
+// （工头点「取消」撞 409 时红字一闪就没了，看不清写的什么）；普通提示
+// 自动消失时间 3 秒延到 6 秒。
 var bannerTimer = null;
-function banner(text) {
+function banner(text, opts) {
+  opts = opts || {};
   var node = $("banner");
-  node.textContent = text;
+  var textEl = $("banner-text");
+  var closeBtn = $("banner-close");
+  if (textEl) textEl.textContent = text; else node.textContent = text;
   node.classList.add("show");
-  if (bannerTimer) clearTimeout(bannerTimer);
-  bannerTimer = setTimeout(function () { node.classList.remove("show"); }, 3000);
+  if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = null; }
+  if (closeBtn) closeBtn.hidden = !opts.sticky;
+  if (opts.sticky) return;
+  bannerTimer = setTimeout(function () { node.classList.remove("show"); }, 6000);
 }
 
 function api(method, path, body) {
@@ -80,13 +88,13 @@ function api(method, path, body) {
       if (text) { try { data = JSON.parse(text); } catch (e) { /* 非 JSON */ } }
       if (!resp.ok) {
         var msg = data && data.error ? data.error : "请求失败（" + resp.status + "）";
-        if (method !== "GET") banner(msg);
+        if (method !== "GET") banner(msg, { sticky: true });
         throw new Error(msg);
       }
       return data;
     });
   }, function () {
-    banner("网络错误：连不上服务器");
+    banner("网络错误：连不上服务器", { sticky: true });
     throw new Error("网络错误");
   });
 }
@@ -1799,6 +1807,11 @@ function saveTemplates() {
 /* ---------- 启动 ---------- */
 
 function start() {
+  // G16：sticky 横幅的手动关闭按钮
+  $("banner-close").addEventListener("click", function () {
+    $("banner").classList.remove("show");
+    if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = null; }
+  });
   $("tab-tasks").addEventListener("click", function () { showView("tasks"); });
   $("tab-new").addEventListener("click", enterCreate);
   $("tab-tpl").addEventListener("click", function () { showView("tpl"); });

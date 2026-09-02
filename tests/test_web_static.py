@@ -646,3 +646,52 @@ def test_task_card_quota_paused_text_differs_by_runner():
     # "等 Codex 额度刷新" 只出现一次，且紧跟在 runner === "codex" 分支的判断之后
     assert "等 Codex 额度刷新" not in body[codex_idx + 1:]
     assert 'runner === "codex"' in body[max(0, codex_idx - 200):codex_idx]
+
+
+# ---------- 总review二 G16：出错横幅要留住、能手动关 ----------
+
+
+def test_app_js_banner_supports_sticky_and_six_second_default():
+    """banner(text, opts) 的 opts.sticky 时不设自动消失定时器；普通提示
+    自动消失时间从 3 秒延到 6 秒。"""
+    body = _js_fn("banner")
+    assert "opts.sticky" in body
+    assert "3000" not in body
+    assert "6000" in body
+
+
+def test_app_js_api_failure_paths_use_sticky_banner():
+    """api() 的两条失败路径（非 2xx 与网络错误）都要传 sticky:true，
+    不能被 3→6 秒的自动消失盖过——工头点「取消」撞 409 时才看得清写的什么。"""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'banner(msg, { sticky: true });' in js
+    assert 'banner("网络错误：连不上服务器", { sticky: true });' in js
+
+
+def test_index_has_banner_close_button():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    for piece in ('id="banner-text"', 'id="banner-close"', "aria-label=\"关闭提示\""):
+        assert piece in html, piece
+
+
+def test_app_js_banner_close_button_clears_show_and_timer():
+    """关闭按钮点了要能把横幅收起、清掉还没触发的自动消失定时器。"""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    m = _re.search(
+        r'\$\("banner-close"\)\.addEventListener\("click", function \(\) \{.*?\}\);',
+        js,
+        _re.S,
+    )
+    assert m, "banner-close 的点击处理没找到"
+    body = m.group(0)
+    assert 'classList.remove("show")' in body
+    assert "clearTimeout(bannerTimer)" in body
+
+
+def test_css_banner_close_button_has_touch_target():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    m = _re.search(r"#banner-close\s*\{[^}]*\}", css, _re.S)
+    assert m, "#banner-close 样式没找到"
+    body = m.group(0)
+    assert "width: 44px" in body
+    assert "height: 44px" in body

@@ -367,10 +367,26 @@ details.box summary { cursor: pointer; min-height: 44px; line-height: 44px; font
   background: var(--danger);
   color: #fff;
   text-align: center;
-  padding: 12px;
+  padding: 12px 44px 12px 12px;
   font-size: 15px;
 }
 #banner.show { display: block; }
+/* G16：sticky 横幅的关闭按钮，触摸区 ≥44px */
+#banner-close {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  min-height: 44px;
+  border: none;
+  background: transparent;
+  color: #fff;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
 
 /* ---------- 登录 / 设置页 ---------- */
 
