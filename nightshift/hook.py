@@ -650,6 +650,16 @@ def _handle_review_stop(task: dict, payload: dict, now: str) -> None:
       戳 held/waiting_background 两种状态，收到控制回复不该变；缺省是
       向后兼容旧数据的防御性默认）。
 
+    总review二 G9：审稿班若自己用 Bash 起了个后台长命令并结束这一回合，
+    这次 Stop 的正文里不会有 NEXT——不是"协议缺失"，是活还没干完，不该按
+    fix 假退回。控制 turn 判断（上面这条）优先级排在这条检查**之前**：
+    "我来看"/继续这类控制消息即使背景任务还在跑也该按控制语义处理（比如
+    "我来看"要停到 held，不能被这里截胡成 waiting_background）；只有真正
+    在等 verdict 的普通 Stop（`review_awaiting_verdict` 为 True）才检查
+    背景任务，命中就只落 `state=waiting_background`、`last_event_at`，
+    不进 claim/写文件/解析 verdict 那一整套——后台跑完 CC 会重新拉起这个
+    会话，真正的结论在下一次 Stop。
+
     S7.2 阻断四：verdict 不再先于 review 文件落盘。旧写法在同一次
     `modify_status` 里既判断"是否放行"又直接把 verdict/final 钉死，锁外
     才写文件——文件写失败时 verdict 已经不可逆，之后同一轮任何 Stop 都会
@@ -686,6 +696,15 @@ def _handle_review_stop(task: dict, payload: dict, now: str) -> None:
                 status["state"] = "held"
                 status["held_since"] = now
                 status["held_reason"] = "我来看：工头要来看，已停在这里"
+            return
+        # 总review二 G9：不是控制 turn（真的在等 verdict），但这次 Stop
+        # 背后还有后台任务在跑——不进下面的 claim/写文件/解析 verdict，
+        # 免得没有 NEXT 被当"协议缺失"误判成 fix。
+        background_tasks = payload.get("background_tasks") or []
+        if any(t.get("status") == "running" for t in background_tasks):
+            claim["kind"] = "background"
+            status["state"] = "waiting_background"
+            status["last_event_at"] = now
             return
         verdict_final = status.get("review_verdict_final")
         if verdict_final is None:  # 旧数据兼容：没这个字段就按 verdict 本身推断
@@ -735,6 +754,9 @@ def _handle_review_stop(task: dict, payload: dict, now: str) -> None:
         store.append_event(
             task_id, f"hook Stop(review) 第 {round_} 轮已记过/正在处理 verdict，忽略重复 Stop"
         )
+        return None
+    if claim["kind"] == "background":
+        store.append_event(task_id, "审稿班后台任务仍在跑，这次 Stop 不当结论")
         return None
 
     # 走到这里说明上面锁内 claim 已经放行了这一次（并发的第二个 Stop 在

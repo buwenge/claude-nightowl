@@ -877,6 +877,66 @@ def test_stop_review_missing_next_defaults_to_fix():
     assert "协议缺失" in events
 
 
+def test_stop_review_background_task_running_does_not_conclude():
+    """总review二 G9：审稿班用 Bash 后台跑长命令并结束这一回合——这次 Stop
+    没有 NEXT 不是"协议缺失"，不该按 fix 假退回。只落 waiting_background，
+    不写 review 文件、不记 verdict，等后台跑完真正的 Stop 再下结论。"""
+    task_id = make_review_task()
+    payload = {
+        "last_assistant_message": "在后台跑测试，先不下结论。",
+        "background_tasks": [
+            {"id": "bg1", "status": "running"},
+        ],
+    }
+    proc = run_hook(task_id, "Stop", json.dumps(payload))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["state"] == "waiting_background"
+    assert "review_verdict" not in status
+    assert "review_file" not in status
+    assert not (store.task_dir(task_id) / "review-1.md").exists()
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "审稿班后台任务仍在跑，这次 Stop 不当结论" in events
+
+
+def test_stop_review_background_task_finished_still_concludes():
+    """background_tasks 里没有 running 项（已完成/失败）不该被这条新分支
+    拦住——照常按协议解析 verdict。"""
+    task_id = make_review_task()
+    payload = {
+        "last_assistant_message": "后台命令跑完了，看过了。\n\nNEXT: done",
+        "background_tasks": [
+            {"id": "bg1", "status": "finished"},
+        ],
+    }
+    proc = run_hook(task_id, "Stop", json.dumps(payload))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["state"] == "idle"
+    assert status["review_verdict"] == "done"
+
+
+def test_stop_review_control_turn_takes_priority_over_background_task():
+    """控制 turn（这里用"我来看"hold）优先级排在背景任务检查之前——即使
+    背景任务还在跑，"我来看"也该按控制语义停到 held，不能被截胡成
+    waiting_background。"""
+    task_id = make_review_task()
+    store.update_status(
+        task_id, review_awaiting_verdict=False, review_control_kind="hold",
+    )
+    payload = {
+        "last_assistant_message": "好，我先停下来。",
+        "background_tasks": [{"id": "bg1", "status": "running"}],
+    }
+    proc = run_hook(task_id, "Stop", json.dumps(payload))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["state"] == "held"
+    assert "review_verdict" not in status
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "控制 turn" in events
+
+
 def test_stop_review_empty_message_defaults_to_fix():
     task_id = make_review_task()
     proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": ""}))
