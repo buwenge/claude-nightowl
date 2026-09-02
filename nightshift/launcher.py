@@ -57,16 +57,19 @@ REVIEW_DISALLOWED_TOOLS = "Write,Edit,NotebookEdit"
 # 窗口 id 只认 tmux 的 @N 形状：杜绝任何模糊目标（会话名/窗口名通配）
 _WINDOW_ID_RE = re.compile(r"^@\d+$")
 
-# Claude hook 挂的七个事件（设计稿 §4.1）；Codex 的七件套固定写在
-# codex_profile.py 生成的 nightowl profile 里，不经这张表（那份 profile
-# 内容不能随任务变，见 codex_profile.py 顶部说明）
+# Claude hook 挂的六个事件（设计稿 §4.1）；Codex 是完全独立的另一套
+# （SessionStart 而非 PreCompact），固定写在 codex_profile.py 生成的
+# nightowl profile 里，不经这张表（那份 profile 内容不能随任务变，见
+# codex_profile.py 顶部说明）。
+# 总review二 G15（B④-5）：PreCompact 删掉了——hook.py 那支分支只记一行
+# "有人开了 compact？"日志，没人读、没有任何调度决策依赖它，每次 compact
+# 还多起一个 python 进程，纯浪费。
 _HOOK_EVENTS = (
     "UserPromptSubmit",
     "SubagentStart",
     "SubagentStop",
     "Stop",
     "PostToolUse",
-    "PreCompact",
     "SessionEnd",
 )
 
@@ -204,26 +207,6 @@ def _codex_project_entry(config_path: Path, workdir: str) -> dict | None:
             f'Codex config.toml 里 projects."{workdir}" 不是表，不敢追加信任条目'
         )
     return entry
-
-
-def _codex_workdir_trusted(config_path: Path, workdir: str) -> bool:
-    """workdir 是否已经在 Codex config.toml 里被记成 trusted。解析失败（文件
-    不存在/格式坏了）一律当作"还没信任"，交给调用方走追加分支——追加是纯
-    末尾写入，不会因为文件本身有问题而丢数据。"""
-    if not config_path.is_file():
-        return False
-    try:
-        with open(config_path, "rb") as f:
-            data = tomllib.load(f)
-    except (tomllib.TOMLDecodeError, OSError):
-        return False
-    projects = data.get("projects")
-    if not isinstance(projects, dict):
-        return False
-    entry = projects.get(workdir)
-    if not isinstance(entry, dict):
-        return False
-    return entry.get("trust_level") == "trusted"
 
 
 def ensure_codex_trusted(workdir: str) -> None:
@@ -548,7 +531,7 @@ def launch(task_id: str, config: dict) -> dict:
         return status
 
     # ①' S5：工作树任务先幂等建树/复用（直接 CLI run-now 也走这里，绕不过）。
-    # 元数据落 status，后继班靠 create_successor 沿用同一棵树
+    # 元数据落 status，后继班靠 create_same_role_successor 沿用同一棵树
     if worktree.wants_worktree(task):
         try:
             meta = worktree.ensure_worktree(task, project_path)
@@ -843,13 +826,18 @@ def close_windows(window_ids, config: dict) -> list[str]:
 
 
 def pid_alive(pid: int) -> bool:
-    """进程是否还活着（os.kill 探测，PID 复用靠三条件组合兜底，这里是其一）。"""
+    """进程是否还活着（os.kill 探测，PID 复用靠三条件组合兜底，这里是其一）。
+
+    总review二 G15（B④-2）：以前多一个 `except PermissionError: return True`
+    ——nightshift/hook/所有会话全是 root，`os.kill(pid, 0)` 对任何进程都
+    不会因权限不够而报错，这个分支进不去，删了对当前单用户 root 部署零
+    行为变化。将来要是以非 root 身份跑，得先重做整套进程围栏（不止这一处），
+    到时候再加回来。
+    """
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    except PermissionError:
-        return True
     return True
 
 

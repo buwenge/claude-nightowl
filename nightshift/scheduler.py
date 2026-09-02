@@ -202,10 +202,14 @@ def tick(config: dict, now: datetime) -> list[str]:
     # S7.1 阻断四 Part A：必须走 effective_runner——review 角色可能跟顶层
     # build runner 不同（task.review.runner），只读 task["runner"] 在
     # Codex 施工/Claude 审稿这类跨家组合下会漏刷正在等的那一家。
+    # 总review二 G15（A N10）：items 里已经有 status 了（本轮 tick 开头
+    # store.list_tasks() 读的），不用每个任务再重新 read_status 一次——
+    # 这里只是决定"这轮末尾要不要顺手刷这家 runner 的额度"，用 tick 开头
+    # 那份快照足够，最多晚一轮（30 秒）反映到额度显示上，不影响起跑判断。
     active_runners = {
         store.effective_runner(item["task"])
         for item in items
-        if store.read_status(item["task"]["id"]).get("state") in ACTIVE_STATES
+        if (item["status"] or {}).get("state") in ACTIVE_STATES
     }
     if active_runners:
         _maybe_refresh_quota(config, now, actions, runners=active_runners)
@@ -329,10 +333,11 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
     # 其它组合（对方真的在跑、或对方是同角色 held）都是状态异常，必须先在
     # 这里挡住，不能被下面 c 段"两边都是 worktree就放行"的跨 pipeline 逻辑
     # 顺带放过。
+    # 总review二 G15（A④-2）：pipeline_id_of 三级兜底到 task["id"]，任务 id
+    # 是必填字段，永远非空——candidate_pid 不可能是假值，原来的
+    # "if not candidate_pid: _fail_now" 到不了，已删。
     candidate_pid = store.pipeline_id_of(task)
     candidate_role = store.role_of(task)
-    if not candidate_pid:  # pipeline_id_of 理论上总有兜底值，防御性 fail-closed
-        return _fail_now(task, config, now, "算不出这一班所属的 pipeline_id，拒绝起跑")
     for other in store.list_tasks():
         other_task = other["task"]
         if other_task["id"] == task_id:
@@ -500,8 +505,6 @@ def _check_launching(
     if exit_code is None:
         if in_grace:
             return []  # 宽限期内不做恢复判断
-        if int(status.get("turns") or 0) > 0:
-            return []  # 其实有 hook 来过，不按崩溃处理
 
         window_id = status.get("window_id")
         pane_pid = status.get("pane_pid")
@@ -1288,12 +1291,14 @@ def _check_running(
 # ---------- 换班：交接判定与后继任务（设计稿 §4.4） ----------
 
 
-def _handover_file(task: dict, status: dict) -> Path:
-    """交接文件路径：status 里 hook 记下的 handover_path 优先，
-    没有就按 task_dir/handover-<shift>.md 算。"""
-    recorded = status.get("handover_path")
-    if recorded:
-        return Path(recorded)
+def _handover_file(task: dict) -> Path:
+    """交接文件路径：task_dir/handover-<shift>.md。
+
+    总review二 G15（A④-3）：以前优先读 status.handover_path，但 hook 写
+    进去的值就是这同一个路径（两边都现读 task.json 算 shift），纯属多一个
+    要跟着同步清的状态字段（`_review_fix` 曾经手动清它，S7.2 阻断三的
+    根源）。直接算，少一份要保持一致的状态。
+    """
     return store.task_dir(task["id"]) / f"handover-{int(task.get('shift') or 1)}.md"
 
 
@@ -1348,7 +1353,7 @@ def _check_idle_chain(
     - 没交接也从未被提醒 → 正常干完（worktree 任务走 _finalize_done 分流）。
 
     F4：chain_checked=True 之后的所有逻辑包了一层 try/except——中途异常
-    （比如 config.models 改名后 create_successor 的 validate_task 抛
+    （比如 config.models 改名后 create_same_role_successor 的 validate_task 抛
     ValueError）不再让任务悄悄停在 idle 没有任何记录，统一转
     needs_attention 并留人话（见 `_chain_eval_failed`）。
     """
@@ -1357,7 +1362,7 @@ def _check_idle_chain(
         blocked = _checkpoint_shift(task, status, config, now)
         if blocked:
             return blocked
-        path = _handover_file(task, status)
+        path = _handover_file(task)
         text = _read_handover(path)
         if text is not None:
             return _handover_verdict(task, status, text, config, now)
@@ -1450,7 +1455,7 @@ def _chain_continue(
             config,
         )
         return [f"{task_id} 第 {shift} 班结束：班次用尽"]
-    successor_id = store.create_successor(task, handover_text, config)
+    successor_id = store.create_same_role_successor(task, handover_text, config)
     if store.effective_runner(task) == "codex":
         window_id = status.get("window_id")
         if window_id:
@@ -1479,7 +1484,7 @@ def _check_exited_chain(
         return []
     store.update_status(task["id"], chain_checked=True)
     try:
-        text = _read_handover(_handover_file(task, status))
+        text = _read_handover(_handover_file(task))
         if text is None:
             return []
         blocked = _checkpoint_shift(task, status, config, now)
@@ -1828,7 +1833,7 @@ def _start_review_round(task: dict, config: dict, now: datetime) -> list[str]:
         launcher.open_notice_window(task, "(需要人工)", [reason], config)
         return [f"{task_id} 审稿流水线元数据缺失 → needs_attention"]
 
-    handover_text = _read_handover(_handover_file(task, status))
+    handover_text = _read_handover(_handover_file(task))
     prompt = store.render_review_prompt(
         config, task,
         workdir=str(wt),
@@ -2222,12 +2227,11 @@ def _review_fix(review_task: dict, config: dict, now: datetime) -> tuple[list[st
                 checkpoint_sha=None, checkpoint_history=history,
                 reactivated_from_review_id=task_id,
                 # S7.2 阻断三：显式清掉上一轮的运行期收尾标记——update_status
-                # 是合并语义，不传等于不清除。handover_path 一旦被上一轮的
-                # 提醒逻辑写过就会一直覆盖 _handover_file() 按 shift 计算的
-                # 默认路径；不清掉的话，新一轮如果只发生一次普通 Stop、还没
-                # 来得及写新交接文件，调度器会重新读到上一轮那份写着
-                # NEXT:done 的旧交接，把中间停顿误判成这一轮已经收工。
-                handover_path=None, context_warned_at=None, quota_warned_at=None,
+                # 是合并语义，不传等于不清除。总review二 G15（A④-3）：
+                # handover_path 这个字段本身已经删掉了（_handover_file 现在
+                # 永远按 shift 现算，不再读 status 里记的路径），不用再清它；
+                # 其余几个提醒计数/标记仍要清，理由不变。
+                context_warned_at=None, quota_warned_at=None,
                 context_warn_count=0, quota_warn_count=0, mode_warned=False,
                 other_model_warned=[],
             )

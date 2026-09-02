@@ -309,27 +309,14 @@ def make_transcript(path: Path, tokens: int) -> str:
 
 
 def write_quota(session=10, week=10, per_model=None, age_minutes=0) -> None:
-    """往数据目录写一份新鲜（或指定年龄）的 quota.json。"""
-    fetched_at = (
-        datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    store.atomic_write_json(
-        store.home() / "quota.json",
-        {
-            "usage": {
-                "session_pct": session,
-                "week_all_pct": week,
-                "per_model": per_model or {},
-            },
-            "fetched_at": fetched_at,
-        },
-    )
+    """往数据目录写一份新鲜（或指定年龄）的 quota.json——S6 起真实的双分片
+    形状（只填 claude 那一片，codex 留空）。
 
-
-def write_quota_dual(session=10, week=10, per_model=None, age_minutes=0) -> None:
-    """往数据目录写一份 S6 双分片形状的 quota.json（只填 claude 那一片，
-    codex 留空），用来验证 `_read_fresh_usage` 真的在读双分片而不是只兼容
-    一期旧顶层形状。"""
+    总review二 G15（D④-2）：这里以前写的是一期旧顶层形状
+    `{"usage": ..., "fetched_at": ...}`，靠 `quota.load_quota_file()` 的
+    兼容分支猜成 claude 那份；那个兼容分支已经删掉（生产 quota.json 自
+    S6 起已确认是双分片），这里跟着改成写真实形状，不然全仓靠这个 helper
+    的测试会读到空壳。"""
     fetched_at = (
         datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -477,7 +464,7 @@ def test_post_tool_use_quota_warn_dual_slice(tmp_path):
             "context_limit_tokens": 200000,
         }
     )
-    write_quota_dual(session=85, week=10)  # 五小时 85 ≥ 80
+    write_quota(session=85, week=10)  # 五小时 85 ≥ 80
     payload = make_transcript(tmp_path / "transcript.jsonl", 100)
     for _ in range(19):
         run_hook(task_id, "PostToolUse", payload)
@@ -550,12 +537,17 @@ def test_post_tool_use_quota_pause_skipped_when_cached_usage_predates_refresh(tm
         "context_warn_tokens": 100000, "context_limit_tokens": 200000,
     })
     past = datetime.now(timezone.utc) - timedelta(minutes=10)
+    # 总review二 G15（D④-2）：双分片形状，一期旧顶层兼容已删
     store.atomic_write_json(store.home() / "quota.json", {
-        "usage": {
-            "session_pct": 90, "week_all_pct": 10, "per_model": {},
-            "session_resets": _resets_text(past),
+        "claude": {
+            "usage": {
+                "session_pct": 90, "week_all_pct": 10, "per_model": {},
+                "session_resets": _resets_text(past),
+            },
+            "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "error": None,
         },
-        "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "codex": {},
     })
     payload = make_transcript(tmp_path / "transcript.jsonl", 100)
     for _ in range(19):
@@ -574,12 +566,17 @@ def test_post_tool_use_quota_pause_fires_when_resets_still_in_future(tmp_path):
         "context_warn_tokens": 100000, "context_limit_tokens": 200000,
     })
     future = datetime.now(timezone.utc) + timedelta(minutes=30)
+    # 总review二 G15（D④-2）：双分片形状，一期旧顶层兼容已删
     store.atomic_write_json(store.home() / "quota.json", {
-        "usage": {
-            "session_pct": 90, "week_all_pct": 10, "per_model": {},
-            "session_resets": _resets_text(future),
+        "claude": {
+            "usage": {
+                "session_pct": 90, "week_all_pct": 10, "per_model": {},
+                "session_resets": _resets_text(future),
+            },
+            "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "error": None,
         },
-        "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "codex": {},
     })
     payload = make_transcript(tmp_path / "transcript.jsonl", 100)
     for _ in range(19):
@@ -644,30 +641,6 @@ def test_post_tool_use_context_and_quota_one_json_two_paragraphs(tmp_path):
     status = store.read_status(task_id)
     assert status["context_warn_count"] == 1
     assert status["quota_warn_count"] == 1
-
-
-def test_stop_writes_over_warn_line_without_stdout(tmp_path):
-    task_id = make_task(
-        guards={
-            "session_pct_max": 80,
-            "context_warn_tokens": 400,
-            "context_limit_tokens": 2000,
-        }
-    )
-    payload = json.dumps(
-        dict(json.loads(fixture("hook_stop_idle.json")),
-             transcript_path=str(tmp_path / "transcript.jsonl")),
-        ensure_ascii=False,
-    )
-    make_transcript(tmp_path / "transcript.jsonl", 1200)
-    proc = run_hook(task_id, "Stop", payload)  # Stop 永远沉默
-    assert proc.returncode == 0 and proc.stdout == ""
-    status = store.read_status(task_id)
-    assert status["over_warn_line"] is True
-
-    make_transcript(tmp_path / "transcript.jsonl", 100)
-    run_hook(task_id, "Stop", payload)
-    assert store.read_status(task_id)["over_warn_line"] is False
 
 
 # ---------- 并发 hook 进程（R2：计数不许丢）----------
@@ -782,23 +755,18 @@ def test_stop_without_config_still_updates(tmp_path):
     assert "算不出上限" in events
 
 
-def test_precompact_only_logs():
+def test_unknown_event_only_logs():
+    """总review二 G15（B④-5）：PreCompact 专属分支删掉了（只记一行没人读
+    的日志，每次 compact 还多起一个 python 进程）——它现在跟任何没有专属
+    分支的事件（如这里的 Notification）走同一条通用兜底路径，不再需要
+    单独一条测试。"""
     task_id = make_task()
     before = store.read_status(task_id)
-    proc = run_hook(task_id, "PreCompact", '{"hook_event_name":"PreCompact"}')
-    assert proc.returncode == 0 and proc.stdout == ""
-    status = store.read_status(task_id)
-    assert status["state"] == "scheduled"  # 状态不动
-    assert status["updated_at"] == before["updated_at"]  # 也不碰 status
-    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
-    assert "PreCompact" in events
-
-
-def test_unknown_event_only_logs():
-    task_id = make_task()
     proc = run_hook(task_id, "Notification", '{"message":"hi"}')
     assert proc.returncode == 0 and proc.stdout == ""
-    assert store.read_status(task_id)["state"] == "scheduled"
+    status = store.read_status(task_id)
+    assert status["state"] == "scheduled"
+    assert status["updated_at"] == before["updated_at"]  # 也不碰 status
     events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
     assert "Notification" in events
 
@@ -1711,7 +1679,6 @@ def test_codex_hook_full_event_sequence():
     assert proc.returncode == 0 and proc.stdout == ""
     status = store.read_status(task_id)
     assert status["state"] == "idle"  # S6：无登记后台时 idle（F12 的登记簿是 S6④ 才有）
-    assert status["over_warn_line"] is False
     assert "canary.txt" in status["last_message"]
     assert status["context_tokens"] is None  # Codex 没有稳定上下文水位来源
 

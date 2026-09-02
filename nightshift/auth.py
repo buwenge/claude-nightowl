@@ -51,7 +51,14 @@ def _cred_path():
 
 
 def _load_creds() -> dict | None:
-    """读凭据；没有/坏了返回 None（坏了等同没设过，可重新 setup）。"""
+    """读凭据；没有/坏了返回 None。
+
+    总review二 G15（C④-6）：docstring 原来还有半句"坏了等同没设过，可重新
+    setup"——这跟 is_set_up() 只看 is_file()（不解析内容）不一致：auth.json
+    存在但坏了时，is_set_up() 仍然 True，setup 端点会拒绝重跑；实际后果是
+    "谁也登不上、也不能重 setup"，不是"等同没设过"。这是安全方向没错（不
+    因为文件损坏就悄悄放行重新设密码），但 docstring 说错了，删掉。
+    """
     path = _cred_path()
     if not path.is_file():
         return None

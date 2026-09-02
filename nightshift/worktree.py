@@ -312,11 +312,13 @@ def ensure_worktree(task: dict, project_path: str | Path) -> dict:
                 f"实际 {entry.get('branch') or '游离 HEAD'}（{path}）"
             )
         ensure_exclude(project_path)
-        base_ref = status.get("base_ref")
+        # 总review二 G15（B④-3）：上面已经在 base_ref 缺失时抛错（见
+        # "缺少 base_ref" 那句），走到这里它必真——两级兜底
+        # （entry.get("head") or head_sha(path)）是死代码，删了行为不变。
         return {
             "worktree_path": str(path),
             "branch": branch,
-            "base_ref": str(base_ref) if base_ref else entry.get("head") or head_sha(path),
+            "base_ref": str(status.get("base_ref")),
         }
 
     slug = slug_for(task_id, task.get("title") or "")

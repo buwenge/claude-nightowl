@@ -66,12 +66,15 @@ _RE_TASK_SESSION = re.compile(
 _RE_TASK_DELETE = re.compile(rf"^/api/tasks/({_TASK_ID_RE})$")
 
 # 静态文件白名单：文件名写死，其余一律 404
+# 总review二 G15（C④-3）："/" 已经按登录态分发 index.html/login.html
+# （见 _route_get 的 "/" 分支），这里不再单列 "/index.html"——那条口子让
+# 未登录也能拿到页面骨架（虽然没有数据），直接访问 /index.html 现在 404；
+# 页面内所有相对引用都是 ./，不受影响。
 _STATIC_FILES = {
     "/app.js": "app.js",
     "/style.css": "style.css",
     "/login.html": "login.html",
     "/setup.html": "setup.html",
-    "/index.html": "index.html",
 }
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -97,7 +100,11 @@ _EDITABLE_UNRUN = (
 )
 # 活跃状态（launching/working/waiting_background/waiting_wakeup/idle）：
 # 只许改标题/任务内容/额度与上下文线/换班设置/触发方式
-_EDITABLE_ACTIVE = ("title", "task_text", "guards", "chain", "trigger")
+# 总review二 G15（C④-4）：trigger 从这张表删掉了——已起跑的任务没人再读
+# trigger（_after_ready 只看 scheduled/postponed 状态；后继任务也不复制
+# trigger），改它以前只会顺手 pop 掉 trigger_met_at/attention_noted，没有
+# 实际效果。trigger 仍在 _EDITABLE_UNRUN 里，未跑状态照样能改。
+_EDITABLE_ACTIVE = ("title", "task_text", "guards", "chain")
 # 编辑直接 409 的终态（failed/cancelled 仍算"未跑"可编辑；S5②：
 # awaiting_merge / merged / discarded 也定死，不许再改）
 _EDIT_TERMINAL_STATES = (
@@ -690,14 +697,12 @@ class _Handler(BaseHTTPRequestHandler):
     # ---------- 配置 / 模板 / 预览 ----------
 
     def _api_config(self) -> None:
+        # 总review二 G15（C④-1）：以前这里还会算一份顶层 models/efforts 兼容
+        # 视图给旧前端用——runner_config() 自 S6 起对旧 config（没有
+        # runners 键）也会合成兼容视图，后端自 S6 起永远发 runners，前端
+        # 永远不需要再看顶层这两个键（runnerModelsEfforts 的旧后端兜底、
+        # modelLimit 的兜底分支同一批删掉，见 web/app.js）。
         cfg = store.load_config()
-        models = {
-            name: {
-                "context_limit": (spec or {}).get("context_limit"),
-                "usage_label": (spec or {}).get("usage_label"),
-            }
-            for name, spec in (cfg.get("models") or {}).items()
-        }
         runners = {
             name: {
                 "models": {
@@ -712,10 +717,7 @@ class _Handler(BaseHTTPRequestHandler):
         }
         return self._send_json(200, {
             "projects": cfg.get("projects") or {},
-            "models": models,
-            "efforts": cfg.get("efforts") or [],
-            # S6：按 runner 分家的模型/档位，前端"用谁施工"下拉据此换选项；
-            # 旧版前端不认这个键，忽略即可，不影响上面两个兼容字段
+            # S6：按 runner 分家的模型/档位，前端"用谁施工"下拉据此换选项。
             "runners": runners,
             "guards": cfg.get("guards") or {},
             "chain": cfg.get("chain") or {},
@@ -750,7 +752,8 @@ class _Handler(BaseHTTPRequestHandler):
                 "on_no_quota": (cfg.get("review") or {}).get("on_no_quota", "release"),
                 "merge_policy": (cfg.get("review") or {}).get("merge_policy", "manual"),
             },
-            "display_tz_offset_hours": cfg.get("display_tz_offset_hours"),
+            # 总review二 G15（C④-2）：display_tz_offset_hours 不再发——app.js
+            # 从没读过它（全用浏览器本地时区），config 里的键留着无害。
             # 可选：顶栏"回主站"链接 {"text": "...", "href": "..."}，没配就不显示
             "home_link": (cfg.get("http") or {}).get("home_link"),
             "warmup": cfg.get("warmup") or {"enabled": False, "time_local": ""},

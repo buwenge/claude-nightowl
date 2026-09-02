@@ -1074,7 +1074,7 @@ function taskCard(item, now, chainIds, opts) {
   card.appendChild(el("div", { class: "task-when", text: whenText }));
 
   // 上下文水位条
-  // 上限按 runner 自己的模型表查（modelLimit 内部兜底到旧顶层 CFG.models）
+  // 上限按 runner 自己的模型表查
   var limit = (task.guards && task.guards.context_limit_tokens) || modelLimit(task.model, runner);
   var pct = (typeof status.context_pct === "number") ? status.context_pct :
     (status.context_tokens && limit ? Math.round(100 * status.context_tokens / limit) : null);
@@ -1172,15 +1172,16 @@ function closeScreen() {
 
 /* ---------- 新建页 ---------- */
 
+// 总review二 G15（C④-1）：旧后端没有 CFG.runners 时退回顶层 Claude 兼容表
+// 那个分支删掉了——后端自 S6 起永远发 runners（含旧 config 合成的兼容
+// 视图），不会再缺。
 function modelLimit(model, runner) {
   runner = runner || "claude";
   if (CFG && CFG.runners && CFG.runners[runner]) {
     var rmodels = CFG.runners[runner].models || {};
     if (rmodels[model]) return rmodels[model].context_limit;
   }
-  // 旧后端没有 CFG.runners 时退回顶层 Claude 兼容表
-  return CFG && CFG.models && CFG.models[model] ?
-    CFG.models[model].context_limit : null;
+  return null;
 }
 
 function currentModel() {
@@ -1595,13 +1596,12 @@ function deleteDraft() {
     .catch(function () {});
 }
 
-// S6⑤：runner 决定这次能选哪些模型/档位——CFG.runners 是 commit①/S6 新键，
-// 旧后端没有这个键时只有 claude 能用（退回旧顶层 CFG.models/CFG.efforts）。
+// S6⑤：runner 决定这次能选哪些模型/档位——CFG.runners 是 commit①/S6 新键。
+// 总review二 G15（C④-1）：旧后端没有 CFG.runners 时的顶层兜底删掉了
+// ——后端自 S6 起永远发 runners，不会再缺（原因同 modelLimit()）。
 function runnerModelsEfforts(runner) {
   if (CFG.runners && CFG.runners[runner]) return CFG.runners[runner];
-  return runner === "claude" ?
-    { models: CFG.models || {}, efforts: CFG.efforts || [] } :
-    { models: {}, efforts: [] };
+  return { models: {}, efforts: [] };
 }
 
 function currentRunner() {
@@ -1687,9 +1687,9 @@ function submitNewForm(ev) {
 
   var body;
   if (active) {
-    // 这一班正在跑：服务器只认这几个键，其他发了也是白发（工作树不许改）
-    body = { title: title, task_text: text, guards: guards, chain: chain,
-             trigger: trigger || { type: "time" } };
+    // 这一班正在跑：服务器只认这几个键，其他发了也是白发（工作树不许改）。
+    // 总review二 G15（C④-4）：trigger 不发了——已起跑的任务没人再读它。
+    body = { title: title, task_text: text, guards: guards, chain: chain };
   } else {
     body = {
       title: title, project: project, runner: currentRunner(), model: model, effort: effort,

@@ -383,13 +383,10 @@ def test_launching_alive_window_or_turned_untouched(monkeypatch):
     status = store.read_status(tid)
     assert status["state"] == "launching"
     assert not status.get("retries")
-
-    # turns>0（hook 其实来过）也不按崩溃处理
-    store.update_status(tid, window_id=None, turns=1)
-    scheduler.tick(CONFIG, NOW)
-    status = store.read_status(tid)
-    assert status["state"] == "launching"
-    assert not status.get("retries")
+    # 总review二 G15（A④-1）：以前这里还测"turns>0 也不按崩溃处理"，
+    # 但 turns 只由 UserPromptSubmit 递增，它同时会把 state 改成 working
+    # （调度器从不给 launching 的班发控制标记）——"launching 且 turns>0"
+    # 这个组合到不了，对应的死分支已删，这条子用例一并删掉。
 
 
 def test_launching_timeout_reminds_once_when_stuck_at_dialog(monkeypatch):
@@ -3412,10 +3409,14 @@ def test_review_fix_reuse_clears_stale_round_bookkeeping_so_old_handover_is_igno
     tmp_path, monkeypatch
 ):
     """S7.2 阻断三反例：held build 原地复用成功推进 shift/round，但如果不清
-    掉上一轮的运行期收尾标记（handover_path/context_warned_at/…），新一轮
-    只要发生一次普通 Stop、还没来得及写新交接文件，调度器就会重新读到
-    status.handover_path 指向的上一轮旧文件（写着 NEXT:done），把中间停顿
-    误判成这一轮已经收工。"""
+    掉上一轮的运行期收尾标记（context_warned_at/…），新一轮只要发生一次
+    普通 Stop、还没来得及写新交接文件，调度器就会误把中间停顿当成这一轮
+    已经收工。
+
+    总review二 G15（A④-3）：`_handover_file` 不再优先读 status.handover_path
+    ——那个字段以前跟"按 shift 现算"的默认路径永远一样，纯属多一份要
+    同步清的状态；hook 仍会往 status 写这个字段（本次没动 hook.py），但
+    调度器不再看它，即使它还留着上一轮的旧路径也不影响这里的判断。"""
     fakes = Fakes(monkeypatch)
     proj = _make_repo(tmp_path)
     cfg = _review_config_for(proj)
@@ -3452,7 +3453,9 @@ def test_review_fix_reuse_clears_stale_round_bookkeeping_so_old_handover_is_igno
     assert build_status["state"] == "working"
     assert build_status["round"] == 2
     # 上一轮的运行期收尾标记必须被显式清空，不能因为合并语义悄悄留着。
-    assert build_status.get("handover_path") is None
+    # handover_path 不在这张清单里了（G15：调度器不再读它，不用再清）——
+    # 它还留着 round1 的旧值，下面的断言证明这不影响本轮的路径计算。
+    assert build_status.get("handover_path") == str(old_handover)
     assert build_status.get("context_warned_at") is None
     assert build_status.get("quota_warned_at") is None
     assert build_status.get("context_warn_count") == 0
@@ -3461,16 +3464,16 @@ def test_review_fix_reuse_clears_stale_round_bookkeeping_so_old_handover_is_igno
     assert build_status.get("other_model_warned") == []
 
     # 新一轮还没写任何新交接文件（handover-<新shift>.md 不存在）；
-    # _handover_file() 清掉 handover_path 后退回按当前 shift 计算的默认
-    # 路径，_read_handover 读不到文件应该返回 None——不会误读 round1 那份
-    # 写着 NEXT:done 的旧交接（旧 bug 恰恰是这里：status.handover_path 一直
-    # 指着 round1 的文件，_read_handover 读到的是真实存在的 "NEXT: done"
-    # 文本，被当成"这一轮也已经收工"直接触发 _finalize_done）。
+    # _handover_file() 永远按当前 shift 现算路径（不再看 status 里那份还
+    # 指着 round1 的 handover_path），_read_handover 读不到文件应该返回
+    # None——不会误读 round1 那份写着 NEXT:done 的旧交接（旧 bug 恰恰是
+    # 这里：以前 status.handover_path 一直指着 round1 的文件，
+    # _read_handover 读到的是真实存在的 "NEXT: done" 文本，被当成"这一轮
+    # 也已经收工"直接触发 _finalize_done）。
     from nightshift import scheduler as sched_mod
 
     task = store.load_task(tid)
-    status = store.read_status(tid)
-    hpath = sched_mod._handover_file(task, status)
+    hpath = sched_mod._handover_file(task)
     assert not hpath.is_file()
     assert sched_mod._read_handover(hpath) is None
 

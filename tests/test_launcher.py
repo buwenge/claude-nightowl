@@ -71,7 +71,9 @@ def make_task(project_path: str | None = None, **over):
 # ---------- 纯函数部分 ----------
 
 
-def test_hook_settings_seven_events():
+def test_hook_settings_six_events():
+    """总review二 G15（B④-5）：PreCompact 删掉了（只记一行没人读的日志，
+    每次 compact 还多起一个 python 进程）。"""
     settings = launcher.hook_settings("abc-123")
     hooks = settings["hooks"]
     assert set(hooks) == {
@@ -80,7 +82,6 @@ def test_hook_settings_seven_events():
         "SubagentStop",
         "Stop",
         "PostToolUse",
-        "PreCompact",
         "SessionEnd",
     }
     for event, entries in hooks.items():
@@ -123,7 +124,7 @@ def test_write_task_files(tmp_path):
     assert mode & 0o700 == 0o700  # 可执行
 
     settings = json.loads((d / "settings.json").read_text(encoding="utf-8"))
-    assert len(settings["hooks"]) == 7
+    assert len(settings["hooks"]) == 6  # G15：PreCompact 删掉了
     # S5：新任务缺省 worktree=true，prompt.txt 必须带运行时安全前言（不可遗漏），
     # 且原文仍在；老式任务（显式 false）prompt.txt 与 prompt_final 一字不差
     prompt_txt = (d / "prompt.txt").read_text(encoding="utf-8")
@@ -801,7 +802,7 @@ def test_launch_codex_resume_uses_parent_thread_id(tmux_session, codex_env):
     parent_window_id = store.read_status(parent_id)["window_id"]
     launcher.close_windows([parent_window_id], config)
 
-    succ_id = store.create_successor(parent_task, "交接", config)
+    succ_id = store.create_same_role_successor(parent_task, "交接", config)
     succ_status = launcher.launch(succ_id, config)
     assert succ_status["state"] == "launching"
     assert succ_status["session_id"] == "01a05206-e86e-7c80-8540-1b92468c92a1"
@@ -827,7 +828,7 @@ def test_launch_codex_resume_fails_closed_when_parent_window_still_alive(tmux_se
     wait_for_state(parent_id)  # 等首班坐实 thread_id；父窗故意不关
 
     parent_task = store.load_task(parent_id)
-    succ_id = store.create_successor(parent_task, "交接", config)
+    succ_id = store.create_same_role_successor(parent_task, "交接", config)
     succ_status = launcher.launch(succ_id, config)
     assert succ_status["state"] == "failed"
     assert "仍然存活" in succ_status["error"]
@@ -857,7 +858,8 @@ def test_ensure_codex_trusted_writes_config_toml_and_is_idempotent():
     text = config_path.read_text(encoding="utf-8")
     assert f'[projects."{workdir}"]' in text
     assert 'trust_level = "trusted"' in text
-    assert launcher._codex_workdir_trusted(config_path, workdir)
+    entry = launcher._codex_project_entry(config_path, workdir)
+    assert entry and entry.get("trust_level") == "trusted"
 
     launcher.ensure_codex_trusted(workdir)  # 第二次：不该再追加一段
     text2 = config_path.read_text(encoding="utf-8")
@@ -875,8 +877,12 @@ def test_ensure_codex_trusted_preserves_existing_content_and_other_projects():
     text = config_path.read_text(encoding="utf-8")
     assert '[projects."/other/tree"]' in text
     assert '[projects."/tmp/proj/.claude/worktrees/new-slug"]' in text
-    assert launcher._codex_workdir_trusted(config_path, "/other/tree")
-    assert launcher._codex_workdir_trusted(config_path, "/tmp/proj/.claude/worktrees/new-slug")
+    other_entry = launcher._codex_project_entry(config_path, "/other/tree")
+    assert other_entry and other_entry.get("trust_level") == "trusted"
+    new_entry = launcher._codex_project_entry(
+        config_path, "/tmp/proj/.claude/worktrees/new-slug"
+    )
+    assert new_entry and new_entry.get("trust_level") == "trusted"
 
 
 def test_codex_config_path_respects_codex_home(monkeypatch, tmp_path):
@@ -900,7 +906,8 @@ def test_launch_codex_persists_trust_for_build_role(tmux_session, codex_env):
     launcher.launch(task_id, config)
 
     assert config_path.is_file()
-    assert launcher._codex_workdir_trusted(config_path, workdir)
+    entry = launcher._codex_project_entry(config_path, workdir)
+    assert entry and entry.get("trust_level") == "trusted"
 
 
 def test_launch_codex_persists_trust_for_review_role(tmux_session, codex_env):
@@ -928,7 +935,8 @@ def test_launch_codex_persists_trust_for_review_role(tmux_session, codex_env):
     actual_workdir = store.read_status(task_id)["worktree_path"]
     assert actual_workdir  # review 角色也建了工作树
     assert config_path.is_file()
-    assert launcher._codex_workdir_trusted(config_path, actual_workdir)
+    entry = launcher._codex_project_entry(config_path, actual_workdir)
+    assert entry and entry.get("trust_level") == "trusted"
     # 幂等：这次调用没有把同一个 workdir 的段落重复堆一份
     text = config_path.read_text(encoding="utf-8")
     assert text.count(f'[projects."{actual_workdir}"]') == 1

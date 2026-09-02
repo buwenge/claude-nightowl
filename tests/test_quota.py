@@ -470,13 +470,16 @@ def test_load_quota_file_missing_returns_empty_shells():
     assert load_quota_file() == {"claude": {}, "codex": {}}
 
 
-def test_load_quota_file_old_shape_reads_as_claude():
+def test_load_quota_file_old_shape_reads_as_empty_shells():
+    """总review二 G15（D④-2）：一期旧形状 `{"usage": ..., "fetched_at": ...}`
+    的兼容分支删掉了（生产 quota.json 自 S6 起已确认是双分片形状）——
+    遇到这种文件不再猜它是 claude 的，两家都按空壳处理，下一 tick 多刷
+    一次额度，不会炸。"""
     old = {"usage": {"session_pct": 5}, "fetched_at": "2026-08-30T00:00:00Z"}
     store.atomic_write_json(store.home() / "quota.json", old)
     data = load_quota_file()
-    assert data["claude"] == old
-    assert data["codex"] == {}
-    # 读取不改盘：文件仍是旧形状，下次成功刷新才会换新形状
+    assert data == {"claude": {}, "codex": {}}
+    # 读取不改盘
     on_disk = json.loads((store.home() / "quota.json").read_text(encoding="utf-8"))
     assert on_disk == old
 

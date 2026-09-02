@@ -66,10 +66,10 @@ def due(config: dict, now: datetime, state: dict | None = None) -> list[str]:
     tz = timezone(timedelta(hours=int(config.get("display_tz_offset_hours", 0))))
     local_now = now.astimezone(tz)
     today = local_now.strftime("%Y-%m-%d")
+    # 总review二 G15（D④-3）：旧格式（last_date/time 两键，没有 done 字典）
+    # 的兼容分支删掉了——生产 warmup.json 自 8/28 起就有 done 字典。
     state = read_state() if state is None else state
     done_today = set((state.get("done") or {}).get(today) or [])
-    if state.get("last_date") == today and not state.get("done"):
-        done_today.add(state.get("time") or "")  # 旧格式兼容
     overdue = []
     for t in times_of(config):
         hour, minute = (int(x) for x in t.split(":"))

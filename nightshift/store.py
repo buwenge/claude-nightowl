@@ -38,7 +38,6 @@ __all__ = [
     "chain_state",
     "create_cross_role_successor",
     "create_same_role_successor",
-    "create_successor",
     "create_task",
     "effective_effort",
     "effective_model",
@@ -498,7 +497,7 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
     if task.get("worktree") is not None and not isinstance(task.get("worktree"), bool):
         raise ValueError("worktree 必须是布尔值")
     # S8：keepalive 是任务自己的长期显式覆盖（跟 guards.keepalive 那个全局
-    # 兜底开关并存，见 scheduler._maybe_keepalive），只认 enabled 一个键。
+    # 兜底开关并存，保活判断在 scheduler._check_running 里），只认 enabled 一个键。
     keepalive = task.get("keepalive")
     if keepalive is not None:
         if not isinstance(keepalive, dict):
@@ -727,7 +726,7 @@ def next_pipeline_shift(task: dict) -> int:
     return status["pipeline_shift_seq"]
 
 
-# create_successor 里交接缺席时的兜底文案（与开工令一致）
+# create_same_role_successor 里交接缺席时的兜底文案（与开工令一致）
 NO_HANDOVER_TEXT = (
     "上一班没留交接。先看 git log / git status / 项目里的验收单或 reports "
     "目录判断进度，再接着做。"
@@ -823,14 +822,6 @@ def create_same_role_successor(
     _copy_worktree_meta(parent_id, successor_id)
     update_status(parent_id, state="chained", successor_id=successor_id)
     return successor_id
-
-
-def create_successor(parent_task: dict, handover_text: str | None, config: dict) -> str:
-    """向后兼容别名：S1–S6 的换班入口，等价于 create_same_role_successor
-    （S7 之前没有角色轮转，续班永远同角色）。S7 起的新调用点请直接用
-    create_same_role_successor / create_cross_role_successor，语义更明确。
-    """
-    return create_same_role_successor(parent_task, handover_text, config)
 
 
 def create_cross_role_successor(

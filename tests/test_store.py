@@ -626,7 +626,7 @@ def test_create_successor_explicitly_copies_worktree_review():
     )
     store.update_status(parent_id, worktree_path="/p/.claude/worktrees/x",
                         branch="ns/x", base_ref="abc")
-    succ = store.load_task(store.create_successor(
+    succ = store.load_task(store.create_same_role_successor(
         store.load_task(parent_id), "交接", config))
     assert succ["worktree"] is True
     assert succ["review"] == {"enabled": False, "merge_policy": "auto"}
@@ -640,7 +640,7 @@ def test_create_successor_explicitly_copies_worktree_review():
     data = store.load_task(pid2)
     del data["worktree"]  # 手工退回旧记录形状
     store.atomic_write_json(store.task_dir(pid2) / "task.json", data)
-    succ2 = store.load_task(store.create_successor(data, "交接", config))
+    succ2 = store.load_task(store.create_same_role_successor(data, "交接", config))
     assert succ2["worktree"] is False
     assert "worktree_path" not in store.read_status(succ2["id"])
 
@@ -672,7 +672,7 @@ def test_create_successor_renders_all_placeholders(tmp_path, monkeypatch):
         "title": "标题X", "project": "demo", "model": "claude-fable-5", "effort": "high",
         "run_at": "2026-08-27T18:00:00Z", "task_text": "正文Y", "prompt_final": "p",
     }, config)
-    succ = store.create_successor(store.load_task(parent_id), "交接Z\nNEXT: continue", config)
+    succ = store.create_same_role_successor(store.load_task(parent_id), "交接Z\nNEXT: continue", config)
     prompt = store.load_task(succ)["prompt_final"]
     for piece in ("标题X", "正文Y", "交接Z", "第 2 班", "/home/user/projects/demo", "1000000"):
         assert piece in prompt, piece
@@ -853,7 +853,7 @@ def test_create_successor_copies_runner():
     parent_id = store.create_task(
         make_task(runner="codex", model="gpt-5.6-luna", effort="high"), RUNNERS_CONFIG
     )
-    succ = store.load_task(store.create_successor(
+    succ = store.load_task(store.create_same_role_successor(
         store.load_task(parent_id), "交接", RUNNERS_CONFIG))
     assert succ["runner"] == "codex"
     # 旧式父任务（缺 runner）：后继也按 claude 解释，不吃别的默认
@@ -864,7 +864,7 @@ def test_create_successor_copies_runner():
     task2 = store.load_task(parent2_id)
     del task2["runner"]  # 模拟 S6 上线前落盘、没有这个字段的旧记录
     store.atomic_write_json(store.task_dir(parent2_id) / "task.json", task2)
-    succ2 = store.load_task(store.create_successor(task2, "交接", RUNNERS_CONFIG))
+    succ2 = store.load_task(store.create_same_role_successor(task2, "交接", RUNNERS_CONFIG))
     assert succ2["runner"] == "claude"
 
 
@@ -949,7 +949,7 @@ def test_create_successor_codex_context_limit_placeholder_is_human_text():
     parent_id = store.create_task(
         make_task(runner="codex", model="gpt-5.6-luna", effort="high"), config
     )
-    succ = store.load_task(store.create_successor(
+    succ = store.load_task(store.create_same_role_successor(
         store.load_task(parent_id), "交接", config))
     assert succ["prompt_final"].startswith("上限 暂无稳定水位来源\n")
     assert "None" not in succ["prompt_final"]

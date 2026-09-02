@@ -154,8 +154,10 @@ def fetch_usage_claude(config: dict, timeout: int = 120) -> dict:
             tail = tail.decode("utf-8", "replace")
         raise UsageUnavailable(f"/usage 超时（{timeout}s）{(tail or '')[-500:]}") from exc
     except OSError as exc:
-        if isinstance(exc, FileNotFoundError) and exc.filename != cmd[0]:
-            raise  # 不是可执行文件不在（比如 cwd 建不出来），原样上抛
+        # 总review二 G15（D④-4）：以前这里还会判 FileNotFoundError 是不是
+        # 指向 cmd[0]（不是就原样上抛，怀疑是 cwd 建不出来）——上面
+        # ensure_dirs() 已经把 home()（cwd）建出来了，"cwd 不存在"这种
+        # FileNotFoundError 到不了这里，分支已死，删了行为不变。
         # 找不到 / 没执行权限 / 其余起不了进程的错，都算"查不到"
         raise UsageUnavailable(f"起不了 claude（{cmd[0]}）：{exc}") from exc
     if proc.returncode != 0:
@@ -407,9 +409,10 @@ def load_quota_file() -> dict:
     """读 quota.json，统一成 {"claude": {...}, "codex": {...}} 形状（各自
     "usage"/"fetched_at"/"error" 三键）。
 
-    兼容一期旧形状 `{"usage": ..., "fetched_at": ...}`（按 claude 解释）；
-    读取时不改盘——下次哪家成功刷新了，才会把整份文件换成新形状。
     文件缺失/坏 JSON/不是对象都返回两家皆空的空壳，不炸。
+
+    总review二 G15（D④-2）：一期旧形状 `{"usage": ..., "fetched_at": ...}`
+    的兼容分支删掉了——生产 quota.json 自 S6 起就是双分片形状，已核对确认。
     """
     path = home() / "quota.json"
     empty = {"claude": {}, "codex": {}}
@@ -422,8 +425,6 @@ def load_quota_file() -> dict:
         return empty
     if not isinstance(data, dict):
         return empty
-    if "claude" not in data and "codex" not in data:
-        return {"claude": data, "codex": {}}  # 一期旧形状：整份就是 claude 那份
     # 分片不是对象（手改/写坏）按空壳，消费方一律 slice_.get(...)，不能炸
     return {
         runner: (data.get(runner) if isinstance(data.get(runner), dict) else {})

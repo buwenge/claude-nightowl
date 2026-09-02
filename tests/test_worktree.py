@@ -299,7 +299,7 @@ def test_create_successor_copies_worktree_review_and_meta(repo):
     parent = make_task(config)
     meta = worktree.ensure_worktree(parent, proj)
     store.update_status(parent["id"], **meta)
-    succ_id = store.create_successor(parent, "交接\nNEXT: continue", config)
+    succ_id = store.create_same_role_successor(parent, "交接\nNEXT: continue", config)
     succ = store.load_task(succ_id)
     assert succ["worktree"] is True
     assert succ["review"] == parent["review"]
@@ -321,7 +321,7 @@ def test_create_successor_of_old_style_task_stays_false(repo):
     data = store.load_task(parent["id"])
     del data["worktree"]  # 手工退回旧记录形状
     store.atomic_write_json(store.task_dir(parent["id"]) / "task.json", data)
-    succ_id = store.create_successor(store.load_task(parent["id"]), "交接", config)
+    succ_id = store.create_same_role_successor(store.load_task(parent["id"]), "交接", config)
     succ = store.load_task(succ_id)
     assert succ["worktree"] is False
     assert worktree.wants_worktree(succ) is False
@@ -672,7 +672,7 @@ def test_chain_window_ids_only_from_records(repo):
     proj, config = repo
     task, meta = _tree_with_canary(repo)
     store.update_status(task["id"], window_id="@11")
-    succ_id = store.create_successor(task, "交接\nNEXT: continue", config)
+    succ_id = store.create_same_role_successor(task, "交接\nNEXT: continue", config)
     store.update_status(succ_id, window_id="@12")
     ids = worktree.chain_window_ids(store.load_task(succ_id))
     assert sorted(ids) == ["@11", "@12"]

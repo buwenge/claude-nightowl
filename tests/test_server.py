@@ -316,19 +316,24 @@ def test_state_changing_requests_need_csrf_header(authed):
 
 
 def test_api_config_fields(authed):
+    """总review二 G15（C④-1/2）：顶层 models/efforts 兼容视图与
+    display_tz_offset_hours 不再发——runners.claude.models 是权威源，
+    app.js 全用浏览器本地时区，没人读这几个键。"""
     status, _, body = authed.request("GET", "/api/config")
     assert status == 200
     assert body["projects"] == CONFIG["projects"]
-    assert body["models"]["claude-fable-5"] == {
-        "context_limit": 500000, "usage_label": "Fable",
+    assert "models" not in body
+    assert "efforts" not in body
+    assert "display_tz_offset_hours" not in body
+    assert body["runners"]["claude"]["models"]["claude-fable-5"] == {
+        "context_limit": 500000,
     }
-    assert body["efforts"] == CONFIG["efforts"]
+    assert body["runners"]["claude"]["efforts"] == CONFIG["efforts"]
     assert body["guards"] == CONFIG["guards"]
     assert body["chain"] == CONFIG["chain"]
     assert body["prompt_template"] == CONFIG["prompt_template"]
     assert body["context_warn_text"] == CONFIG["context_warn_text"]
     assert body["chain_template"] == CONFIG["chain_template"]
-    assert body["display_tz_offset_hours"] == 8
 
 
 def test_put_templates_changes_only_three_keys(authed, ns_home):
@@ -646,8 +651,9 @@ def test_api_config_exposes_codex_runner_when_configured(authed, ns_home):
     assert status == 200
     assert set(body["runners"]) == {"claude", "codex"}
     assert body["runners"]["codex"]["models"] == {"gpt-5.6-luna": {"context_limit": None}}
-    # 顶层老字段（旧前端还在读的）原样保留，没被 runners 抢走
-    assert body["models"]["claude-fable-5"] == {"context_limit": 500000, "usage_label": "Fable"}
+    # G15（C④-1）：顶层 models 兼容字段已删——claude 的模型表现在只在
+    # runners.claude 里，不受 codex 单独配置了 runners 影响
+    assert body["runners"]["claude"]["models"]["claude-fable-5"] == {"context_limit": 500000}
 
 
 def test_create_task_codex_runner_rejected_when_not_configured(authed):
@@ -1057,6 +1063,9 @@ def test_put_task_active_restricted(authed):
         ("model", "claude-haiku-4-5-20251001"),
         ("project", "demo"),
         ("effort", "low"),
+        # 总review二 G15（C④-4）：trigger 从活跃态可改字段里删掉了——
+        # 已起跑的任务没人再读它
+        ("trigger", {"type": "time"}),
     ):
         status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {key: value})
         assert status == 400, key
@@ -1483,10 +1492,15 @@ def test_quota_empty_then_loaded(authed, ns_home):
         "codex": {"usage": None, "fetched_at": None, "error": None, "age_seconds": None},
     }
 
-    # 一期旧形状（quota.json 整份就是 claude 那份）按 claude 解释
+    # 总review二 G15（D④-2）：一期旧顶层形状兼容删掉了，quota.json 只认
+    # 双分片形状（生产自 S6 起就是这个形状）
     store.atomic_write_json(ns_home / "quota.json", {
-        "usage": {"session_pct": 13, "week_all_pct": 19, "per_model": {"Fable": 35}},
-        "fetched_at": store.utc_now_iso(),
+        "claude": {
+            "usage": {"session_pct": 13, "week_all_pct": 19, "per_model": {"Fable": 35}},
+            "fetched_at": store.utc_now_iso(),
+            "error": None,
+        },
+        "codex": {},
     })
     status, _, body = authed.request("GET", "/api/quota")
     assert status == 200
@@ -1515,16 +1529,17 @@ def test_static_files_and_traversal(ns_home, tmp_path, monkeypatch):
         client = Client(url)
         for name, ctype in (
             ("app.js", "text/javascript"), ("style.css", "text/css"),
-            ("index.html", "text/html"), ("login.html", "text/html"),
+            ("login.html", "text/html"),
         ):
             status, headers, raw = client.request("GET", f"/{name}")
             assert status == 200, name
             assert headers["Content-Type"].startswith(ctype)
             assert headers["Cache-Control"] == "no-store"
             assert raw
-        # 白名单外与路径穿越一律 404
+        # 白名单外与路径穿越一律 404；index.html 单独那条路由 G15（C④-3）
+        # 删掉了——只经 "/" 按登录态分发，直接访问也该 404
         for path in ("/nope.js", "/etc/passwd", "/../etc/passwd",
-                     "/../../etc/passwd", "/%2e%2e/etc/passwd"):
+                     "/../../etc/passwd", "/%2e%2e/etc/passwd", "/index.html"):
             status, _, _ = client.request("GET", path)
             assert status == 404, path
     finally:
@@ -1592,11 +1607,20 @@ def test_delete_allows_chained(authed):
 
 
 def test_static_no_store_and_versioned_assets(authed):
-    status, headers, body = authed.request("GET", "/index.html")
+    # 总review二 G15（C④-3）：/index.html 单独那条路由删掉了，index.html
+    # 只经 "/" 按登录态分发——已登录时打 "/" 就是它。
+    status, headers, body = authed.request("GET", "/")
     assert status == 200
     assert headers.get("Cache-Control") == "no-store"
     text = body if isinstance(body, str) else str(body)
     assert "./app.js?v=" in text and "./style.css?v=" in text
+
+
+def test_index_html_no_longer_directly_routable(authed):
+    """总review二 G15（C④-3）：/index.html 那条静态白名单删掉了——未登录
+    也能拿到页面骨架的口子不该存在，直接访问现在 404。"""
+    status, _, _ = authed.request("GET", "/index.html")
+    assert status == 404
 
 
 def test_quota_refresh_endpoint_default_refreshes_both(authed, monkeypatch):

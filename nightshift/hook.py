@@ -141,11 +141,10 @@ def _read_fresh_usage(config: dict) -> dict | None:
 
     二次返修阻断二修正：S6 起 quota.json 是双 runner 分片
     `{"claude": {...}, "codex": {...}}`；这里必须走 `quota.load_quota_file()`
-    只取 `claude` 那一份再判有效（loader 自带一期旧顶层形状兼容，`{"usage":
-    ..., "fetched_at": ...}` 会被当成 claude 分片解释），不能再直接读文件
-    顶层 `data["fetched_at"]`/`data["usage"]`——双分片写法下顶层根本没有
-    这两个键，会让这个 hook 无声失效（Claude 的五小时暂停、周线收尾、
-    别的模型周线提示全部读不到新数据）。
+    只取 `claude` 那一份再判有效，不能再直接读文件顶层
+    `data["fetched_at"]`/`data["usage"]`——双分片写法下顶层根本没有这两个
+    键，会让这个 hook 无声失效（Claude 的五小时暂停、周线收尾、别的模型
+    周线提示全部读不到新数据）。
 
     分片有 error、没有 usage dict、或 `fetched_at` 超过新鲜度上限都当没有
     ——回注提醒宁缺勿滥，过期额度只会吓唬人。
@@ -464,16 +463,6 @@ def _is_subagent_call(payload: dict) -> bool:
     except OSError:
         return False
     return str(tool_use_id).encode("utf-8") not in tail
-
-
-def _over_warn_line(task: dict, tokens: int | None) -> bool:
-    """Stop 用：当前水位是否已过回注警戒线（写进 status 供调度器换班判断）。"""
-    if tokens is None:
-        return False
-    try:
-        return tokens >= warn_threshold(task, store.load_config())
-    except Exception:
-        return False
 
 
 def _post_tool_use_refresh(task: dict, status: dict, payload: dict) -> str | None:
@@ -1039,7 +1028,6 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             "last_message": (payload.get("last_assistant_message") or "")[:2000],
             "stuck": False,
             "last_event_at": now,
-            "over_warn_line": False,  # Codex 没有上下文水位来源，恒定不过线
         }
         fields["state"] = "waiting_wakeup" if status_now.get("quota_paused_until") else "idle"
 
@@ -1065,9 +1053,6 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             "last_event_at": now,
         }
         _refresh_context(task, payload, fields)
-        # Stop 不回注（stdout 语义不同），但同样刷新水位并把"是否过警戒线"
-        # 落盘，供调度器换班判断（"这班收到过注入"用 context_warned_at 判）
-        fields["over_warn_line"] = _over_warn_line(task, fields["context_tokens"])
         crons = payload.get("session_crons") or []
         fields["session_crons"] = crons
         if any(t.get("status") == "running" for t in background_tasks):
@@ -1174,9 +1159,6 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
                 )
             return None
         return _post_tool_use_refresh(task, status, payload)  # 锁内算出的新值；上下文字段不是计数，锁外合并即可
-
-    elif event == "PreCompact":
-        store.append_event(task_id, "hook PreCompact（有人开了 compact？）")
 
     elif event == "SessionEnd":
         # 已经收尾的终态（finished/chained/…）不被"关窗口"盖成 exited：
