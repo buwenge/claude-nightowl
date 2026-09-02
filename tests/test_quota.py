@@ -287,6 +287,19 @@ def test_parse_usage_week_all_line_renamed_is_parse_error():
     assert ok["week_all_pct"] == 19 and ok["per_model"] == {}
 
 
+def test_resets_in_minutes_accepts_iso_from_epoch_to_iso():
+    """总review二 G17：Codex 分片的 resets_at 是 quota._epoch_to_iso 生成的
+    ISO 字符串，resets_in_minutes 要能直接认（不再永远落到 60 分钟兜底）。"""
+    from datetime import datetime, timezone
+    from nightshift.quota import resets_in_minutes
+    now = datetime(2026, 9, 2, 8, 0, 0, tzinfo=timezone.utc)
+    assert resets_in_minutes("2026-09-02T08:53:11Z", now) == 54
+    # 已过的 ISO 时刻取 0，不报错
+    assert resets_in_minutes("2026-09-01T00:00:00Z", now) == 0
+    # 格式不对的字符串仍然认不出，返回 None（不是 ISO 也不是 /usage 格式）
+    assert resets_in_minutes("2026-13-99T99:99:99Z", now) is None
+
+
 def test_resets_in_minutes_year_boundary():
     """审查 D4：跨年那几分钟，缓存里的 resets 还是 12 月 31 日 → 应算"已过"取 0，
     不是按当前年解析成明年 12 月 31 日的 52 万分钟。"""

@@ -175,19 +175,31 @@ _RE_RESETS_AT = re.compile(r"([A-Z][a-z]{2}) (\d{1,2}), (\d{1,2})(?::(\d{2}))?(a
 
 
 def resets_in_minutes(resets_text: str | None, now: datetime | None = None) -> int | None:
-    """把 /usage 的 `Aug 27, 6:40pm (UTC)` 换算成"距现在几分钟刷新"（向上取整，最小 0）。
+    """把刷新时刻换算成"距现在几分钟刷新"（向上取整，最小 0）。
 
-    认不出来（格式变了 / 不是 UTC）返回 None，调用方按未知处理。/usage 不给年份：
-    resets 只会落在"过去一天内 ~ 未来八天内"，在去年/今年/明年三个候选里取离
-    现在最近的那个——跨年那几分钟缓存里还是 12 月 31 日，按"当前年"硬解析会
-    算成明年 12 月 31 日（52 万分钟，hook 会排出上万个闹钟）。
+    两种输入形状都认：Codex 分片的 `_epoch_to_iso` 产出的 ISO 字符串
+    （`2026-09-02T08:53:11Z`）优先按 ISO 解析；解析不出来再退回 /usage 的
+    `Aug 27, 6:40pm (UTC)` 这种正则格式（S6 之前一直用的那条路）。
+
+    都认不出来（格式变了 / 不是 UTC）返回 None，调用方按未知处理。/usage 不给
+    年份：resets 只会落在"过去一天内 ~ 未来八天内"，在去年/今年/明年三个候选里
+    取离现在最近的那个——跨年那几分钟缓存里还是 12 月 31 日，按"当前年"硬解析
+    会算成明年 12 月 31 日（52 万分钟，hook 会排出上万个闹钟）。
     """
     if not resets_text:
         return None
+    now = now or datetime.now(timezone.utc)
+    try:
+        iso_when = datetime.fromisoformat(resets_text.replace("Z", "+00:00"))
+    except ValueError:
+        iso_when = None
+    if iso_when is not None:
+        if iso_when.tzinfo is None:
+            iso_when = iso_when.replace(tzinfo=timezone.utc)
+        return max(0, math.ceil((iso_when - now).total_seconds() / 60))
     m = _RE_RESETS_AT.search(resets_text)
     if not m:
         return None
-    now = now or datetime.now(timezone.utc)
     mon, day, hour, minute, ampm = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4) or 0), m.group(5)
     if ampm == "pm" and hour != 12:
         hour += 12

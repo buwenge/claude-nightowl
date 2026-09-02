@@ -695,3 +695,17 @@ def test_css_banner_close_button_has_touch_target():
     body = m.group(0)
     assert "width: 44px" in body
     assert "height: 44px" in body
+
+
+# ---------- 总review二 G17：Codex 额度刷新时刻要按本地时间显示 ----------
+
+
+def test_app_js_parse_resets_accepts_iso_before_usage_format():
+    """parseResets 先判 ISO（quota._epoch_to_iso 生成的形状），是就交给 Date
+    原生解析（本地时区），不是才走 /usage 那条正则老路。"""
+    body = _js_fn("parseResets")
+    iso_idx = body.index("^\\d{4}-\\d{2}-\\d{2}T")
+    usage_idx = body.index("A-Z][a-z]{2}")
+    assert iso_idx < usage_idx, "ISO 判断要在 /usage 正则之前"
+    assert "new Date(text)" in body
+    assert "isNaN(iso.getTime())" in body

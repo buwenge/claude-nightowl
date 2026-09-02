@@ -240,10 +240,16 @@ function refreshQuota() {
   api("GET", "./api/config").then(function (cfg) { CFG = cfg; renderWarmup(cfg); }).catch(function () {});
 }
 
-// /usage 的 "Aug 27, 6:40pm (UTC)" → Date（按 UTC 解析；年份取当前年，明显过去就算下一年）
+// /usage 的 "Aug 27, 6:40pm (UTC)" → Date（按 UTC 解析；年份取当前年，明显过去就算下一年）；
+// G17：Codex 分片的 resets 是 quota._epoch_to_iso 生成的 ISO 字符串
+// （"2026-09-02T08:53:11Z"），先认这种形状，Date 原生解析已经是本地时区。
 var MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
 function parseResets(text) {
   if (!text) return null;
+  if (/^\d{4}-\d{2}-\d{2}T/.test(text)) {
+    var iso = new Date(text);
+    return isNaN(iso.getTime()) ? null : iso;
+  }
   var m = /([A-Z][a-z]{2}) (\d{1,2}), (\d{1,2})(?::(\d{2}))?(am|pm)\s*\(UTC\)/.exec(text);
   if (!m || !(m[1] in MONTHS)) return null;
   var hour = Number(m[3]) % 12 + (m[5] === "pm" ? 12 : 0);
