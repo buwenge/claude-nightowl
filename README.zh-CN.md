@@ -1,223 +1,178 @@
 # claude-nightowl（夜猫子）
 
-> 包名与命令仍叫 `nightshift`（夜班）——让 Claude Code 在你睡觉时按计划在 tmux 里干活。English version: [README.md](README.md).
+**让 Claude Code（和 Codex CLI）在你睡觉时按计划在 tmux 里无人值守地干活——自带额度预检、hook 状态回报、上下文水位守卫、自动换班交接、隔离工作树，以及可选的"施工 → 审稿"流水线。**
 
-到点在 tmux 里开一个新窗口、跑一个**正常的交互式 `claude`** 的定时任务调度器。
-你早上 ssh 进来 `Ctrl+B w` 选窗口就能接着聊；跑的时候靠 Claude Code 自己的
-hook 回报状态，靠机器读 transcript 算上下文水位——不猜、不接管会话。
+包名与命令叫 `nightshift`（夜班）。English version: [README.md](README.md) · 详细操作手册：[docs/使用手册.md](docs/使用手册.md)
 
-## 适用范围
+```
+02:30  调度器在 tmux 里开一个窗口 ──▶ claude --permission-mode auto（你的提示词）
+       hook 逐条回报事件 ──────────▶ status.json / events.log
+       上下文到 80% ────────────────▶ "写交接、commit、停下"
+       交接末行 NEXT: continue ─────▶ 下一个窗口接着上一班的进度干
+07:00  你 ssh 进来，Ctrl+B w 选窗口，在同一个会话里接着聊
+```
 
-- 能跑：Linux / macOS / Windows 的 WSL——有 `tmux`、Python 3.12 和**终端版** Claude Code 的地方。
-- 不能跑：Windows 原生（没 tmux、没 fcntl）、Claude Code 桌面 app / IDE 插件 / 网页版（调度器起的是 CLI 会话，attach 不到那些）。
-- 隐含前提：机器整夜不睡（VPS 天然满足；笔记本得关掉睡眠）。
-- 目标项目目录要先手动用 `claude` 开过一次、点过"信任此文件夹"；`--permission-mode auto` 对某些模型（如 Haiku 4.5）会被 CC 静默回落成 manual，真跑请用 Sonnet / Opus / Fable 这类支持 auto 的模型（回落了调度器会开"(注意)"窗口提醒）。
+---
 
-> **安全提示**：网页登录口令 = 一把能让 `--permission-mode auto` 的 Claude 以运行用户（通常是 root）身份在你的项目里干活的钥匙，强度等同于一个 shell。放公网务必走 nginx + HTTPS，口令认真设，有条件再套一层 Cloudflare Access 之类的第二因子。
+## 为什么做这个
 
-## 依赖
+交互式的 Claude Code 会话是干正经活最好的地方：完整的工具权限、plan 模式、记忆、子 agent，而且人随时可以插进去。问题只有一个——得有人醒着往里打字。
 
-- Python 3.12（只用标准库，不装任何第三方包，没有 venv）
-- tmux
-- Claude Code（`claude` 在 PATH 里）
+用 cron 跑 `claude -p` 能自动化，但交互式会话没了。**夜猫子把交互式会话留着，把"守夜"的活接过来**：到点在 tmux 窗口里起一个*正常的* `claude`，通过 Claude Code 自己的 hook 看它在干什么，读 transcript 算上下文用了多少，窗口快满的时候让模型写交接、再开下一班。
+
+它从不抓屏幕猜模型在干嘛，也从不接管对话。第二天早上窗口还在。
+
+## 功能
+
+- **带预检的定时。** 任务可以定在某个时刻跑，也可以定在另一个任务结束之后跑。起跑前调度器检查：目标目录已被 Claude Code 信任、同目录没有别的任务在跑、账号额度在你设的线以上——不够就**推迟**（默认 30 分钟一步，最多 6 小时），绝不硬起。
+- **靠 hook 报状态，不抓屏。** 每个任务自带一套 hook 配置（走 `--settings`，不往你项目里写任何东西）。七个 hook 事件在文件锁下更新任务自己的 `status.json`。`Stop` 事件会带回后台任务和已设闹钟，所以调度器分得清"在等后台任务""在等闹钟"和"真干完了"。
+- **上下文守卫与换班交接。** 每 20 次工具调用（或 transcript 长了一截、或过了 5 分钟）hook 读一次 transcript 算水位。到警戒线（默认模型窗口的 80%）就注入收尾指令：写 `handover-<n>.md`、commit、停下。调度器读交接的最后一行——`NEXT: continue` 拿着交接开下一个窗口；`NEXT: done` 任务完结。每个角色最多 `chain.max_windows` 班。
+- **额度守卫。** 每 5 分钟解析一次 `claude -p /usage`（本地斜杠命令，不耗额度）。撞五小时线时会话自己设闹钟、刷新后接着干；撞周线就收尾。子 agent 也会收到一句短提醒，不会在主会话睡下后继续烧。
+- **隔离工作树与存档点。** 默认每个任务在 `<项目>/.claude/worktrees/<slug>` 里、分支 `ns/<slug>` 上干活。模型不 commit；调度器在每个班次边界打一个存档点。干完了你在网页上点**合并**（`--no-ff`）或**丢弃**，或者设 `merge_policy: auto`。启动时的对账绝不删除任何不是它自己建的东西。
+- **施工 → 审稿流水线。** 打开 `review`，施工班干完后接一个只读审稿班（同一个模型、换一个模型、或 Codex 都行），审稿班用 `NEXT: done` / `NEXT: fix` / `NEXT: pending` 给结论。`fix` 会让施工角色带着审稿意见回到*同一个*工作树返工；轮数有上限。任何一条流水线都可以在网页上**"我来看"**暂停、继续，或跳过审稿。
+- **Codex CLI 当第二种工人。** 任务可以跑在 `codex` 上而不是 `claude`。状态一样来自 hook（通过 Codex 的 hooks profile 和官方 notify 端点），守卫文案改用 `tmux send-keys` 投递，还有一个小小的**后台进程登记簿**，让沙箱里的 Codex 会话能起长任务而不丢单。两个账号的额度并排显示。
+- **保活与卡住检测。** 在等待的会话（等后台任务、或被"我来看"按住）每 50 分钟（Codex 25 分钟）收到一句探针，让提示词缓存保持热的。在一条工具调用里静默 15 分钟的会话会被标为疑似卡住；可选让调度器按 `Esc` 并注入一句自检提示。
+- **手机优先的网页。** 带日历的任务列表、带实时提示词预览的新建表单、可编辑的全部文案模板、带刷新倒计时的额度卡、任何运行中窗口的只读屏幕快照，以及一键操作（取消、中止、停后台、我来看/继续、合并/丢弃、往会话里捎话）。一个口令、cookie 登录，附 nginx 片段。
+- **零依赖。** Python 3.12 标准库、`tmux`、`claude` 命令。没有 venv，不 pip。
+
+## 工作原理
+
+```
+                 ┌─────────────────────────── 调度器（python3 -m nightshift serve）────────────────────────────┐
+                 │  每 30 秒一轮：预检 → 起跑 → 看护 → 保活 → 交接/换班 → 存档点/合并                            │
+                 └───────┬─────────────────────────────────────────────────────────────────────────▲────────────┘
+                         │ tmux new-window  run.sh                                                │ 读
+                         ▼                                                                        │
+   ┌────────────────────────────────────────┐   hook 事件（stdin JSON）    ┌───────────────────────┴──────────┐
+   │ claude --session-id … --settings hooks │ ───────────────────────────▶ │ ~/.nightshift/tasks/<id>/        │
+   │   （一个普通的交互式会话）              │ ◀─── additionalContext ───── │   status.json  events.log        │
+   └────────────────────────────────────────┘   （上下文 / 额度提醒）       │   handover-<n>.md  prompt.txt    │
+                         ▲                                                └──────────────────────────────────┘
+                         │ ssh 进来，Ctrl+B w，接着聊
+```
+
+状态机大致是：`scheduled → launching → working ⇄ waiting_background / waiting_wakeup → idle →（存档点）→ chained | finished | awaiting_merge → merged`，旁边还有 `held`、`postponed`、`failed`、`needs_attention`、`chain_exhausted`。每一次状态变化都用人话写进 `events.log`。
+
+## 依赖与前提
+
+- Linux、macOS 或 WSL——有 `tmux`、Python 3.12 和**终端版** Claude Code（`claude` 在 `PATH` 里）的地方。Windows 原生不行（没 tmux、没 `fcntl`）；桌面 app / IDE 插件 / 网页版也不行（调度器起的是 CLI 会话）。
+- 机器整夜不睡（VPS 天然满足；笔记本得关掉睡眠）。
+- 每个目标项目目录要先用 `claude` 开过一次、点过"信任此文件夹"。预检只读 `~/.claude.json` 里的 `hasTrustDialogAccepted`，没信任的目录拒绝起跑——它绝不替你写这个文件。
+- 用支持 `--permission-mode auto` 的模型。Claude Code 对某些模型（比如 Haiku 4.5）会静默回落成手动批准；调度器发现回落会开一个"(注意)"窗口，但任务会停在那里等人。
+- 可选：Codex CLI，如果你想用 Codex 工人。
 
 ## 快速开始
 
 ```bash
+git clone https://github.com/buwenge/claude-nightowl.git
+cd claude-nightowl
+
 mkdir -p ~/.nightshift
 cp config.example.json ~/.nightshift/config.json
+$EDITOR ~/.nightshift/config.json      # 至少改：tmux_session、projects、models
+
+# 前台跑调度器 + 网页（127.0.0.1:8190）
+python3 -m nightshift serve
 ```
 
-然后把 `~/.nightshift/config.json` 改成自己的：
-
-| 键 | 改什么 |
-|---|---|
-| `tmux_session` | 任务窗口开在哪个 tmux 会话里（你登录自动进的那个会话名） |
-| `projects` | 项目名 → 目录绝对路径；表单/命令行只能从这里选 |
-| `models` | 各模型的上下文上限 `context_limit`（Claude 5 全系 1,000,000，Haiku 4.5 200,000；官方接口不给这个数，只能查表）、账号额度里的单模型周线标签 `usage_label` |
-| `efforts` / `guards` / `chain` | 思考档位、额度与上下文警戒线、换班策略 |
-| `prompt_template` 等三个模板 | 提示词模板、到线提醒文案、续班文案 |
-
-另外目标项目目录要先在 Claude Code 里点过一次"信任此文件夹"
-（`~/.claude.json` 里 `hasTrustDialogAccepted`），没信任的目录到点会被拦下并开失败窗口。
-
-## 五个常用命令
+然后打开 `http://127.0.0.1:8190/`，设一次口令，建任务——或者用命令行：
 
 ```bash
-# 建任务：明晚 2:30（UTC+8）在 demo 项目里跑一个重构
-python3 -m nightshift add --title "重构 store" --project demo \
-    --model claude-fable-5 --effort high --run-at "2026-08-28 02:30" \
-    --task-text "把 store.py 的读写拆开，跑测试，commit"
+python3 -m nightshift add --title "拆分 store.py" --project demo \
+    --model claude-sonnet-5 --effort high --run-at "2026-09-03 02:30" \
+    --task-text "把 store.py 拆成读写两个模块，跑测试，commit。"
 
-# 列出任务（含状态与上下文水位）
-python3 -m nightshift list
-
-# 看一个任务的完整状态与最近事件
-python3 -m nightshift show <任务id>
-
-# 不等到点现在就跑；先 --dry-run 预览将生成的 run.sh 与 tmux 命令
-python3 -m nightshift run-now <任务id> --dry-run
-python3 -m nightshift run-now <任务id>
-
-# 查账号额度（无头跑一次 /usage 并解析）
-python3 -m nightshift quota
-
-# 抓某个任务窗口最近 200 行屏幕
-python3 -m nightshift capture <任务id> --lines 200
+python3 -m nightshift list                      # 任务、状态、上下文水位
+python3 -m nightshift show <任务id>             # 完整状态 + 最近事件
+python3 -m nightshift run-now <任务id> --dry-run   # 预览 run.sh 与 tmux 命令
+python3 -m nightshift quota                     # 解析一次 /usage
+python3 -m nightshift capture <任务id> --lines 200 # 抓窗口最近 200 行屏幕
+python3 -m nightshift passwd                    # 设置/覆盖网页口令
 ```
+
+`--run-at` 按 `display_tz_offset_hours`（默认 UTC+8）解释，落盘存 UTC。
+
+## 配置
+
+全部在 `~/.nightshift/config.json`（目录可用 `NIGHTSHIFT_HOME` 改）。从 `config.example.json` 复制后改，重要的键：
+
+| 键 | 是什么 |
+|---|---|
+| `tmux_session`、`window_prefix` | 任务窗口开在哪个 tmux 会话里（你 ssh 进来落到的那个），窗口怎么命名。 |
+| `projects` | `名字 → 绝对路径`。任务只能指向这里面的目录。 |
+| `models` | 各模型的 `context_limit`（Claude Code 不暴露这个数，只能查表——Claude 5 全系 1,000,000，Haiku 4.5 200,000）和用来对上 `/usage` 里单模型周线的 `usage_label`。 |
+| `runners` | `claude` 与 `codex` 两块：可执行文件、探针模型、允许的模型/档位、保活间隔与文案。 |
+| `guards` | 默认额度线（`session_pct_max` 80、`weekly_pct_max` 95、`model_weekly_pct_max`）、`context_warn_ratio` 0.8、保活开关。可按任务覆盖。 |
+| `chain` | `max_windows`（默认 3）与 `on_no_handover`（`continue` / `stop`）。 |
+| `review` | 审稿默认值：`max_rounds`、`on_no_quota`、`merge_policy`（`manual` / `auto`）、`criteria_text`。 |
+| `scheduler` | 巡检间隔、起跑宽限、推迟步长/上限、额度刷新间隔、卡住阈值、起跑超时。 |
+| `http` | 监听地址/端口、URL 前缀、cookie 设置。 |
+| `warmup` | 可选：每天固定时刻发一句便宜的话，让五小时窗口早点开始算。 |
+| `*_template`、`*_text` | 系统往会话里发的每一句话——任务提示词、续班提示词、上下文/额度提醒、审稿指令、保活探针。网页"模板"页都能改；占位符自动填。 |
+
+按任务的覆盖项（`guards`、`chain`、`review`、`keepalive`、`worktree`、`trigger`）在新建表单里设，或直接改 `tasks/<id>/task.json`。
+
+## 交接协议
+
+一个班被要求收尾时，往 `~/.nightshift/tasks/<id>/handover-<班次>.md` 写一份普通的 markdown——做完了什么、没做完什么、下一步做什么——**最后一个非空行**必须是二选一：
+
+```
+NEXT: continue      # 没干完：拿着这份交接开下一班
+NEXT: done          # 干完了：走完工流程（完结 / 审稿 / 等合并）
+```
+
+调度器在几件事上是有讲究的：
+
+- 只认文件。聊天回复里写的 `NEXT:` 不算，所以模型说两遍"done"也没事。
+- 一份交接只评估一次。之后要是被重写了（你在窗口里继续聊、让它换个方案），调度器发现文件变了会再评估一次。
+- 写完交接但还挂着一个闹钟的班当作已收工，调度器会敲它一句撤掉闹钟；挂着闹钟但**没有**交接的班不动——它还在干活。
+- 你在一个已经完结的任务窗口里聊天，任务会短暂显示为工作中，然后自动弹回原来的终态。
+- 审稿班不写文件，结论是它最终回复的最后一行。
+
+## 部署
+
+**systemd。** 调度器是前台进程，单元模板在 `deploy/nightshift.service.example`（改 `WorkingDirectory` 与 `NIGHTSHIFT_HOME`，然后 `systemctl enable --now nightshift`）。任务窗口是 tmux 的子进程不是服务的子进程，重启服务不影响正在跑的会话。`serve --once` 只跑一轮，适合挂 cron；`serve --no-http` 不起网页。
+
+**nginx。** 网页要放在 HTTPS 后面。`deploy/nginx-location.example.conf` 把 `/nightshift/` 反代到 `127.0.0.1:8190` 并给登录接口限速。网页里全是相对路径，任何前缀都行。
+
+**安全，认真读一次。** 网页口令是一把钥匙，能让一个自动批准权限的 Claude Code 以调度器的运行用户（通常是 root）身份在你的项目里干活。把它当 shell 登录看：口令要强、只走 HTTPS、有条件前面再套一层第二因子（Cloudflare Access 之类）。口令散列与 cookie 签名密钥存在 `~/.nightshift/auth.json`（0600），不进 `config.json`。登录会话一年有效；改口令让全部登录失效。
 
 ## 数据目录
 
-数据都在 `NIGHTSHIFT_HOME`（默认 `~/.nightshift`）：
-
 ```
 ~/.nightshift/
-├── config.json                     # 你的配置（从 config.example.json 复制改）
-├── auth.json                       # 网页登录口令的散列与签名密钥（0600）
-├── quota.json                      # 最近一次 /usage 的解析结果（调度器写）
-├── scheduler.log                   # 调度器日志（2 MB × 3 轮转）
-└── tasks/<任务id>/
-    ├── task.json                   # 任务定义（你写的）
-    ├── status.json                 # 机器状态（hook 与调度器写）
-    ├── events.log                  # 事件流水（一行一条）
-    ├── prompt.txt / settings.json / run.sh   # 起会话用的三件套
-    └── .lock                       # status.json 的文件锁
+├── config.json               你的配置
+├── auth.json                 口令散列 + cookie 密钥（0600）
+├── quota.json                最近一次解析的 /usage
+├── scheduler.log             轮转日志
+└── tasks/<id>/
+    ├── task.json             你定义的任务
+    ├── status.json           机器状态（hook 与调度器在锁下写）
+    ├── events.log            一行一条事件，人话
+    ├── prompt.txt            发给会话的最终提示词
+    ├── settings.json         随 --settings 传入的 hook 配置
+    ├── run.sh                tmux 窗口跑的脚本
+    ├── handover-<n>.md       各班交接
+    └── background/           Codex 后台进程登记簿
 ```
 
-## hook 机制（两句话）
+## 开发
 
-每个任务自带一套 Claude Code hook 配置（随 `--settings` 传入，不碰任何项目的
-settings），七个事件都打到 `python3 -m nightshift.hook <任务id> <事件>`：
-它读 stdin 的 JSON，只更新该任务自己的 `status.json`（文件锁 + 原子写）。
-`Stop` 事件带回 `background_tasks`，据此区分"在等背景任务"和"真干完了一轮"。
-hook 的 stdout 平时沉默；唯一例外见下一节——`PostToolUse` 回注提醒时输出一个
-`hookSpecificOutput` JSON。
+```bash
+python3 -m pytest tests -q          # 约 680 条测试，4 分钟左右
+```
 
-## 上下文到线与换班
+测试从不真的起 `claude`（通过 `NIGHTSHIFT_CLAUDE_BIN` 换成 `tests/fake_claude.sh`），只写临时目录，用一个叫 `ns-selftest` 的 tmux 会话（自己建、自己杀）。一次只跑一个 pytest 进程——两个会抢这个会话。夹具里的 hook 载荷和 `/usage` 输出都是脱敏过的真实采样。
 
-一个任务可以跨多班（多个窗口）跑完，全程不用人在场。
+目录：`nightshift/`（调度器、launcher、hook、store、context、quota、worktree、server、Codex 相关）、`web/`（原生 JS，无构建步骤）、`tests/`、`deploy/`、`tools/`。贡献守则在 `AGENTS.md`，更细的操作说明在 [docs/使用手册.md](docs/使用手册.md)。
 
-**到线提醒（回注）。** 每20次工具调用，hook 机器侧读一次 transcript 算上下文
-水位。到警戒线（`guards.context_warn_tokens`，没写就按
-`context_warn_ratio × 该模型 context_limit`，默认 0.8）时，hook 通过
-`PostToolUse` 的 `additionalContext` 往会话里注一句提醒（模型像看到系统提示
-一样看见它，不靠它自己自觉查）：
+## 局限与非目标
 
-> [nightshift] 上下文已 412k / 500k，到警戒线了。现在收尾：①把已完成/未完成/
-> 下一步写进 ~/.nightshift/tasks/<任务id>/handover-1.md，末行写 NEXT: continue
-> 或 NEXT: done；②未提交的改动 commit；③然后停下，不要再开新的活。停下时不要
-> 再挂 ScheduleWakeup 闹钟（已经设了的先用 ScheduleWakeup stop 撤掉），挂着
-> 闹钟调度器会当你还没停。调度器会按交接开下一班。
+- 它是**交互式 CLI 会话**的调度器。不直接调 Anthropic / OpenAI 的 API，也不支持桌面 app 或 IDE 集成。
+- 上下文上限是一张你自己维护的表；出了新模型就往 `models` 里加。
+- 合并刻意保守：不 `reset --hard`、不 `clean`、不删任何不是调度器自己建的东西。拿不准就停下开"需要人工"窗口，不猜。
+- 一台机器、一个用户。没有多租户，也不打算做。
 
-文案可在 `config.context_warn_text`（或任务级 `guards.context_warn_text`）里改。
-每过 20 次工具调用仍在线上就再注一次，直到模型真的收尾。
+## 许可证
 
-**Codex 走同一套判定，但投递方式不同。** `PostToolUse` 的 `additionalContext`
-回注只对 Claude 成立，Codex 收不到；hook 改成读 Codex 自己的 rollout 文件（每
-一轮结束落的 `token_count` 记录）算水位，一样每 20 次工具调用/transcript 增
-量/超 5 分钟三个触发判定，上限没有稳定的模型表可查（`models` 表里 Codex 的
-`context_limit` 恒为 `null`），只能用 rollout 自己带的 `model_context_window`
-现读。到线时 hook 只落一个"待投递"标记，真正的提醒由调度器下一轮巡检
-`send-keys` 敲进 Codex 的 tmux 窗口（跟五小时额度到线的投递方式一样）；文案
-复用同一个 `config.context_warn_text`（review 角色复用
-`review_context_warn_text`），只是没配文案时 Codex 这边也不投递。
-
-**额度守卫（同一时机回注，三条线各管各的）。** 调度器有任务在跑时每
-`scheduler.quota_refresh_minutes`（默认 10）分钟跑一次 `claude -p "/usage"` 写
-`quota.json`；hook 每 20 次工具调用读一次，按任务的 `guards` 判：
-
-| 线 | 键（"已用"百分比上限） | 到线怎么办 |
-|---|---|---|
-| 五小时 | `session_pct_max`（默认 80，即剩 20%） | **停下等刷新**：注入"用 ScheduleWakeup 连续设 50 分钟、50 分钟、13 分钟闹钟，最后一个醒来再继续"（分钟数按 `/usage` 给的刷新时间算）。模型定了闹钟停下后，Stop 回报里 `session_crons` 非空，任务记为"等闹钟"，不收尾不续班；若它没定闹钟就停了，刷新时间一到调度器往窗口敲一句"额度应已刷新，请继续"。 |
-| 七日（全部模型） | `weekly_pct_max`（默认 95） | **收尾交接**，末行 `NEXT: done`（本周续不了班）。 |
-| 该模型单独周线 | `model_weekly_pct_max`（默认同上） | 同上；`/usage` 里像 `Current week (Fable)` 这种单模型行按 `models.<模型>.usage_label` 对上。 |
-
-别的模型的单独周线到了不叫停本会话，只注一句"别再派 X 的子 agent、别切到它"
-（每个模型提醒一次）——防止 Sonnet 会话派 Fable 子 agent 审核时撞限流。
-起跑前预检同样只看本任务模型的三条线，不过线就推迟。五段文案
-（`prompt_template` / `context_warn_text` / `quota_pause_text` /
-`quota_wrapup_text` / `quota_other_model_text` / `chain_template`）都在网页"模板"页可改，
-占位符由系统自动填。
-
-**交接文件怎么写。** 就是一个普通 markdown，路径在提醒里给全
-（`tasks/<任务id>/handover-<班次>.md`）。把"已完成 / 未完成 / 下一步"写清楚，
-最后一行必须是调度器认的指令：
-
-- `NEXT: continue` —— 活没干完，开下一班接着做；
-- `NEXT: done` —— 干完了，任务完结。
-
-**换班。** 模型收尾停下（Stop 且没有背景任务）后，调度器读到 idle 就看交接
-文件：`continue` → 走一遍完整预检（额度不够就推迟，绝不硬起）→ 开下一班窗口，
-提示词 = `chain_template` 渲染的"第 N 班 + 上一班交接"；`done` → 任务 finished。
-会话在写完交接后崩了/被关了（exited）也一样认交接。
-
-写完交接但还挂着缓存闹钟（`waiting_wakeup`，比如收尾前设过闹钟没撤）的班同样
-按交接换班；换班成功后调度器会往父窗口敲一句让它用 `ScheduleWakeup stop` 撤
-掉闹钟，不然闹钟每次响都会把已经换班的窗口拉起来一次。交接文件在评估过之后
-又被重写（比如人工在同一个窗口继续聊天、让它把交接改了）会触发重新评估一次；
-如果没有重写，人工聊完这个窗口会被调度器摁回评估时的原状态（比如又变回
-`finished`），不会一直悬在"working"里出不来。
-
-**没留交接怎么办（`chain.on_no_handover`）。** 这班收到过提醒却没写交接：
-
-- `continue`（默认）——照常续班，提示词换成兜底文案"上一班没留交接，先看
-  git log / git status / 项目里的验收单或 reports 目录判断进度"；
-- `stop` —— 标 `needs_attention`，开"需要人工"窗口停下等人。
-
-从没收到过提醒就 idle 的，视为正常干完 → `finished`。
-
-**几班上限（`chain.max_windows`）。** 默认 3。到上限还要求续班的，任务标
-`chain_exhausted` 并开"班次用尽"窗口。旧窗口一律保留不关，早上
-`Ctrl+B w` 挨个看；网页卡片上能看到换班链（"已续班 → <后继id>" /
-"上一班 <id>"）。
-
-## 部署为 systemd 服务
-
-调度器是常驻前台进程，用 systemd 托管：
-
-1. 复制单元模板，改掉两处占位路径：
-   ```bash
-   cp deploy/nightshift.service.example /etc/systemd/system/nightshift.service
-   ```
-   - `WorkingDirectory=/path/to/nightshift` → 本仓库的绝对路径；
-   - `Environment=NIGHTSHIFT_HOME=/root/.nightshift` → 你的数据目录
-     （默认就是 `~/.nightshift` 的绝对路径）。
-2. 启动并设开机自启：
-   ```bash
-   systemctl daemon-reload
-   systemctl enable --now nightshift
-   ```
-3. 看调度日志：`~/.nightshift/scheduler.log`（2 MB × 3 轮转，stderr 同步一份）。
-
-任务窗口是 tmux 的子进程而不是服务的子进程，所以 `systemctl restart nightshift`
-不影响正在跑的任务。
-
-不想常驻的话，`python3 -m nightshift serve --once` 跑一轮调度就退出，适合挂 cron
-（不起网页）；只想跑调度不要网页，用 `python3 -m nightshift serve --no-http`。
-
-## 网页
-
-`serve` 默认在 `127.0.0.1:8190`（端口、监听地址、URL 前缀都在 `config.json` 的
-`http` 段里改）同时跑调度循环和网页：任务列表 / 新建任务 / 模板编辑 / 屏幕快照，
-手机上也能用。
-
-- **首次打开**：还没设过口令时会自动跳到设置页，设一次口令（至少 8 个字符）。
-  口令只能设这一次，散列连同签名密钥存 `~/.nightshift/auth.json`（0600），
-  不进 `config.json`。
-- **改口令**：在服务器上跑 `python3 -m nightshift passwd`，输入两遍即可覆盖；
-  覆盖后旧的登录会话全部失效。
-- **登录会话**：cookie（`ns_auth`）签发后一年有效，HttpOnly / SameSite=Lax /
-  （https 下）Secure；登录接口还有进程内失败限速（同来源 15 分钟错 5 次即锁）。
-- **任务页**：额度卡显示三条线的**剩余**百分比、各自的刷新时间（转成浏览器本地时区）
-  与倒计时；"刷新"重拉列表与缓存，"重新查额度"现查一次 `/usage`（约 10 秒）。
-  卡片按活跃 / 排班中 / 已结束分组，终态（含"已续班"的父任务）可删；会话还开着的
-  有"看屏幕"（只读快照，每 5 秒刷新）。
-- **新建页**：开跑时间必填、没有默认值（浏览器本地时间，提交时转 UTC）；折叠区
-  "上下文与换班"里可按任务改警戒线、三条额度线、几班上限、没交接时续班还是停下；
-  最下方是会原样发给会话的最终提示词，随内容自动刷新，手改后不再覆盖。
-- **回主站链接**：`config.http.home_link = {"text": "← 主站", "href": "/"}` 时顶栏左上显示，
-  方便从别的站点跳过来的场景；不配就没有。退出登录在页脚小字里（点了要重输口令）。
-- **放公网**：前面必须挡一层 nginx 反代，location 片段见
-  `deploy/nginx-location.example.conf`（含登录路径限速；其中登录限速的 zone
-  要在 nginx 的 `http {}` 层定义）。nginx 会剥掉 `/nightshift` 前缀，
-  网页里的资源引用全是相对路径，直接照抄片段即可。
+MIT，见 [LICENSE](LICENSE)。

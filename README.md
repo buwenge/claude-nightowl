@@ -2,7 +2,7 @@
 
 **Run scheduled, unattended Claude Code (and Codex CLI) sessions inside tmux — with quota preflight, hook-based status tracking, a context-window guard, automatic shift handover, isolated git worktrees, and an optional build → review loop.**
 
-The package and CLI are called `nightshift`. [中文说明 →](README.zh-CN.md)
+The package and CLI are called `nightshift`. [中文说明 →](README.zh-CN.md) · Detailed operator's manual (Chinese): [docs/使用手册.md](docs/使用手册.md)
 
 ```
 02:30  scheduler opens a tmux window ──▶ claude --permission-mode auto  (your prompt)
