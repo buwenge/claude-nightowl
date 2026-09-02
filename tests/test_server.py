@@ -1631,6 +1631,50 @@ def test_merge_api_wrong_state_409(authed, ns_home, tmp_path):
     assert "不能合并" in body["error"]
 
 
+def test_merge_api_widened_to_exited_with_tree(authed, ns_home, tmp_path, monkeypatch):
+    """总review二 G1：_MERGE_STATES 放宽到与 _DISCARD_STATES 同一个集合——
+    exited 的树任务不再只能丢弃或手工 git，POST merge 能走到
+    worktree.merge_task。"""
+    proj = _make_git_repo(tmp_path)
+    cfg = store.load_config()
+    cfg["projects"] = {"demo": str(proj)}
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    task_id, _, _ = _worktree_task(authed, proj, tmp_path, state="exited")
+
+    called = {}
+
+    def fake_merge_task(task, project_path, status, cfg, close_windows=None):
+        called["task_id"] = task["id"]
+        called["state"] = status.get("state")
+        return True, "已合并进主线（假）"
+
+    monkeypatch.setattr(server.worktree, "merge_task", fake_merge_task)
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/merge")
+    assert status == 200, body
+    assert called["task_id"] == task_id
+    assert called["state"] == "exited"
+
+
+def test_merge_api_old_style_task_still_409_even_in_widened_state(authed, ns_home, tmp_path):
+    """放宽状态集合不改变"老式任务（没有工作树）不能合并"这条老规矩。"""
+    proj = _make_git_repo(tmp_path)
+    cfg = store.load_config()
+    cfg["projects"] = {"demo": str(proj)}
+    store.atomic_write_json(ns_home / "config.json", cfg)
+    status_code, _, body = authed.request("POST", "/api/tasks", {
+        "title": "老式任务", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+        "worktree": False,
+    })
+    assert status_code == 201, body
+    task_id = body["id"]
+    store.update_status(task_id, state="exited")
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/merge")
+    assert status == 409
+    assert "老式任务" in body["error"]
+
+
 def test_discard_api_success_and_state_guards(authed, ns_home, tmp_path):
     proj = _make_git_repo(tmp_path)
     cfg = store.load_config()

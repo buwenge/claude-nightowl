@@ -91,6 +91,16 @@ def test_app_js_has_merge_discard_orphan_and_state_texts():
         assert piece in js, piece
 
 
+def test_app_js_merge_button_states_widened_to_discard_states():
+    """总review二 G1：合并按钮的状态集合与丢弃按钮同一个集合——
+    exited/chain_exhausted/failed/cancelled 有存档点的任务也该有合并入口。"""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert (
+        'var MERGE_BUTTON_STATES = ["awaiting_merge", "needs_attention", "failed",\n'
+        '  "cancelled", "chain_exhausted", "exited"];'
+    ) in js
+
+
 def test_css_has_touch_affordance_and_new_state_chips():
     css = (WEB / "style.css").read_text(encoding="utf-8")
     for piece in (

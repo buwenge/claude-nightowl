@@ -161,7 +161,10 @@ var CANCEL_STATES = ["scheduled", "postponed"];
 var TERMINAL_STATES = ["exited", "finished", "failed", "cancelled",
   "chain_exhausted", "needs_attention", "chained", "merged", "discarded"];
 // 有树且等人工的状态：卡片给"合并进主线 / 丢弃 / 先留着"
-var MERGE_BUTTON_STATES = ["awaiting_merge", "needs_attention"];
+// 总review二 G1：与后端 _DISCARD_STATES 同一个集合——exited/chain_exhausted/
+// failed/cancelled 有存档点时也该有合并入口，不是只能丢弃或手工 git。
+var MERGE_BUTTON_STATES = ["awaiting_merge", "needs_attention", "failed",
+  "cancelled", "chain_exhausted", "exited"];
 
 function groupOf(state) {
   if (state === "awaiting_merge") return 0;  // 等合并：最前面的待处理组
@@ -453,9 +456,6 @@ function taskActions(item, chainIds, opts) {
         .then(function (data) { banner(data && data.note ? data.note : "已合并进主线"); refreshTasks(); })
         .catch(function () { refreshTasks(); });  // 主线脏/冲突：错误留在卡片红字，不显示假成功
     });
-    addDiscard();
-    addKeep();
-  } else if (hasTree && ["failed", "cancelled", "chain_exhausted", "exited"].indexOf(state) >= 0) {
     addDiscard();
     addKeep();
   }

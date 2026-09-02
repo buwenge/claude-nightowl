@@ -104,13 +104,16 @@ _EDIT_TERMINAL_STATES = (
     "finished", "exited", "chained", "chain_exhausted", "needs_attention",
     "awaiting_merge", "merged", "discarded",
 )
-# 能按"合并进主线"的状态：等合并，或 needs_attention（工头清完主线后重试）
-_MERGE_STATES = ("awaiting_merge", "needs_attention")
 # 能按"丢弃"的状态：有树且不会再自动跑（活跃班正在树里施工，不许拆脚手架）
 _DISCARD_STATES = (
     "awaiting_merge", "needs_attention", "failed", "cancelled",
     "chain_exhausted", "exited",
 )
+# 能按"合并进主线"的状态：与 _DISCARD_STATES 相同（总review二 G1）——
+# exited/chain_exhausted/failed/cancelled 只要有工作树就可能带着存档点，
+# 不该只剩丢弃或手工 git 一条路；`worktree.merge_task` 自带主线脏/存档点
+# 后又脏/冲突三道检查，这里放宽不需要额外加检查。
+_MERGE_STATES = _DISCARD_STATES
 # S7.1 阻断六：一条流水线所有成员都落在这些状态时，判定"已经彻底收尾，
 # 没有任何东西可以再 hold"——只用于 _api_pipeline_hold 的活跃态校验，跟
 # 上面几组"能不能编辑/能不能删/能不能合并"的语义各自独立，不要混用。
