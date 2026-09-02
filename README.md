@@ -111,6 +111,16 @@ hook 的 stdout 平时沉默；唯一例外见下一节——`PostToolUse` 回�
 文案可在 `config.context_warn_text`（或任务级 `guards.context_warn_text`）里改。
 每过 20 次工具调用仍在线上就再注一次，直到模型真的收尾。
 
+**Codex 走同一套判定，但投递方式不同。** `PostToolUse` 的 `additionalContext`
+回注只对 Claude 成立，Codex 收不到；hook 改成读 Codex 自己的 rollout 文件（每
+一轮结束落的 `token_count` 记录）算水位，一样每 20 次工具调用/transcript 增
+量/超 5 分钟三个触发判定，上限没有稳定的模型表可查（`models` 表里 Codex 的
+`context_limit` 恒为 `null`），只能用 rollout 自己带的 `model_context_window`
+现读。到线时 hook 只落一个"待投递"标记，真正的提醒由调度器下一轮巡检
+`send-keys` 敲进 Codex 的 tmux 窗口（跟五小时额度到线的投递方式一样）；文案
+复用同一个 `config.context_warn_text`（review 角色复用
+`review_context_warn_text`），只是没配文案时 Codex 这边也不投递。
+
 **额度守卫（同一时机回注，三条线各管各的）。** 调度器有任务在跑时每
 `scheduler.quota_refresh_minutes`（默认 10）分钟跑一次 `claude -p "/usage"` 写
 `quota.json`；hook 每 20 次工具调用读一次，按任务的 `guards` 判：
