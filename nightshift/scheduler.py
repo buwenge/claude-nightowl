@@ -22,6 +22,12 @@ from . import background_runner, hook, launcher, quota, store, warmup, worktree
 
 __all__ = ["parse_iso", "to_iso", "tick", "run_forever", "reconcile_worktrees"]
 
+# F4：模块级 logger——tick 内按任务隔离异常时要记日志，不能等到
+# _setup_logging（常驻主循环才调用一次）才有 logger 可用；_setup_logging
+# 挂好 handler 之后返回的也是这同一个 logger（logging.getLogger 按名字
+# 缓存单例），行为不变。
+logger = logging.getLogger("nightshift.scheduler")
+
 # retry_max 的兜底值（task.json 里没写时按 3）
 DEFAULT_RETRY_MAX = 3
 # 视为"活跃"的状态：额度刷新看它们，同目录不并跑也拦它们。S7：held 加入
@@ -107,6 +113,10 @@ def tick(config: dict, now: datetime) -> list[str]:
       不戳，设计稿 §5.2）；idle 首次评估换班（设计稿 §4.4）；
     - exited：也评估一次换班（只认交接文件）；
     - 其余状态（chained/finished/…）不动。
+
+    F4：单个任务的异常不影响其它任务——循环体整个包了一层
+    try/except，一个任务处理时炸了只记日志、留一条 events，跳到下一个
+    任务；不会让它后面排队的任务这一轮全部陪葬。
     """
     if now.tzinfo is None:
         raise ValueError("now 必须是带时区的 aware datetime（UTC）")
@@ -115,43 +125,57 @@ def tick(config: dict, now: datetime) -> list[str]:
     actions: list[str] = []
     items = store.list_tasks()
     for item in items:
-        task, status = item["task"], item["status"]
-        state = status.get("state")
-        after = (task.get("trigger") or {}).get("type") == "after"
-        if state == "scheduled":
-            if after:
-                # S4：等前置任务——"到点"的定义换成前置链状态，
-                # 不满足就什么都不做（不推迟、不开窗）
-                if not _after_ready(task, status, config, now):
-                    continue
-                status = _note_trigger_met(task, status, now)
-                actions.extend(_try_launch(task, status, config, now))
-                continue
-            # R4：到点锚用 max(run_at, retry_at)——有 retry_at（启动重试时刻）
-            # 就用它，task.json 的 run_at 一个字不改
-            retry_at = status.get("retry_at")
-            due = parse_iso(task["run_at"])
-            if retry_at:
-                due = max(due, parse_iso(retry_at))
-            if due <= now:
-                actions.extend(_try_launch(task, status, config, now))
-        elif state == "postponed":
-            next_at = status.get("next_attempt_at")
-            if next_at and parse_iso(next_at) <= now:
+        task = item["task"]
+        try:
+            status = item["status"]
+            state = status.get("state")
+            after = (task.get("trigger") or {}).get("type") == "after"
+            if state == "scheduled":
                 if after:
-                    # S4：到点后照旧再判一次前置条件，不满足就原地等
+                    # S4：等前置任务——"到点"的定义换成前置链状态，
+                    # 不满足就什么都不做（不推迟、不开窗）
                     if not _after_ready(task, status, config, now):
                         continue
                     status = _note_trigger_met(task, status, now)
-                actions.extend(_try_launch(task, status, config, now))
-        elif state == "launching":
-            actions.extend(_check_launching(task, status, config, now))
-        elif state in ("working", "waiting_background", "waiting_wakeup", "idle", "held"):
-            actions.extend(_check_running(task, status, config, now))
-        elif state == "exited":
-            # S3 换班：exited 也评估一次（写完交接后会话被关/崩了的情形）
-            actions.extend(_check_exited_chain(task, status, config, now))
-        # 其余状态（chained/finished/…）不动
+                    actions.extend(_try_launch(task, status, config, now))
+                    continue
+                # R4：到点锚用 max(run_at, retry_at)——有 retry_at（启动重试时刻）
+                # 就用它，task.json 的 run_at 一个字不改
+                retry_at = status.get("retry_at")
+                due = parse_iso(task["run_at"])
+                if retry_at:
+                    due = max(due, parse_iso(retry_at))
+                if due <= now:
+                    actions.extend(_try_launch(task, status, config, now))
+            elif state == "postponed":
+                next_at = status.get("next_attempt_at")
+                if next_at and parse_iso(next_at) <= now:
+                    if after:
+                        # S4：到点后照旧再判一次前置条件，不满足就原地等
+                        if not _after_ready(task, status, config, now):
+                            continue
+                        status = _note_trigger_met(task, status, now)
+                    actions.extend(_try_launch(task, status, config, now))
+            elif state == "launching":
+                actions.extend(_check_launching(task, status, config, now))
+            elif state in ("working", "waiting_background", "waiting_wakeup", "idle", "held"):
+                actions.extend(_check_running(task, status, config, now))
+            elif state == "exited":
+                # S3 换班：exited 也评估一次（写完交接后会话被关/崩了的情形）
+                actions.extend(_check_exited_chain(task, status, config, now))
+            # 其余状态（chained/finished/…）不动
+        except Exception as exc:
+            # F4：不按任务隔离的话，一个任务每 tick 都复现的异常（比如
+            # scheduled 任务的 project 已经不在 config.projects）会让排在
+            # 它后面的任务整晚起不来——这里兜住，留日志+events，跳过继续。
+            logger.exception("tick：任务 %s 处理异常，本轮跳过", task["id"])
+            try:
+                store.append_event(
+                    task["id"], f"tick 处理异常（本轮跳过，下轮重试）：{exc!r}"
+                )
+            except OSError:
+                pass
+            continue
 
     # 每轮末尾：只刷有活跃任务在等的那家 runner，且它自己的分片缺失/过期才刷
     # （零开销原则；两家各自独立，S6 前只有 claude，行为不变）。
@@ -251,7 +275,14 @@ def _fetch_and_record_usage(
 
 def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[str]:
     task_id = task["id"]
-    project_path = config["projects"][task["project"]]
+    # F4：跟 _checkpoint_shift/_finalize_done 口径一致——项目已经从
+    # config.projects 里删掉时 fail-closed 到 failed，不能让 KeyError
+    # 从 tick 里直接炸出来（那会连累它后面排队的任务这一轮全部处理不到）。
+    project_path = (config.get("projects") or {}).get(task["project"])
+    if not project_path:
+        return _fail_now(
+            task, config, now, f"项目 {task.get('project')} 已不在 config.projects，不能起跑"
+        )
     # S7：这一班自己的有效工人（review 角色可能跟顶层 build runner 不同）。
     runner = store.effective_runner(task)
 
@@ -1069,7 +1100,8 @@ def _check_running(
         return [f"{task_id} 审稿额度刷新，敲它继续"]
 
     # S3 换班：idle 收尾后按交接文件接下一班（每次评估先落 chain_checked
-    # 防重复；评估失败的代价是这班不再自动续，好过重复开出双份后继）。
+    # 防重复，好过重复开出双份后继；F4：评估中途炸了不再悄悄晾在 idle，
+    # _check_idle_chain/_check_exited_chain 会转 needs_attention 并留人话）。
     # S7：review 角色走独立的 verdict 分流，不进 build 的交接判定。
     if status.get("state") == "idle":
         if store.role_of(task) == "review":
@@ -1111,11 +1143,17 @@ def _check_running(
     # awaiting_verdict 概念，pre_send_fields 留空）；last_keepalive_at/
     # keepalive_count 这类不参与"下一次 Stop 怎么解释"判断的计数字段留在
     # success_only_fields，只在确认送达后才落盘。
+    # F1：build 角色也要走跟 review 对称的控制 turn 标记——保活探针打进
+    # held 会话后 UserPromptSubmit/Stop 一样会触发，不落 build_control_kind
+    # 的话 hook.py 没法认出这是控制回复，会把 build 误判成收工/idle（Fable
+    # 审查 A1，9/1）。build 没有 awaiting_verdict 概念，只带 control_kind 一个字段。
     pre_send_fields: dict = {}
     if store.role_of(task) == "review":
         pre_send_fields = {
             "review_awaiting_verdict": False, "review_control_kind": "keepalive",
         }
+    else:
+        pre_send_fields = {"build_control_kind": "keepalive"}
     sent = send_review_control(
         task_id, str(window_id), text, kind="keepalive",
         pre_send_fields=pre_send_fields,
@@ -1156,6 +1194,34 @@ def _last_nonempty_line(text: str) -> str:
     return [ln for ln in (ln.strip() for ln in text.splitlines()) if ln][-1]
 
 
+def _chain_eval_failed(
+    task: dict, config: dict, now: datetime, exc: Exception
+) -> list[str]:
+    """F4：`_check_idle_chain`/`_check_exited_chain` 评估中途炸了的统一兜底。
+
+    以前的代价只是"这班不再自动续"——chain_checked 已经落盘、状态原样
+    停在 idle，网页上看着像正常空闲，没有任何错误提示，工头根本发现不了。
+    现在统一转 needs_attention：写 error、记事件、开提醒窗，工头能在网页
+    上看到、处理完可以合并/丢弃/重建。
+    """
+    task_id = task["id"]
+    reason = f"收工评估失败：{exc!r}"
+    store.update_status(
+        task_id, state="needs_attention", error=reason, last_event_at=to_iso(now)
+    )
+    store.append_event(task_id, f"收工评估失败 → needs_attention：{exc!r}")
+    logger.exception("收工评估失败：任务 %s", task_id)
+    launcher.open_notice_window(
+        task, "(需要人工)",
+        [
+            f"收工评估失败：{exc!r}",
+            "这班不再自动续班/审稿；处理完可在网页合并、丢弃或重建",
+        ],
+        config,
+    )
+    return [f"{task_id} 收工评估失败 → needs_attention"]
+
+
 def _check_idle_chain(
     task: dict, status: dict, config: dict, now: datetime
 ) -> list[str]:
@@ -1166,43 +1232,51 @@ def _check_idle_chain(
     - 有交接按末行 NEXT: continue/done 判（没写 NEXT 按 continue）；
     - 没交接但这班被提醒过 → 按 chain.on_no_handover（continue/stop）；
     - 没交接也从未被提醒 → 正常干完（worktree 任务走 _finalize_done 分流）。
+
+    F4：chain_checked=True 之后的所有逻辑包了一层 try/except——中途异常
+    （比如 config.models 改名后 create_successor 的 validate_task 抛
+    ValueError）不再让任务悄悄停在 idle 没有任何记录，统一转
+    needs_attention 并留人话（见 `_chain_eval_failed`）。
     """
     store.update_status(task["id"], chain_checked=True)
-    blocked = _checkpoint_shift(task, status, config, now)
-    if blocked:
-        return blocked
-    path = _handover_file(task, status)
-    text = _read_handover(path)
-    if text is not None:
-        return _handover_verdict(task, status, text, config, now)
+    try:
+        blocked = _checkpoint_shift(task, status, config, now)
+        if blocked:
+            return blocked
+        path = _handover_file(task, status)
+        text = _read_handover(path)
+        if text is not None:
+            return _handover_verdict(task, status, text, config, now)
 
-    if status.get("context_warned_at"):  # 这班被提醒过却没留交接
-        policy = (task.get("chain") or {}).get("on_no_handover") or "continue"
-        if policy == "stop":
-            store.update_status(
-                task["id"], state="needs_attention", last_event_at=to_iso(now)
-            )
+        if status.get("context_warned_at"):  # 这班被提醒过却没留交接
+            policy = (task.get("chain") or {}).get("on_no_handover") or "continue"
+            if policy == "stop":
+                store.update_status(
+                    task["id"], state="needs_attention", last_event_at=to_iso(now)
+                )
+                store.append_event(
+                    task["id"],
+                    "到线提醒过却没留交接，按 chain.on_no_handover=stop 停下等人",
+                )
+                launcher.open_notice_window(
+                    task,
+                    "(需要人工)",
+                    [
+                        "到线提醒后没留交接，按设置停下等人",
+                        f"交接文件应在：{path}",
+                    ],
+                    config,
+                )
+                return [f"{task['id']} 提醒过没交接 → needs_attention"]
             store.append_event(
                 task["id"],
-                "到线提醒过却没留交接，按 chain.on_no_handover=stop 停下等人",
+                "到线提醒过却没留交接，按 chain.on_no_handover=continue 续班（兜底文案）",
             )
-            launcher.open_notice_window(
-                task,
-                "(需要人工)",
-                [
-                    "到线提醒后没留交接，按设置停下等人",
-                    f"交接文件应在：{path}",
-                ],
-                config,
-            )
-            return [f"{task['id']} 提醒过没交接 → needs_attention"]
-        store.append_event(
-            task["id"],
-            "到线提醒过却没留交接，按 chain.on_no_handover=continue 续班（兜底文案）",
-        )
-        return _chain_continue(task, status, config, now, handover_text=None)
+            return _chain_continue(task, status, config, now, handover_text=None)
 
-    return _finalize_done(task, config, now)
+        return _finalize_done(task, config, now)
+    except Exception as exc:
+        return _chain_eval_failed(task, config, now, exc)
 
 
 def _handover_verdict(
@@ -1281,17 +1355,25 @@ def _check_exited_chain(
     task: dict, status: dict, config: dict, now: datetime
 ) -> list[str]:
     """exited 也评估一次换班（会话被关/崩了但交接已写完的情形）：
-    只认交接文件——有交接先打存档点再按 NEXT 判，没交接不动。"""
+    只认交接文件——有交接先打存档点再按 NEXT 判，没交接不动。
+
+    F4：chain_checked=True 之后的所有逻辑包了一层 try/except，评估中途
+    异常转 needs_attention 并留人话（见 `_chain_eval_failed`），不再悄悄
+    停在 exited 没有任何记录。
+    """
     if status.get("chain_checked"):
         return []
     store.update_status(task["id"], chain_checked=True)
-    text = _read_handover(_handover_file(task, status))
-    if text is None:
-        return []
-    blocked = _checkpoint_shift(task, status, config, now)
-    if blocked:
-        return blocked
-    return _handover_verdict(task, status, text, config, now)
+    try:
+        text = _read_handover(_handover_file(task, status))
+        if text is None:
+            return []
+        blocked = _checkpoint_shift(task, status, config, now)
+        if blocked:
+            return blocked
+        return _handover_verdict(task, status, text, config, now)
+    except Exception as exc:
+        return _chain_eval_failed(task, config, now, exc)
 
 
 # ---------- S5②：收工存档点与完工分流 ----------
@@ -1689,13 +1771,14 @@ def _check_review_idle(
                 return [f"{task_id} 返工轮数到线 → needs_attention"]
             return []  # 已经告过警，安静等工头点"继续"
 
-    if verdict in ("done", "fix"):
-        blocked = _hold_blocks(
-            task, config, now,
-            reason="审稿已给出结果（{}），但工头要来看".format(verdict),
-        )
-        if blocked is not None:
-            return blocked
+    # F5：pending 也要受"我来看"拦——之前只拦 done/fix，pending 会绕过
+    # hold_requested 直接往下走 release/hold 分支，工头"我来看"落空。
+    blocked = _hold_blocks(
+        task, config, now,
+        reason="审稿已给出结果（{}），但工头要来看".format(verdict),
+    )
+    if blocked is not None:
+        return blocked
 
     if status.get("review_routed_round") == round_:
         return []  # 这一轮已经处理过（幂等）
@@ -1739,10 +1822,24 @@ def _review_done(review_task: dict, config: dict, now: datetime) -> list[str]:
         parent_id = parent_task["id"]
         window_id = parent_status.get("window_id")
         stop_failed = False
-        if window_id and launcher.window_alive(str(window_id), config):
+        window_alive = bool(window_id) and launcher.window_alive(str(window_id), config)
+        if window_alive:
             text = config.get("review_stop_build_text") or DEFAULT_REVIEW_STOP_BUILD_TEXT
-            proc = launcher.send_keys(str(window_id), text)
-            if proc.returncode != 0:
+            # F1：这句"请停下"打进 build 会话后，跟保活探针一样会触发它的
+            # UserPromptSubmit/Stop——必须走 build_control_kind="stop" 让
+            # hook.py 认出这是控制 turn，state 保持 send 之前的值（held），
+            # 由这里 success_only_fields 一次性落成 chained，不能被 build
+            # 回一句话之后 hook 自己算出的 idle 覆盖掉（Fable 审查 N1，9/1）。
+            sent = send_review_control(
+                parent_id, str(window_id), text, kind="stop",
+                pre_send_fields={"build_control_kind": "stop"},
+                success_only_fields={
+                    "state": "chained", "successor_id": task_id,
+                    "last_event_at": to_iso(now),
+                },
+                failure_note="，未能让施工班停下",
+            )
+            if not sent:
                 # S7.1 阻断六：send-keys 失败不能假装 build 已经停了——它可能
                 # 还在跑，这时候把它标 chained 会让人以为可以放心合并/删树。
                 stop_failed = True
@@ -1766,9 +1863,12 @@ def _review_done(review_task: dict, config: dict, now: datetime) -> list[str]:
             store.append_event(task_id, review_reason)
             launcher.open_notice_window(review_task, "(需要人工)", [review_reason], config)
             return [f"{task_id} 审稿通过但停工未确认成功 → 暂缓收尾，需人工确认"]
-        store.update_status(
-            parent_id, state="chained", successor_id=task_id, last_event_at=to_iso(now)
-        )
+        if not window_alive:
+            # 窗口本来就不在了，没有 send-keys 这一步、也就没有
+            # success_only_fields 帮忙落 chained，原样直接写。
+            store.update_status(
+                parent_id, state="chained", successor_id=task_id, last_event_at=to_iso(now)
+            )
     _update_coordinator(review_task, pipeline_phase="done")
     store.append_event(task_id, "审稿通过（NEXT: done）")
     return _finalize_done(review_task, config, now)
@@ -1815,11 +1915,18 @@ def _review_pending(review_task: dict, config: dict, now: datetime) -> list[str]
     if on_no_quota == "hold":
         # S7.1 阻断二/三：额外落 quota_paused_until，配合
         # _check_running 新增的 review-hold 恢复分支，不再永久卡住。
+        # F2（Fable 审查 A2，9/1）：pending 不是终态，这一轮之后还会再来一份
+        # 真正的 done/fix——路由幂等标记 review_routed_round 在这里就清掉
+        # （state 已是 held，_check_review_idle 只在 idle 时进入，不会重复
+        # 路由这份 pending）。不能等到恢复分支的 success_only_fields 再清：
+        # 那一步在 Stop 抢先消费掉 delivery 时不会落盘，"我来看→继续"把它
+        # 拨回 idle 的路径也不经过恢复分支，两种情况下新 verdict 都会被
+        # 顶部的幂等判断当"本轮已处理"吞掉，review 永远 idle、build 永远 held。
         store.update_status(
             task_id, state="held", held_since=to_iso(now),
             held_reason="审稿额度到线，等刷新后继续", last_event_at=to_iso(now),
             quota_paused_until=_review_hold_resume_eta(review_task, now),
-            quota_resume_sent=False,
+            quota_resume_sent=False, review_routed_round=None,
         )
         return [f"{task_id} 审稿 pending → held"]
 
@@ -2103,7 +2210,7 @@ def _setup_logging() -> logging.Logger:
         stream_handler.setFormatter(fmt)
         root.addHandler(file_handler)
         root.addHandler(stream_handler)
-    return logging.getLogger("nightshift.scheduler")
+    return logger
 
 
 def run_forever(config: dict, max_ticks: int | None = None) -> None:

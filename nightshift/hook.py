@@ -733,7 +733,13 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
     if event == "UserPromptSubmit":
 
         def bump_turns(status: dict) -> None:
-            status["state"] = "working"
+            # F1：调度器投递的控制文字（保活/我来看/停工）本身也会触发这个
+            # hook——build_control_kind/review_control_kind 任一个还留着，
+            # 说明这轮 UserPromptSubmit 是控制 turn 造成的，state 必须保持
+            # 发送前的值（held/chained），改去向要交给对应的 Stop 分支判断，
+            # 这里不能抢先覆盖成 working。
+            if not status.get("build_control_kind") and not status.get("review_control_kind"):
+                status["state"] = "working"
             status["turns"] = int(status.get("turns") or 0) + 1
             status["session_id"] = payload.get("session_id")
             status["transcript_path"] = payload.get("transcript_path")
@@ -816,6 +822,39 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
         store.append_event(task_id, "hook Stop(build) 我来看：已停在这里等工头")
         return None
 
+    elif event == "Stop" and (
+        (_s := store.read_status(task_id)).get("build_control_kind") in ("keepalive", "stop")
+        and _s.get("state") in ("held", "chained")
+    ):
+        # F1：build 角色跟 review 对称的控制 turn 分支——调度器投递的保活
+        # 探针（build_control_kind="keepalive"）或审稿通过后敲的"请停下"
+        # （build_control_kind="stop"）打进会话后，必然触发这一次 Stop；
+        # 这不是正常收工，不能走存档点/换班判定/审稿流程——那会把"只是
+        # 回了一句探针/确认"误判成这一班干完了，state 从 held/chained
+        # 掉回 idle（Fable 审查 A1/N1，9/1：held 的 build 收到保活回一句就变 idle；
+        # `_review_done` 敲"请停下"写完 chained 之后 build 回一句又变
+        # idle）。state 原样保持 send 之前的值不动，只清运行期字段，把
+        # build_control_kind 标记消费掉——不然会残留到下一次 Stop，让一次
+        # 正常收工也被当成控制 turn 吞掉。
+        kind = _s.get("build_control_kind")
+        state = _s.get("state")
+
+        def consume_build_control(status: dict) -> None:
+            status.pop("build_control_kind", None)
+            status["last_message"] = (payload.get("last_assistant_message") or "")[:2000]
+            status["last_event_at"] = now
+            status["stuck"] = False
+            status.pop("auto_interrupted", None)
+            status.pop("stuck_since", None)
+            # state 不动：由发起这次控制 turn 的一方（保活探针的下一次
+            # tick，或 _review_done 的 success_only_fields）决定去向。
+
+        store.modify_status(task_id, consume_build_control)
+        store.append_event(
+            task_id, f"hook Stop(build) 控制 turn（{kind}），state 保持 {state}"
+        )
+        return None
+
     elif event == "Stop" and runner == "codex":
         # Codex 的 Stop payload 没有 background_tasks/session_crons（那是
         # Claude 概念）；后台完成登记（F12）是夜班自己的登记簿，S6④ 才落地，
@@ -835,6 +874,10 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             status.update(fields)
             status.pop("auto_interrupted", None)
             status.pop("stuck_since", None)
+            # F1：保活戳中的 build 走 waiting_background/waiting_wakeup 时
+            # state 不是 held，会落到这里按 payload 重算——build_control_kind
+            # 必须在这里消费掉，不能残留到下一次 Stop 被误判成控制 turn。
+            status.pop("build_control_kind", None)
 
         store.modify_status(task_id, clear_stuck_cycle_codex)
         store.append_event(task_id, f"hook Stop(codex) → {fields['state']}")
@@ -867,6 +910,10 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             status.update(fields)
             status.pop("auto_interrupted", None)
             status.pop("stuck_since", None)
+            # F1：保活戳中的 build 走 waiting_background/waiting_wakeup 时
+            # state 不是 held，会落到这里按 payload 重算——build_control_kind
+            # 必须在这里消费掉，不能残留到下一次 Stop 被误判成控制 turn。
+            status.pop("build_control_kind", None)
 
         store.modify_status(task_id, clear_stuck_cycle)
         store.append_event(task_id, f"hook Stop → {fields['state']}")
