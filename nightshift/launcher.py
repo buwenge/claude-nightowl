@@ -8,6 +8,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 import tomllib
 import uuid
 from pathlib import Path
@@ -15,6 +17,7 @@ from pathlib import Path
 from . import store, worktree
 
 __all__ = [
+    "CodexTrustError",
     "REVIEW_ALLOWED_TOOLS",
     "REVIEW_DISALLOWED_TOOLS",
     "REVIEW_TOOLS",
@@ -157,6 +160,42 @@ def _toml_quote(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+class CodexTrustError(Exception):
+    """Codex 信任条目没法安全持久化：config.toml 解析不了，或者同名
+    `[projects."<workdir>"]` 已经在但 trust_level 不是 trusted。TOML 不允许同一
+    张表声明两次，这时再追加会让**整份** config.toml 解析失败——不只这一班起
+    不来，工头自己交互式开的 Codex 也一起挂。宁可这一班启动失败说清原因。"""
+
+
+def _codex_project_entry(config_path: Path, workdir: str) -> dict | None:
+    """config.toml 里 `projects.<workdir>` 那张表；没有这一条（或文件不存在）
+    返回 None。文件在但解析失败、`projects` 不是表、条目不是表 → 抛
+    CodexTrustError：解析不了的文件上追加一段是盲写（Codex 照样起不来，还让人
+    以为信任已处理），不做。"""
+    if not config_path.is_file():
+        return None
+    try:
+        with open(config_path, "rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as exc:
+        raise CodexTrustError(
+            f"Codex config.toml 解析失败，不敢追加信任条目（请人工修复 {config_path}）：{exc}"
+        ) from None
+    projects = data.get("projects")
+    if projects is None:
+        return None
+    if not isinstance(projects, dict):
+        raise CodexTrustError(f"Codex config.toml 的 projects 不是表，不敢追加信任条目：{config_path}")
+    entry = projects.get(workdir)
+    if entry is None:
+        return None
+    if not isinstance(entry, dict):
+        raise CodexTrustError(
+            f'Codex config.toml 里 projects."{workdir}" 不是表，不敢追加信任条目'
+        )
+    return entry
+
+
 def _codex_workdir_trusted(config_path: Path, workdir: str) -> bool:
     """workdir 是否已经在 Codex config.toml 里被记成 trusted。解析失败（文件
     不存在/格式坏了）一律当作"还没信任"，交给调用方走追加分支——追加是纯
@@ -200,8 +239,16 @@ def ensure_codex_trusted(workdir: str) -> None:
     with open(lock_path, "a", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
-            if _codex_workdir_trusted(config_path, workdir):
-                return
+            entry = _codex_project_entry(config_path, workdir)
+            if entry is not None:
+                if entry.get("trust_level") == "trusted":
+                    return
+                raise CodexTrustError(
+                    f'Codex config.toml 已有 [projects."{workdir}"] 但 trust_level='
+                    f'{entry.get("trust_level")!r}，不是 trusted；TOML 不允许同名表出现两次，'
+                    "追加会让整份 config.toml 解析失败（工头自己的 Codex 也会挂）——"
+                    "请人工把这段改成 trusted 或删掉后重跑"
+                )
             existing = ""
             if config_path.is_file():
                 existing = config_path.read_text(encoding="utf-8")
@@ -535,7 +582,7 @@ def launch(task_id: str, config: dict) -> dict:
     if runner == "codex":
         try:
             ensure_codex_trusted(workdir_for(task, config))
-        except OSError as exc:
+        except (OSError, CodexTrustError) as exc:
             reason = f"写 Codex 信任配置失败：{exc}"
             store.append_event(task_id, f"启动被拦：{reason}")
             status = store.update_status(
@@ -672,9 +719,62 @@ def open_failure_window(task: dict, reason: str, config: dict) -> None:
     open_notice_window(task, "(失败)", [f"原因：{reason}"], config)
 
 
+def _tmux_stdin(text: str, *args) -> subprocess.CompletedProcess:
+    """带 stdin 的 tmux 调用（只给 `load-buffer -` 用）：同 _tmux 的 10 秒超时语义。
+    单独一个函数而不是给 _tmux 加参数——测试里用 `lambda *a` 桩掉 _tmux 的地方
+    不少，多一个关键字参数会把它们全部炸掉。"""
+    try:
+        return subprocess.run(
+            ["tmux", *args], input=text, capture_output=True, text=True, timeout=10
+        )
+    except subprocess.TimeoutExpired as exc:
+        stderr = exc.stderr or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", "replace")
+        return subprocess.CompletedProcess(args, 124, "", f"tmux 超时：{stderr[-500:]}")
+
+
+# 文本落进 pane 之后、单独发 Enter 之前的间隔。CC 的输入解析器把一次读到的多字符
+# 块当粘贴处理，块里的回车变成换行（9/1 靶测坐实：文本与 Enter 放同一条 tmux
+# 命令永远提交不了）；分开发之后，Enter 只要落在解析器的 NORMAL_TIMEOUT
+# （CC 2.1.257 二进制里 NORMAL_TIMEOUT=50 ms）之外就是一次独立按键。这里不用
+# paste-buffer 的 -p（不带括号粘贴序列），所以 PASTE_TIMEOUT=2000 ms 那个
+# IN_PASTE 模式不会进。0.3 秒留足余量，测试可把它改成 0。
+_SEND_ENTER_DELAY_SECONDS = 0.3
+# 调度器线程与 HTTP 线程同进程：文本与 Enter 之间不许被别的按键插队
+# （捎话/中止/停后台都走这一个入口或 send_escape）。
+_send_lock = threading.Lock()
+
+
 def send_keys(window_id: str, text: str) -> subprocess.CompletedProcess:
-    """往窗口的 pane 敲一段文本加回车（保活戳用）。"""
-    return _tmux("send-keys", "-t", str(window_id), text, "Enter")
+    """往窗口的 pane 敲一段文本再回车——所有往会话里塞文字的地方（捎话、保活、
+    额度停/续、我来看/继续、审稿意见回传、F12 唤醒、自检提示）都走这里。
+
+    三步，任何一步失败就停在那一步并返回它的 CompletedProcess（文本没进去
+    绝不再发 Enter——那会把 pane 里现有的半截输入提交出去）：
+    1. `load-buffer -b <一次性名字> -`：文本走 stdin，不经 tmux 命令行解析。
+       send-keys 把文本当命令行参数有四个坑（tmux 3.4 本机实测）：单参数超过
+       约 16 KB 报 "command too long"（审稿意见回传的返工文案就会撞）；以 `-`
+       开头被当 flag 报 "unknown flag"；尾部 ASCII `;` 被当命令分隔符（静默吞掉，
+       后面跟 Enter 时整条报 "unknown command: Enter"）；文本恰好是键名
+       （Enter/Space/Tab…）被当按键。stdin 路线四个坑一起绕开。
+    2. `paste-buffer -d -r -b <名字> -t <窗口>`：写进 pane，-d 用完即删，-r 保留
+       换行原样（不换成回车，跟以前 send-keys 送出的字节一致）。
+    3. 隔 _SEND_ENTER_DELAY_SECONDS 再单独 `send-keys Enter`（见常量说明）。
+    """
+    wid = str(window_id)
+    with _send_lock:
+        if text:
+            buf = f"ns-{uuid.uuid4().hex[:12]}"
+            proc = _tmux_stdin(text, "load-buffer", "-b", buf, "-")
+            if proc.returncode != 0:
+                return proc
+            proc = _tmux("paste-buffer", "-d", "-r", "-b", buf, "-t", wid)
+            if proc.returncode != 0:
+                _tmux("delete-buffer", "-b", buf)
+                return proc
+            time.sleep(_SEND_ENTER_DELAY_SECONDS)
+        return _tmux("send-keys", "-t", wid, "Enter")
 
 
 def send_escape(window_id: str) -> subprocess.CompletedProcess:
