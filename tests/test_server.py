@@ -2750,8 +2750,14 @@ def test_create_task_rejects_mistyped_guards_and_chain(authed, payload):
 
 
 def test_create_task_trigger_task_must_look_like_a_task_id(authed):
+    """总review F13（监理 9/2 坐实）：pre.upper() 造的坏形状不确定性——
+    task id 后四位是 `make_task` 生成的随机十六进制，若恰好全是数字（约
+    1/16^4≈15% 概率），.upper() 原样不变，仍是一个合法且真实存在的
+    task id，POST 会 201 通过，测试偶发红。换成确定性的坏形状：把最后
+    四位换成 ABCD（大写字母不在 [0-9a-f] 里，永远不合法）。"""
     pre = make_task(authed, "前置")
-    for bad in (f"../tasks/{pre}", pre.upper(), 123):
+    bad_shape = pre[:-4] + "ABCD"
+    for bad in (f"../tasks/{pre}", bad_shape, 123):
         status, _, body = authed.request("POST", "/api/tasks", {
             "title": "等前置", "project": "demo", "model": "claude-fable-5", "effort": "high",
             "task_text": "正文", "prompt_final": "提示词",
