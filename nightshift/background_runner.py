@@ -2,8 +2,7 @@
 
 Codex 不许裸用 `&`/`nohup`/`setsid` 起长任务后就地结束 turn——那样谁都不知道
 它有没有跑完。**也不许在沙箱内用双 fork/setsid 试图脱离这次工具调用**：真机
-实证（Fathom + Sol 独立复现，见
-`/root/CC/moving/reports/夜班-S6-F12沙箱清理机制答复.md`）证实每次
+实证（两个独立会话分别复现）证实每次
 sandboxed exec 都在独立 PID namespace 里（`codex-linux-sandbox` 是 PID 1），
 工具调用被判定完成后这个 namespace 会被回收，fork/setsid/挪 cgroup 都换不了
 进程所在的 namespace，逃不掉。也不许让沙箱外的常驻进程按请求文件执行任意

@@ -4021,7 +4021,7 @@ def test_check_running_fails_closed_when_coordinator_task_missing(monkeypatch):
 
 
 def test_try_launch_blocks_second_task_when_pipeline_already_working(monkeypatch):
-    """S7.2 兼容尾巴 4：这是 Sol 两轮审查都用来验证阻断四的直接反例——同
+    """S7.2 兼容尾巴 4：这是两轮审查都用来验证阻断四的直接反例——同
     一条 pipeline 已经有一个任务 `working`，另一个同 pipeline 的任务到点
     尝试起跑，必须被拦（postponed，不是被放行成第二个 launching）。以前
     S7.1③的验收单只自称"同 pipeline 互斥拦第二班"，但实际新增测试只覆盖

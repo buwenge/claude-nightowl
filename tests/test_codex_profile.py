@@ -56,7 +56,7 @@ def test_hooks_json_command_has_no_per_task_content():
 
 def test_hook_command_real_noop_without_task_context(tmp_path):
     """A2 真机复现的反面：普通 cwd、环境里同时没有 NIGHTOWL_TASK_ID 和
-    PYTHONPATH（模拟工头自己交互式开 codex/Sol），七件生成命令逐个真跑，
+    PYTHONPATH（模拟用户自己交互式开 codex），七件生成命令逐个真跑，
     必须 exit 0、stdout/stderr 都是空——绝不能再裸跑 python 炸
     ModuleNotFoundError 产生全局噪音。"""
     doc = codex_profile.hooks_json()

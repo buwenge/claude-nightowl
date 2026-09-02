@@ -10,9 +10,9 @@ profile）；真机把 hooks 塞进 profile 一次没有触发信任提示、目
 - ``~/.codex/hooks.json``（用户级，全局）：七件固定 hooks，命令一律
   ``python3 -m nightshift.hook --codex <event>``，task id 从 run.sh
   export 的 ``NIGHTOWL_TASK_ID`` 环境变量读；读不到就静默 no-op（hook.py
-  已有逻辑），日常交互式 codex/Sol 会话不受影响，只多一次几毫秒的子进程
+  已有逻辑），日常交互式 codex 会话不受影响，只多一次几毫秒的子进程
   启动开销。**这份文件是用户级、全局的，装上之后不论谁先起下一个 codex
-  会话（夜班任务窗口，还是工头自己手动开的 Sol），都会撞到一次性的
+  会话（夜班任务窗口，还是用户自己手动开的 codex），都会撞到一次性的
   "Hooks need review" 信任提示**——这就是开工令要求的"正常人工确认"，
   但可能落在工头自己的交互会话里，部署时要提前告知。
 - ``~/.codex/nightowl.config.toml``（profile，``--profile nightowl`` 加载）：
@@ -58,7 +58,7 @@ def hooks_json() -> dict:
     """``~/.codex/hooks.json`` 的内容：命令不随任务变（改一字都要重新走信任），
     task id 全部走 ``NIGHTOWL_TASK_ID`` 环境变量。
 
-    S6.1 A2：这份 hooks.json 是用户级、全局的——工头自己交互式跑 codex/Sol
+    S6.1 A2：这份 hooks.json 是用户级、全局的——用户自己交互式跑 codex
     也会触发同一条命令，但那种会话既没有 NIGHTOWL_TASK_ID 也没有
     PYTHONPATH。之前直接裸跑 `python3 -m nightshift.hook --codex <event>`，
     import 阶段就因为找不到 nightshift 包炸 ModuleNotFoundError（真机实测：
@@ -93,7 +93,7 @@ def hooks_json() -> dict:
 def profile_toml_text(config: dict) -> str:
     """``~/.codex/nightowl.config.toml`` 的内容：approval/sandbox/notify，不含 hooks。
 
-    network_access 缺省关闭（比现有个人 Sol 配置更保守——无人值守跑代码，
+    network_access 缺省关闭（比典型的个人 codex 配置更保守——无人值守跑代码，
     默认不给网络；config.runners.codex.network_access=true 才开）。
     """
     rc = (config.get("runners") or {}).get("codex") or {}

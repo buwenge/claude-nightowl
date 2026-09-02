@@ -1,7 +1,6 @@
 """background_runner.py 的测试：登记簿读写、前台 wrapper 心跳/完成/停止请求。
 
-S6④ 改法（Sol 沙箱清理机制答复后的定案，见
-`/root/CC/moving/reports/夜班-S6-F12沙箱清理机制答复.md`）：wrapper 不再
+S6④ 改法（沙箱清理机制实证后的定案）：wrapper 不再
 双 fork/setsid 脱离，而是自己留在（模拟的）沙箱内前台直接持有并等待目标
 进程；`start` 尽早把 `{background_id, result_path}` 打到 stdout 并 flush，
 随后这个 OS 进程本身继续阻塞直到目标命令跑完——这里测的就是"尽早吐 id"
