@@ -620,6 +620,15 @@ def test_task_card_uses_runner_aware_model_limit():
     assert "modelLimit(task.model" in body and "CFG.models[task.model]" not in body
 
 
+def test_task_card_falls_back_to_status_context_limit_for_codex():
+    """总review三 H4：Codex 的 modelLimit 恒为 null（模型表里 context_limit
+    配的就是 null）——上下文水位条要再退一层，读 hook 现测出来的
+    status.context_limit（H2 新字段），不然卡片上 Codex 任务永远看不到
+    "/ 上限k"那截、条本身也算不出百分比。"""
+    body = _js_fn("taskCard")
+    assert "|| status.context_limit" in body
+
+
 def test_pipeline_detail_cache_invalidated_when_members_change():
     js = (WEB / "app.js").read_text(encoding="utf-8")
     assert "function pipelineSignature(" in js

@@ -1088,8 +1088,10 @@ function taskCard(item, now, chainIds, opts) {
   card.appendChild(el("div", { class: "task-when", text: whenText }));
 
   // 上下文水位条
-  // 上限按 runner 自己的模型表查
-  var limit = (task.guards && task.guards.context_limit_tokens) || modelLimit(task.model, runner);
+  // 上限按 runner 自己的模型表查；Codex 的模型表恒为 null（没有稳定水位
+  // 来源），退到 hook 现读出来的 status.context_limit（总review三 H2 新
+  // 字段，来自 Codex rollout 自己带的 model_context_window）。
+  var limit = (task.guards && task.guards.context_limit_tokens) || modelLimit(task.model, runner) || status.context_limit;
   var pct = (typeof status.context_pct === "number") ? status.context_pct :
     (status.context_tokens && limit ? Math.round(100 * status.context_tokens / limit) : null);
   if (pct !== null) {
