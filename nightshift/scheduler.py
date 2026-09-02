@@ -1490,6 +1490,32 @@ def _handover_needs_eval(task: dict, status: dict) -> bool:
     return mtime_ns is not None and mtime_ns != status.get("chain_checked_handover_mtime")
 
 
+def _mark_chain_evaluated(task: dict, status: dict) -> dict:
+    """H6.1：`_check_idle_chain`/`_check_exited_chain` 开头那段落盘逻辑
+    两处一模一样，抽出来共用（行为零变化）。
+
+    落 `chain_checked=True`、当前交接文件的 `chain_checked_handover_mtime`
+    （供下次判断交接是否又被重写）、`rewoken_from=None`（H8：这班既然真
+    的在评估换班，就不再是"被重新唤醒但没干活"的状态）。进来时
+    `chain_checked` 已经是 True 说明这是一次重评（交接在上次评估后被
+    重写）——额外清 `checkpoint_done`（存档点要重打；`_checkpoint_shift`
+    无改动时本来就只记"无改动"，幂等，不会多打 commit）并记一条事件。
+    返回落盘后的最新 status，调用方拿它继续走后续逻辑。
+    """
+    is_reeval = bool(status.get("chain_checked"))
+    fields = {
+        "chain_checked": True,
+        "chain_checked_handover_mtime": _handover_mtime_ns(task),
+        "rewoken_from": None,
+    }
+    if is_reeval:
+        fields["checkpoint_done"] = False
+    status = store.update_status(task["id"], **fields)
+    if is_reeval:
+        store.append_event(task["id"], "交接文件在上次评估后被重写，重新评估换班")
+    return status
+
+
 def _last_nonempty_line(text: str) -> str:
     return [ln for ln in (ln.strip() for ln in text.splitlines()) if ln][-1]
 
@@ -1539,24 +1565,10 @@ def _check_idle_chain(
     needs_attention 并留人话（见 `_chain_eval_failed`）。
 
     H6：调用方（`_check_running`）已经用 `_handover_needs_eval` 判过要不要
-    进这里，这里只管落盘。同时落 `chain_checked_handover_mtime`（供下次
-    判断交接是否又被重写）与 `rewoken_from=None`（H8：这班既然真的在评估
-    换班，就不再是"被重新唤醒但没干活"的状态）。进来时 `chain_checked`
-    已经是 True 说明这是一次重评（交接在上次评估后被重写）——存档点要
-    重打（`checkpoint_done` 清掉；`_checkpoint_shift` 无改动时本来就只记
-    "无改动"，幂等，不会多打 commit）。
+    进这里；落盘（含重评时清 checkpoint_done）统一交给 `_mark_chain_evaluated`
+    （H6.1，跟 `_check_exited_chain` 共用）。
     """
-    is_reeval = bool(status.get("chain_checked"))
-    fields = {
-        "chain_checked": True,
-        "chain_checked_handover_mtime": _handover_mtime_ns(task),
-        "rewoken_from": None,
-    }
-    if is_reeval:
-        fields["checkpoint_done"] = False
-    status = store.update_status(task["id"], **fields)
-    if is_reeval:
-        store.append_event(task["id"], "交接文件在上次评估后被重写，重新评估换班")
+    status = _mark_chain_evaluated(task, status)
     try:
         blocked = _checkpoint_shift(task, status, config, now)
         if blocked:
@@ -1681,21 +1693,12 @@ def _check_exited_chain(
 
     H6：改用 `_handover_needs_eval` 而不是一次性的 `chain_checked`——评估
     过之后交接文件若又被重写（比如人工把它拉回来改了交接），要能再评估
-    一次；落盘同 `_check_idle_chain`（mtime/rewoken_from/重评清 checkpoint_done）。
+    一次；落盘统一交给 `_mark_chain_evaluated`（H6.1，跟 `_check_idle_chain`
+    共用）。
     """
     if not _handover_needs_eval(task, status):
         return []
-    is_reeval = bool(status.get("chain_checked"))
-    fields = {
-        "chain_checked": True,
-        "chain_checked_handover_mtime": _handover_mtime_ns(task),
-        "rewoken_from": None,
-    }
-    if is_reeval:
-        fields["checkpoint_done"] = False
-    status = store.update_status(task["id"], **fields)
-    if is_reeval:
-        store.append_event(task["id"], "交接文件在上次评估后被重写，重新评估换班")
+    status = _mark_chain_evaluated(task, status)
     try:
         text = _read_handover(_handover_file(task))
         if text is None:
