@@ -1838,3 +1838,89 @@ def test_post_tool_use_subagent_call_defers_injection_to_main(tmp_path):
     assert status["context_warned_at"] and status["context_warn_count"] == 1
     assert status["context_tokens"] == 1200
     assert "context_refresh_pending" not in status
+
+
+# ---------- 总review二 G19：额度提醒也要给正在跑的子 agent ----------
+
+
+def test_post_tool_use_subagent_call_injects_quota_notice_directly(tmp_path):
+    """子 agent 在前台等主会话时一直烧额度，欠账（context_refresh_pending）
+    要等主会话下一次工具调用才补——命中额度到线时不能干等，要直接把提醒
+    注进这次子 agent 自己的工具结果。这次注入不写主会话的
+    quota_paused_until/quota_warned_at（那些仍由主会话下一次调用补落盘），
+    主会话下一次工具调用仍要正常补注一遍。"""
+    task_id = make_task(guards={"session_pct_max": 80, "weekly_pct_max": 95})
+    write_quota(session=85, week=10)  # 五小时 85 ≥ 80，命中 pause
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "usage": {"input_tokens": 1200},
+                "content": [{"type": "tool_use", "id": "toolu_main_001", "name": "Bash", "input": {}}],
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+    base = json.loads(fixture("hook_userpromptsubmit.json"))
+    base["transcript_path"] = str(transcript)
+    main_payload = json.dumps({**base, "tool_use_id": "toolu_main_001"})
+    sub_payload = json.dumps(
+        {**base, "tool_use_id": "toolu_sub_999", "agent_id": "agent-abc"}
+    )
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", main_payload)
+    proc = run_hook(task_id, "PostToolUse", sub_payload)  # 第 20 次落在子 agent 里
+    assert proc.returncode == 0
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "立刻收尾" in ctx
+    assert "五小时剩 15%" in ctx and "七日剩 90%" in ctx
+    status = store.read_status(task_id)
+    assert status.get("quota_paused_until") is None
+    assert status.get("quota_warned_at") is None
+    assert status.get("quota_pause_count") is None
+    assert status["context_refresh_pending"] is True  # 欠账照旧记
+    assert status.get("subagent_quota_noted") == ["agent-abc"]
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "额度提醒已注入子 agent（agent-abc）" in events
+
+    # 同一个 agent 再调用一次：已经注过，不重复
+    proc2 = run_hook(task_id, "PostToolUse", sub_payload)
+    assert proc2.stdout == ""
+
+    # 主会话下一次工具调用仍要正常补注（欠账补刷路径不受影响）
+    proc3 = run_hook(task_id, "PostToolUse", main_payload)
+    ctx3 = json.loads(proc3.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "五小时额度只剩 15%" in ctx3
+    status3 = store.read_status(task_id)
+    assert status3.get("quota_paused_until")
+
+
+def test_post_tool_use_subagent_call_no_notice_when_quota_not_hit(tmp_path):
+    """额度没到线时子 agent 的工具结果里不该凭空多一段提醒。"""
+    task_id = make_task(guards={"session_pct_max": 80, "weekly_pct_max": 95})
+    write_quota(session=10, week=10)  # 远没到线
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "usage": {"input_tokens": 1200},
+                "content": [{"type": "tool_use", "id": "toolu_main_001", "name": "Bash", "input": {}}],
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+    base = json.loads(fixture("hook_userpromptsubmit.json"))
+    base["transcript_path"] = str(transcript)
+    main_payload = json.dumps({**base, "tool_use_id": "toolu_main_001"})
+    sub_payload = json.dumps(
+        {**base, "tool_use_id": "toolu_sub_999", "agent_id": "agent-abc"}
+    )
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", main_payload)
+    proc = run_hook(task_id, "PostToolUse", sub_payload)  # 第 20 次落在子 agent 里
+    assert proc.returncode == 0 and proc.stdout == ""
+    status = store.read_status(task_id)
+    assert status.get("subagent_quota_noted") is None
+    assert status["context_refresh_pending"] is True  # 欠账仍要记

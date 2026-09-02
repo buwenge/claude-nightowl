@@ -31,11 +31,17 @@ __all__ = [
     "review_file_path", "warn_threshold",
 ]
 
+# G19：主会话撞额度线时若有子 agent 还在跑，先让它收尾/停掉再执行下面的
+# 动作——不然子 agent 在主会话睡下/收尾之后仍在后台继续烧额度。四段"到线"
+# 文案（build 的 pause/wrapup、review 的 pause/wrapup）末尾都加这句。
+_SUBAGENT_HEADS_UP = "若有子 agent 在跑，先让它收尾或停掉，再执行上面的动作。"
+
 # 五小时额度到线：停下等刷新（缓存闹钟）；周额度到线：收尾交接。文案在 config 里可改。
 QUOTA_PAUSE_TEXT = (
     "[nightshift] 五小时额度只剩 {session_left}%（线 {session_line_left}%），约 {resets_in} 分钟后刷新。"
     "现在停止干活，不要再开新的工具调用：按家规定缓存闹钟——用 ScheduleWakeup 连续设 {alarm_plan}，"
     "每个闹钟醒来只输出一个“·”再设下一个，最后一个闹钟醒来后从刚才停下的地方继续。"
+    f"{_SUBAGENT_HEADS_UP}"
 )
 # 别的模型的周线到了：只提示别去用它，不叫停本会话
 QUOTA_OTHER_MODEL_TEXT = (
@@ -46,12 +52,14 @@ QUOTA_WRAPUP_TEXT = (
     "[nightshift] 周额度只剩 {week_left}%（线 {week_line_left}%）{model_note}，一时半会儿刷新不了。"
     "现在收尾：把已完成/未完成/下一步写进 {handover_path}，末行写 NEXT: done（本周不再续班，交接留给下次）；"
     "{commit_step}然后停下。"
+    f"{_SUBAGENT_HEADS_UP}"
 )
 # S7：审稿班（role=review）额度到线收尾，跟 build 的收尾话术不同——
 # 写进最终回复正文、末行 NEXT: pending，不叫它写交接文件或 commit。
 DEFAULT_REVIEW_WRAPUP_TEXT = (
     "[nightshift] 审稿额度只剩 {week_left}%（线 {week_line_left}%）{model_note}，一时半会儿刷新不了。"
     "现在把已经看到的意见写进本次最终回复正文，末行写 NEXT: pending（本轮不计数），然后停下。"
+    f"{_SUBAGENT_HEADS_UP}"
 )
 # S7.1 阻断二：review 撞五小时额度线时，不走 build 那套 ScheduleWakeup 多轮
 # 自我唤醒闹钟（那套后续每个闹钟醒来的回复都不带 NEXT，会被 review 的 Stop
@@ -63,6 +71,16 @@ DEFAULT_REVIEW_QUOTA_PAUSE_TEXT = (
     "[nightshift] 审稿五小时额度只剩 {session_left}%（线 {session_line_left}%），约 {resets_in} 分钟后刷新。"
     "现在把已经看到的意见写进本次最终回复正文，末行写 NEXT: pending（本轮不计数）；"
     "不用自己设闹钟，额度刷新后 nightshift 会主动敲你继续这一轮审稿。"
+    f"{_SUBAGENT_HEADS_UP}"
+)
+# G19：额度提醒同样要给正在跑的子 agent——上下文水位不给（量的是主会话），
+# 但额度是两边共用的，主会话在前台等子 agent 时，欠账要等它下一次工具调用
+# 才补，这段时间子 agent 一直烧。这段短文案直接打进子 agent 自己那次工具
+# 结果，不写主会话的 quota_paused_until/quota_warned_at（那些仍由主会话
+# 补注时落盘）。
+SUBAGENT_QUOTA_NOTICE_TEXT = (
+    "来自nightshift：账号额度已到线（五小时剩 {session_left}% / 七日剩 {week_left}%），"
+    "请立刻收尾，把已有结果汇报给主会话后停下，不要再开新的工具调用。"
 )
 # S7.1 阻断二：review 撞上下文警戒线时，不能沿用 build 那套"写 handover、
 # 末行 NEXT: continue/done"协议——review 没有 handover 概念，且 continue/
@@ -319,6 +337,50 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
         paused_until = datetime.now(timezone.utc) + timedelta(minutes=total)
         return "pause", text, {"quota_paused_until": paused_until.strftime("%Y-%m-%dT%H:%M:%SZ")}
     return None, "", {}
+
+
+def _subagent_quota_notice(
+    task: dict, status: dict, payload: dict, config: dict
+) -> str | None:
+    """G19：这次 PostToolUse 落在子 agent 里（`_is_subagent_call`）时，除了
+    照旧记"欠账"（context_refresh_pending，留给主会话下一次工具调用补刷
+    补注），额外只做一次针对额度的判定——命中就直接把提醒打进这次子
+    agent 自己的工具结果，不用等主会话。
+
+    跟主会话的 `_quota_check` 走同一套线（wrapup/pause 判定不变），但：
+    - 文案是给子 agent 看的独立短文案（`SUBAGENT_QUOTA_NOTICE_TEXT`），
+      不是主会话那套"设 ScheduleWakeup 闹钟"/"写交接文件"的话术——子
+      agent 做不了这些事，只能收尾停下；
+    - 不写 quota_paused_until / quota_warned_at 等主会话字段，那些仍由
+      主会话下一次工具调用经 `_post_tool_use_refresh` 补落盘；
+    - 只记一条 events，不计入 quota_pause_count/quota_warn_count。
+
+    同一个 agent 不重复注：去重键优先用 `payload.agent_id`，没有就退到
+    `tool_use_id` 前缀（都没有就没法去重，直接不注——宁可漏提醒，不能
+    每次工具调用都注一遍刷屏）。
+    """
+    agent_key = payload.get("agent_id") or str(payload.get("tool_use_id") or "")[:16]
+    if not agent_key:
+        return None
+    noted = list(status.get("subagent_quota_noted") or [])
+    if agent_key in noted:
+        return None
+    kind, _text, _fields = _quota_check(task, config)
+    if kind not in ("wrapup", "pause"):
+        return None
+    usage = _read_fresh_usage(config) or {}
+    session_pct = usage.get("session_pct")
+    week_pct = usage.get("week_all_pct")
+    text = store.render(
+        config.get("subagent_quota_notice_text") or SUBAGENT_QUOTA_NOTICE_TEXT,
+        session_left=("?" if not isinstance(session_pct, int) else 100 - session_pct),
+        week_left=("?" if not isinstance(week_pct, int) else 100 - week_pct),
+    )
+    noted.append(agent_key)
+    task_id = task["id"]
+    store.update_status(task_id, subagent_quota_noted=noted)
+    store.append_event(task_id, f"额度提醒已注入子 agent（{agent_key}）")
+    return text
 
 
 def _drop_expired_quota_pause(task: dict, status: dict, now_iso: str) -> bool:
@@ -1149,7 +1211,7 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             return None
         if _is_subagent_call(payload):
             # 回注会进子 agent 的工具结果、主会话看不见（见 _is_subagent_call）：
-            # 这次不刷不注，记一笔"欠着"，主会话下一次工具调用立刻补刷。
+            # 上下文这次不刷不注，记一笔"欠着"，主会话下一次工具调用立刻补刷。
             store.update_status(task_id, context_refresh_pending=True)
             if not was_pending:
                 store.append_event(
@@ -1157,7 +1219,16 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
                     f"hook PostToolUse #{status['tool_calls']} 该刷新但落在子 agent 的"
                     "工具调用里，不回注；留待主会话下一次工具调用",
                 )
-            return None
+            # G19：上下文提醒不给子 agent 是对的（量的是主会话的水位），但
+            # 额度是两边共用的——主会话在前台等子 agent 时，欠账要等它下
+            # 一次工具调用才补，这段时间子 agent 一直烧。额外做一次只针对
+            # 额度的判定，命中就直接注进这次子 agent 的工具结果（见
+            # _subagent_quota_notice），不等"欠账补注"那条慢路径。
+            try:
+                config = store.load_config()
+            except Exception:
+                return None
+            return _subagent_quota_notice(task, status, payload, config)
         return _post_tool_use_refresh(task, status, payload)  # 锁内算出的新值；上下文字段不是计数，锁外合并即可
 
     elif event == "SessionEnd":
