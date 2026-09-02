@@ -1,9 +1,16 @@
 """读 transcript 算上下文 token。
 
-方法（设计稿 §4.3，调研 §2.6 已验证）：找 transcript JSONL 里最后一条
+Claude 方法（设计稿 §4.3，调研 §2.6 已验证）：找 transcript JSONL 里最后一条
 `type == "assistant"` 且 `message.usage` 存在的记录，
 input_tokens + cache_read_input_tokens + cache_creation_input_tokens
 即该轮实际携带的上下文量。
+
+Codex 方法（总review三 H1，工头 9/2 核实）：Codex 的 rollout JSONL 每一轮
+结束都会落一条 `{"type": "event_msg", "payload": {"type": "token_count",
+"info": {...}}}`，`info.last_token_usage.total_tokens` 就是这一轮实际携带
+的上下文量，`info.model_context_window` 是这个模型的上限——跟 Claude 不同，
+Codex 没有稳定的模型表可查（`context_limit_for` 对它恒定 None），只能从
+rollout 自己带的这个数现读。
 """
 
 from __future__ import annotations
@@ -12,10 +19,31 @@ import json
 import os
 from pathlib import Path
 
-__all__ = ["context_limit_for", "read_context_tokens"]
+__all__ = ["context_limit_for", "read_codex_context", "read_context_tokens"]
 
 # 先只读文件末尾这么多字节倒着扫，找不到再全文扫
 _TAIL_BYTES = 512 * 1024
+
+
+def _read_tail_or_full(path: Path, scan):
+    """尾窗优先、全文回退的行扫描：Claude/Codex 两套 transcript 格式共用
+    这套文件 IO（H1：不许各写一套）。小文件（≤ `_TAIL_BYTES`）直接整份扫；
+    大文件先扫最后 `_TAIL_BYTES` 字节，扫不到再退回整份重扫一遍（兜底命中的
+    那条记录恰好落在尾窗之前）。`scan(lines)` 接一份已按行切好、未反转的
+    字符串列表，命中就返回结果，找不到返回 None。
+    """
+    if not path.is_file():
+        return None
+    size = path.stat().st_size
+    if size > _TAIL_BYTES:
+        with open(path, "rb") as f:
+            f.seek(-_TAIL_BYTES, os.SEEK_END)
+            tail = f.read()
+        found = scan(tail.decode("utf-8", errors="replace").splitlines())
+        if found is not None:
+            return found
+    with open(path, "rb") as f:
+        return scan(f.read().decode("utf-8", errors="replace").splitlines())
 
 
 def _usage_from_line(line: str) -> dict | None:
@@ -64,20 +92,52 @@ def _scan_lines(lines) -> int | None:
 
 def read_context_tokens(transcript_path: str | os.PathLike) -> int | None:
     """transcript 里最后一条 assistant usage 的 token 和；找不到返回 None。"""
-    path = Path(transcript_path)
-    if not path.is_file():
+    return _read_tail_or_full(Path(transcript_path), _scan_lines)
+
+
+def _codex_token_count_from_line(line: str) -> tuple[int, int | None] | None:
+    """这一行若是 Codex rollout 里带 token_count 的 event_msg 则返回
+    `(total_tokens, model_context_window)`，否则 None。"""
+    line = line.strip()
+    if not line:
         return None
-    size = path.stat().st_size
-    if size > _TAIL_BYTES:
-        with open(path, "rb") as f:
-            f.seek(-_TAIL_BYTES, os.SEEK_END)
-            tail = f.read()
-        found = _scan_lines(tail.decode("utf-8", errors="replace").splitlines())
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or record.get("type") != "event_msg":
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        return None
+    info = payload.get("info")
+    # info 有时是 null（施工令原料 2）——那一条不携带真实水位，跳过读前一条。
+    if not isinstance(info, dict):
+        return None
+    last = info.get("last_token_usage")
+    if not isinstance(last, dict):
+        return None
+    total = last.get("total_tokens")
+    if total is None:  # total_tokens 缺失时用 input+output 补
+        total = int(last.get("input_tokens") or 0) + int(last.get("output_tokens") or 0)
+    window = info.get("model_context_window")
+    return int(total), (int(window) if isinstance(window, (int, float)) else None)
+
+
+def _scan_codex_lines(lines) -> tuple[int, int | None] | None:
+    for line in reversed(lines):
+        found = _codex_token_count_from_line(line)
         if found is not None:
             return found
-    with open(path, "rb") as f:
-        found = _scan_lines(f.read().decode("utf-8", errors="replace").splitlines())
-    return found
+    return None
+
+
+def read_codex_context(
+    transcript_path: str | os.PathLike,
+) -> tuple[int, int | None] | None:
+    """Codex rollout 里最后一条 token_count 记录的 `(total_tokens,
+    model_context_window)`；找不到（文件不存在/没有这类记录）返回 None。"""
+    return _read_tail_or_full(Path(transcript_path), _scan_codex_lines)
 
 
 def context_limit_for(model: str, config: dict, runner: str = "claude") -> int | None:
