@@ -348,7 +348,9 @@ def test_launching_retry_then_failed(monkeypatch):
 def test_launching_alive_window_or_turned_untouched(monkeypatch):
     fakes = Fakes(monkeypatch)  # 窗口在、pid 在
     tid = make_task(title="还在起")
-    stale = scheduler.to_iso(NOW - timedelta(seconds=999))
+    # 过了 launch_grace_seconds（180s）但没到 G4 的 launching_timeout_minutes
+    # （默认 10 分钟）：窗口/pid 都在，应保持 launching，不判崩溃也不判超时。
+    stale = scheduler.to_iso(NOW - timedelta(seconds=300))
     store.update_status(tid, state="launching", launched_at=stale, turns=0,
                         window_id="@5", pane_pid=NO_PID)
     scheduler.tick(CONFIG, NOW)
@@ -362,6 +364,46 @@ def test_launching_alive_window_or_turned_untouched(monkeypatch):
     status = store.read_status(tid)
     assert status["state"] == "launching"
     assert not status.get("retries")
+
+
+def test_launching_timeout_reminds_once_when_stuck_at_dialog(monkeypatch):
+    """总review二 G4：窗口在、pane 在，但从没收到过第一个 hook 事件——多半是
+    卡在登录/信任对话框。9 分钟不动；11 分钟转 needs_attention 且只提醒一次
+    （下一 tick 状态已经不是 launching，_check_launching 不会再被调用）。"""
+    fakes = Fakes(monkeypatch)  # 窗口在、pid 在
+    tid = make_task(title="卡在信任对话框")
+    t0 = NOW
+    store.update_status(tid, state="launching", launched_at=scheduler.to_iso(t0),
+                        turns=0, window_id="@7", pane_pid=NO_PID)
+
+    scheduler.tick(CONFIG, t0 + timedelta(minutes=9))
+    status = store.read_status(tid)
+    assert status["state"] == "launching"
+    assert not fakes.notice_calls
+
+    scheduler.tick(CONFIG, t0 + timedelta(minutes=11))
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention"
+    assert "10 分钟没收到第一个 hook 事件" in status["error"]
+    assert "登录/信任对话框" in status["error"]
+    assert len(fakes.notice_calls) == 1
+
+    # 已经转 needs_attention，_check_launching 不会再被调用，不会重复提醒
+    scheduler.tick(CONFIG, t0 + timedelta(minutes=20))
+    assert store.read_status(tid)["state"] == "needs_attention"
+    assert len(fakes.notice_calls) == 1
+
+
+def test_launching_timeout_configurable(monkeypatch):
+    """launching_timeout_minutes 可配置，默认 10 分钟。"""
+    fakes = Fakes(monkeypatch)
+    config = {**CONFIG, "scheduler": {**CONFIG["scheduler"], "launching_timeout_minutes": 3}}
+    tid = make_task(title="更短的超时线")
+    t0 = NOW
+    store.update_status(tid, state="launching", launched_at=scheduler.to_iso(t0),
+                        turns=0, window_id="@8", pane_pid=NO_PID)
+    scheduler.tick(config, t0 + timedelta(minutes=4))
+    assert store.read_status(tid)["state"] == "needs_attention"
 
 
 def test_launching_exit_code_retries_even_within_grace(monkeypatch):

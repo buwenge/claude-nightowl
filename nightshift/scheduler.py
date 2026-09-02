@@ -505,6 +505,24 @@ def _check_launching(
             and pane_pid
             and launcher.pid_alive(int(pane_pid))
         ):
+            # 总review二 G4：窗口在、pane 在，但从没收到过第一个 hook 事件——
+            # 多半是 claude 卡在登录/信任对话框，不是"正常还在起"，之前这种
+            # 情况会永远停在 launching，没有任何超时或提醒。launched_at 到这
+            # 里必真（前面 in_grace 已经把"没有 launched_at"的情况挡掉了）。
+            timeout_minutes = sch.get("launching_timeout_minutes", 10)
+            elapsed = now - parse_iso(launched_at)
+            if elapsed >= timedelta(minutes=timeout_minutes):
+                reason = (
+                    f"起跑 {timeout_minutes} 分钟没收到第一个 hook 事件"
+                    "（可能停在登录/信任对话框），请看窗口"
+                )
+                store.update_status(
+                    task_id, state="needs_attention", error=reason,
+                    last_event_at=to_iso(now),
+                )
+                store.append_event(task_id, reason)
+                launcher.open_notice_window(task, "(需要人工)", [reason], config)
+                return [f"{task_id} 起跑超时未收到首个 hook → needs_attention"]
             return []
 
     retries = int(status.get("retries") or 0) + 1
