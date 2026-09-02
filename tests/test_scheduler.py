@@ -4,6 +4,7 @@ launcher / quota 全部 monkeypatch 成可控假函数；时间用固定的 awar
 """
 
 import json
+import os
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -1142,6 +1143,124 @@ def test_chain_exited_without_handover_untouched(monkeypatch):
     assert len(store.list_tasks()) == 1
 
 
+# ---------- H6：交接文件重写过就重新评估（替代一次性 chain_checked） ----------
+
+
+def test_chain_reeval_after_handover_rewritten_continues(monkeypatch):
+    """finished 之后交接文件被人工重写（真机事故①：同一窗口继续聊天几
+    小时后把 NEXT: done 改成 continue），mtime 变了就要重新评估续班，不能
+    再被一次性的 chain_checked 拦住。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    _go_idle(tid)
+    _write_handover(tid, "全部完成，已提交。\nNEXT: done")
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "finished"
+    assert status["chain_checked"] is True
+    assert status["chain_checked_handover_mtime"] is not None
+
+    # 人工把状态摁回 idle（对应真机：UserPromptSubmit→working→…→Stop→idle），
+    # 重写交接；用 os.utime 把 mtime 往后拨 1 秒，别赌两次写入落在不同纳秒
+    store.update_status(tid, state="idle", last_event_at=scheduler.to_iso(NOW))
+    handover_path = store.task_dir(tid) / "handover-1.md"
+    handover_path.write_text("改主意了，还有一步没做。\nNEXT: continue\n", encoding="utf-8")
+    new_mtime = handover_path.stat().st_mtime + 1
+    os.utime(handover_path, (new_mtime, new_mtime))
+
+    actions = scheduler.tick(CONFIG, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS))
+    status = store.read_status(tid)
+    assert status["state"] == "chained"
+    assert status.get("successor_id")
+    assert any("续班" in a for a in actions)
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "交接文件在上次评估后被重写，重新评估换班" in events
+
+
+def test_chain_reeval_skipped_when_handover_unchanged(monkeypatch):
+    """交接 mtime 没变就不算"被重写"，不会重复造后继（对齐现有
+    test_chain_evaluated_only_once 的口径）。"""
+    Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    _go_idle(tid)
+    _write_handover(tid, "全部完成，已提交。\nNEXT: done")
+    scheduler.tick(CONFIG, NOW)
+    assert store.read_status(tid)["state"] == "finished"
+
+    store.update_status(tid, state="idle", last_event_at=scheduler.to_iso(NOW))
+    actions = scheduler.tick(CONFIG, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS))
+    assert actions == []
+    assert store.read_status(tid)["state"] == "idle"  # 没被续班，也没被改动
+    assert len(store.list_tasks()) == 1
+
+
+def test_chain_reeval_blocked_when_successor_already_exists(monkeypatch):
+    """已经有后继的班（chained），哪怕交接文件又被重写，也不能再造第二个
+    后继——这种"父窗口在已换班之后又被戳"的情形交给 H8 恢复状态。"""
+    Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    _go_idle(tid)
+    _write_handover(tid, "登录页已完成。\n还差支付页。\nNEXT: continue")
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "chained"
+    successor_id = status["successor_id"]
+
+    handover_path = store.task_dir(tid) / "handover-1.md"
+    handover_path.write_text("其实还有第三步。\nNEXT: continue\n", encoding="utf-8")
+    new_mtime = handover_path.stat().st_mtime + 1
+    os.utime(handover_path, (new_mtime, new_mtime))
+
+    assert scheduler._handover_needs_eval(store.load_task(tid), store.read_status(tid)) is False
+    # chained 不在活跃态巡检范围，tick 也不会碰它
+    actions = scheduler.tick(CONFIG, NOW)
+    assert actions == []
+    assert store.read_status(tid)["successor_id"] == successor_id
+    assert len(store.list_tasks()) == 2
+
+
+def test_exited_chain_reevaluates_after_handover_appears_later(monkeypatch):
+    """exited 第一次评估时还没有交接文件（记的 mtime 是 None）；后来交接
+    补上了，第二次 tick 要能重新评估——同一套 mtime 判据自然覆盖到的情形，
+    不是"从无到有"的特例。"""
+    Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    store.update_status(tid, state="exited", exit_reason="window_gone")
+    actions = scheduler.tick(CONFIG, NOW)
+    assert actions == []
+    status = store.read_status(tid)
+    assert status["state"] == "exited"
+    assert status["chain_checked"] is True
+    assert status.get("chain_checked_handover_mtime") is None
+
+    _write_handover(tid, "其实写完了才退出。\nNEXT: done")
+    actions = scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "finished"
+    assert any("finished" in a for a in actions)
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "交接文件在上次评估后被重写，重新评估换班" in events
+
+
+def test_exited_chain_not_reevaluated_when_successor_already_exists(monkeypatch):
+    """exited 分支同一条护栏：已经有后继时不重复造第二个，即使外力把
+    状态又摁回 exited。"""
+    Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    store.update_status(tid, state="exited", exit_reason="window_gone")
+    _write_handover(tid, "上下文写完交接时会话被关了。\nNEXT: continue")
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    successor_id = status["successor_id"]
+    assert status["state"] == "chained"
+
+    store.update_status(tid, state="exited")
+    actions = scheduler.tick(CONFIG, NOW)
+    assert actions == []
+    assert store.read_status(tid)["successor_id"] == successor_id
+    assert len(store.list_tasks()) == 2
+
+
 # ---------- S5②：收工存档点与完工分流（真 Git 仓库） ----------
 
 
@@ -1380,6 +1499,43 @@ def test_checkpoint_shift_is_idempotent(tmp_path, monkeypatch):
         ["git", "-C", str(wt), "rev-list", "--count", "HEAD"],
         capture_output=True, text=True, check=True).stdout.strip()
     assert count == "2"  # init + 一颗存档点
+
+
+def test_worktree_reeval_after_handover_rewritten_reruns_checkpoint(tmp_path, monkeypatch):
+    """H6：worktree=true 的重评——交接被重写后不仅要重新判 NEXT，
+    checkpoint_done 也要清掉重打一次存档点（这班在上次评估后又干了活）。"""
+    Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _config_for(proj)
+    tid = make_task(review={"enabled": False, "merge_policy": "manual"})
+    wt = _register_tree(proj, tid, "夜间重构")
+    (wt / "canary.txt").write_text("第一版\n", encoding="utf-8")
+    _go_idle(tid)
+    _write_handover(tid, "干完了。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "awaiting_merge"
+    assert status["checkpoint_done"] is True
+    first_sha = status["checkpoint_sha"]
+    assert first_sha
+
+    # 人工把状态摁回 idle（真机：同一窗口继续聊 → working → … → Stop → idle），
+    # 又干了点活并重写交接
+    (wt / "canary.txt").write_text("第一版\n又改了一点\n", encoding="utf-8")
+    store.update_status(tid, state="idle", last_event_at=scheduler.to_iso(NOW))
+    handover_path = store.task_dir(tid) / "handover-1.md"
+    handover_path.write_text("又想起来漏了一步，继续。\nNEXT: continue\n", encoding="utf-8")
+    new_mtime = handover_path.stat().st_mtime + 1
+    os.utime(handover_path, (new_mtime, new_mtime))
+
+    scheduler.tick(cfg, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS))
+    status = store.read_status(tid)
+    assert status["state"] == "chained"
+    assert status["checkpoint_done"] is True  # 重打完之后又落回 True
+    second_sha = status["checkpoint_sha"]
+    assert second_sha and second_sha != first_sha  # 真的又打了一颗新存档点
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "交接文件在上次评估后被重写，重新评估换班" in events
 
 
 def test_worktree_exited_with_handover_checkpoints_first(tmp_path, monkeypatch):
