@@ -700,6 +700,71 @@ def _check_codex_quota_pause(
     return [f"{task_id} Codex 额度到线，已停下等 {paused_until}"]
 
 
+def _check_codex_context_warn(
+    task: dict, status: dict, config: dict, now: datetime, window_id: str
+) -> list[str] | None:
+    """总review三 H3：working/waiting_background 的 Codex 任务看到 hook 已经
+    落的 `context_warn_pending`（H2：hook.py 的 Codex PostToolUse 分支刷新
+    水位、判到线）→ 调度器代它 send-keys 收尾提醒。Codex 没有 stdout 回注
+    这条路（模块开头说明），只能靠调度器主动敲——跟 `_check_codex_quota_pause`
+    同一套"send 失败不能假装已经送达"的原则（S6.1 B2）：失败只记事件，
+    pending 留着等下一 tick 重试；成功才落 `context_warned_at`（首次）/
+    `context_warn_count`/`handover_path`，并清 pending，不让它被重复投递。
+
+    文案跟 Claude 那套回注同一份配置键（build：`guards.context_warn_text`/
+    `config.context_warn_text`；review：`review_context_warn_text`/
+    `hook.DEFAULT_REVIEW_CONTEXT_WARN_TEXT`），只是投递方式不同。build 没配
+    文案时 Claude 那边本来就沉默不注（`hook._post_tool_use_refresh` 里
+    `text` 为空就什么都不做）——这里同样沉默，但要把 pending 清掉，不然
+    会一直卡在"待投递"、每 tick 白判一次（不是"投递失败"，是这个功能压根
+    没开）。
+    """
+    task_id = task["id"]
+    if not status.get("context_warn_pending"):
+        return None
+    is_review = store.role_of(task) == "review"
+    guard_text = (task.get("guards") or {}).get("context_warn_text")
+    if is_review:
+        text_tpl = (
+            guard_text
+            or config.get("review_context_warn_text")
+            or hook.DEFAULT_REVIEW_CONTEXT_WARN_TEXT
+        )
+    else:
+        text_tpl = guard_text or config.get("context_warn_text")
+    if not text_tpl:
+        store.update_status(task_id, context_warn_pending=False)
+        return None
+    tokens = status.get("context_tokens") or 0
+    limit = status.get("context_limit") or 0
+    text = store.render(
+        text_tpl,
+        ctx_k=round(tokens / 1000),
+        limit_k=round(limit / 1000),
+        handover_path=str(hook.handover_path(task)),
+        commit_step=hook.commit_step(task),
+    )
+    proc = launcher.send_keys(window_id, text)
+    if proc.returncode != 0:
+        store.append_event(
+            task_id,
+            f"Codex 上下文到线但 send-keys 失败（returncode={proc.returncode}），"
+            "留在待投递，下 tick 重试",
+        )
+        return [f"{task_id} Codex 上下文到线但投递失败"]
+    count = int(status.get("context_warn_count") or 0) + 1
+    store.update_status(
+        task_id,
+        context_warned_at=status.get("context_warned_at") or to_iso(now),
+        context_warn_count=count,
+        handover_path=str(hook.handover_path(task)),
+        context_warn_pending=False,
+        last_event_at=to_iso(now),
+    )
+    store.append_event(task_id, f"已 send-keys 上下文收尾提醒 #{count}")
+    return [f"{task_id} Codex 上下文到线，已 send-keys 收尾提醒"]
+
+
 # ---------- S6④：Codex 后台进程登记簿核对（F12） ----------
 
 
@@ -1099,6 +1164,14 @@ def _check_running(
         codex_pause = _check_codex_quota_pause(task, status, config, now, str(window_id))
         if codex_pause is not None:
             return codex_pause
+
+    # 总review三 H3：working/waiting_background 的 Codex 任务上下文到线
+    # （hook.py 已经落 context_warn_pending）→ send-keys 收尾提醒。放在
+    # 额度暂停判断之后、保活戳之前——额度到线优先（先停），没停才提上下文。
+    if runner == "codex" and status.get("state") in ("working", "waiting_background"):
+        codex_context = _check_codex_context_warn(task, status, config, now, str(window_id))
+        if codex_context is not None:
+            return codex_context
 
     # F11：build 的 idle 去抖——刚落定的 idle 可能只是 Stop→idle 与紧接着
     # 的 UserPromptSubmit→working 之间那道缝里的瞬时状态，还没到这一
@@ -2234,6 +2307,12 @@ def _review_fix(review_task: dict, config: dict, now: datetime) -> tuple[list[st
                 context_warned_at=None, quota_warned_at=None,
                 context_warn_count=0, quota_warn_count=0, mode_warned=False,
                 other_model_warned=[],
+                # 总review三 H3：build 是 Codex 时到线只落 context_warn_pending，
+                # 不写 context_warned_at（那要等真的 send-keys 送达）——上一轮
+                # held 之前如果恰好卡在"已判到线、还没来得及投递"，这里不清掉
+                # 的话，新一轮开工后调度器会拿着上一轮的旧水位数字立刻投递一句
+                # 过期提醒。同一批清空，理由跟其余几个提醒标记一致。
+                context_warn_pending=None,
             )
             store.update_status(
                 task_id, state="chained", reactivated_task_id=parent_id,

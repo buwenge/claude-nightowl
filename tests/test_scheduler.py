@@ -1859,6 +1859,73 @@ def test_codex_waiting_wakeup_actively_woken_unlike_claude(monkeypatch):
     assert len(sent) == 1  # 只敲一次
 
 
+def test_codex_context_warn_pending_sends_keys_and_marks_warned(monkeypatch):
+    """总review三 H3：hook.py 已经判到线、落了 context_warn_pending——调度器
+    要代它 send-keys 收尾提醒（Codex 没有 stdout 回注这条路），成功后落
+    context_warned_at/context_warn_count/handover_path 并清 pending，第二
+    tick 不该重发。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(
+        sched.launcher, "send_keys",
+        lambda w, t: sent.append(t) or subprocess.CompletedProcess([], 0),
+    )
+    cfg = {**CODEX_CONFIG, "context_warn_text": "[nightshift] 上下文已 {ctx_k}k/{limit_k}k，到线了。{handover_path}"}
+    tid = make_task_codex()
+    store.update_status(
+        tid, state="working", window_id="@1", pane_pid=1,
+        last_event_at=scheduler.to_iso(NOW),
+        context_tokens=180000, context_limit=200000, context_warn_pending=True,
+    )
+    sched.tick(cfg, NOW)
+    status = store.read_status(tid)
+    assert len(sent) == 1 and "180k/200k" in sent[0]
+    assert status["context_warned_at"]
+    assert status["context_warn_count"] == 1
+    assert status.get("context_warn_pending") is not True
+    assert status["handover_path"]
+    # 已经送达，第二 tick 不该重发
+    sched.tick(cfg, NOW)
+    assert len(sent) == 1
+
+
+def test_codex_context_warn_send_failure_retries_next_tick(monkeypatch):
+    """S6.1 B2 同一套原则：send-keys 真失败不能假装已经送达——不落
+    context_warned_at，pending 留着，下一 tick 补投。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    fail = {"on": True}
+
+    def fake_send_keys(w, t):
+        sent.append(t)
+        return subprocess.CompletedProcess([], 1 if fail["on"] else 0)
+
+    monkeypatch.setattr(sched.launcher, "send_keys", fake_send_keys)
+    cfg = {**CODEX_CONFIG, "context_warn_text": "[nightshift] 上下文已 {ctx_k}k/{limit_k}k，到线了。"}
+    tid = make_task_codex()
+    store.update_status(
+        tid, state="working", window_id="@1", pane_pid=1,
+        last_event_at=scheduler.to_iso(NOW),
+        context_tokens=180000, context_limit=200000, context_warn_pending=True,
+    )
+    sched.tick(cfg, NOW)
+    status = store.read_status(tid)
+    assert len(sent) == 1
+    assert status.get("context_warned_at") is None
+    assert status["context_warn_pending"] is True  # 留着等下一 tick 重试
+
+    fail["on"] = False
+    sched.tick(cfg, NOW)
+    status = store.read_status(tid)
+    assert len(sent) == 2
+    assert status["context_warned_at"]
+    assert status.get("context_warn_pending") is not True
+
+
 def test_keepalive_codex_25_minutes_claude_50_minutes(monkeypatch):
     import nightshift.scheduler as sched
     monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
