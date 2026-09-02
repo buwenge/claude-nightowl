@@ -1156,13 +1156,24 @@ class _Handler(BaseHTTPRequestHandler):
         return str(window_id)
 
     def _api_interrupt(self, task_id: str) -> None:
-        """中止（S4②）：往窗口按一下 Esc。不改 state——hook 会自己报 Stop。"""
+        """中止（S4②）：往窗口按一下 Esc。不改 state——hook 会自己报 Stop。
+
+        总review F10（跟 C 组已修的捎话 N4 同一模式）：tmux 真失败（窗口刚
+        死等）不能假装已经按下去了——查 send_escape 的 returncode，非 0 就
+        502 如实告知，不记"已发出"。
+        """
         if self._load_existing(task_id) is None:
             return
         window_id = self._require_live_window(task_id)
         if window_id is None:
             return
-        launcher.send_escape(window_id)
+        proc = launcher.send_escape(window_id)
+        if getattr(proc, "returncode", 0) != 0:
+            store.append_event(
+                task_id, f"中止：send-escape 失败（returncode={proc.returncode}）"
+            )
+            logger.warning("网页中止 send-escape 失败：%s（returncode=%s）", task_id, proc.returncode)
+            return self._send_json(502, {"error": "没敲进去（tmux 失败），请稍后再试"})
         store.append_event(task_id, "中止：Esc")
         logger.info("网页中止：%s", task_id)
         return self._send_json(200, {"ok": True})
@@ -1170,7 +1181,11 @@ class _Handler(BaseHTTPRequestHandler):
     def _api_stop_background(self, task_id: str) -> None:
         """停后台（S4②，S6④ 按 runner 分文案）：Claude 用 config.stop_background_text
         （TaskStop）；Codex 改成明确调用 background_runner 的 list/stop 能力——
-        Codex 没有 TaskStop 这个概念，裸敲同一句 Claude 文案它根本听不懂。"""
+        Codex 没有 TaskStop 这个概念，裸敲同一句 Claude 文案它根本听不懂。
+
+        总review F10（跟 C 组已修的捎话 N4 同一模式）：send_keys 真失败不能
+        假装已经敲进去了——查 returncode，非 0 就 502 如实告知，不记"已敲入"。
+        """
         task = self._load_existing(task_id)
         if task is None:
             return
@@ -1182,7 +1197,13 @@ class _Handler(BaseHTTPRequestHandler):
             text = cfg.get("codex_stop_background_text") or DEFAULT_CODEX_STOP_BACKGROUND_TEXT
         else:
             text = cfg.get("stop_background_text") or DEFAULT_STOP_BACKGROUND_TEXT
-        launcher.send_keys(window_id, text)
+        proc = launcher.send_keys(window_id, text)
+        if getattr(proc, "returncode", 0) != 0:
+            store.append_event(
+                task_id, f"停后台：send-keys 失败（returncode={proc.returncode}）"
+            )
+            logger.warning("网页停后台 send-keys 失败：%s（returncode=%s）", task_id, proc.returncode)
+            return self._send_json(502, {"error": "没敲进去（tmux 失败），请稍后再试"})
         store.append_event(task_id, "停后台：已敲入停后台文案，让它自己清后台")
         logger.info("网页停后台：%s", task_id)
         return self._send_json(200, {"ok": True})

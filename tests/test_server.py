@@ -1138,6 +1138,33 @@ def test_stop_background_sends_config_text(authed, monkeypatch):
     assert status == 409
 
 
+def test_interrupt_send_escape_failure_returns_502(authed, monkeypatch):
+    """总review F10：跟捎话 N4 同一模式——tmux 真失败不能假装 Esc 已经按下去了。"""
+    task_id = make_task(authed, "中止失败")
+    store.update_status(task_id, state="working", window_id="@12", pane_pid=1)
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(launcher, "send_escape",
+                        lambda wid: subprocess.CompletedProcess([], 1, "", "boom"))
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/interrupt")
+    assert status == 502 and "tmux" in body["error"]
+    assert store.read_status(task_id)["state"] == "working"  # 没敲成，state 不动
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "send-escape 失败" in events
+
+
+def test_stop_background_send_keys_failure_returns_502(authed, monkeypatch):
+    """总review F10：跟捎话 N4 同一模式——tmux 真失败不能假装停后台文案已经敲进去了。"""
+    task_id = make_task(authed, "停后台失败")
+    store.update_status(task_id, state="waiting_background", window_id="@13", pane_pid=1)
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(launcher, "send_keys",
+                        lambda wid, text: subprocess.CompletedProcess([], 1, "", "boom"))
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/stop-background")
+    assert status == 502 and "tmux" in body["error"]
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "send-keys 失败" in events
+
+
 def test_task_detail_and_list_expose_background_summary_for_codex(authed, ns_home):
     from nightshift import background_runner
     cfg = store.load_config()
