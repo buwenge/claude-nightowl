@@ -2474,10 +2474,18 @@ def test_pipeline_skip_review_rejects_any_started_review_not_only_working(authed
         assert store.read_status(review_id)["state"] == state  # 没被悄悄取消
 
 
-def test_pipeline_skip_review_merge_failure_returns_non_2xx(authed):
+def test_pipeline_skip_review_merge_failure_returns_non_2xx(authed, monkeypatch):
     """S7.2 阻断八：跳过审稿后自动合并没成功时，响应不能还是
     `200 + ok:true`（只在第二个字段 merge_ok 里说真话）——状态码要用 409，
-    `ok` 字段本身必须是 false，客户端读第一个字段就能判断出失败。"""
+    `ok` 字段本身必须是 false，客户端读第一个字段就能判断出失败。
+
+    总review二 G18：这条走的是真 `_finalize_done`，自动合并失败会落进
+    `launcher.open_notice_window` 那条真开 tmux 通知窗口的分支——不打桩
+    会真的在 ns-selftest 会话里留一个挂着 `read` 不退出的窗口，每跑一次
+    全量测试就多留一个。打成记录调用的桩，只验证被叫到，不碰真 tmux。"""
+    notices = []
+    monkeypatch.setattr(launcher, "open_notice_window",
+                         lambda *a, **k: notices.append(a))
     build_id, review_id = make_review_pipeline(authed, review_state="scheduled")
     build_task = store.load_task(build_id)
     build_task["review"] = {**build_task["review"], "merge_policy": "auto"}
@@ -2487,6 +2495,7 @@ def test_pipeline_skip_review_merge_failure_returns_non_2xx(authed):
     status, _, body = authed.request("POST", f"/api/tasks/{build_id}/skip-review")
     assert status == 409, body
     assert body["ok"] is False
+    assert notices, "自动合并失败应该开一个通知窗口（这里只验证桩被调用）"
     assert body["merge_ok"] is False
     assert store.read_status(build_id)["state"] == "needs_attention"
 
