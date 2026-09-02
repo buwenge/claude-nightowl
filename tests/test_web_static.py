@@ -304,6 +304,27 @@ def test_app_js_has_six_pipeline_control_actions():
         assert piece in js, piece
 
 
+def test_app_js_chain_card_only_keeps_chain_level_actions_when_has_review():
+    """总review二 G10：hasReview 的流水线卡片上，「现在就跑/编辑/取消」这
+    几个成员级动作不再挂在 chain.latest 身上——chainCard 传
+    suppressMemberActions，taskActions 用它挡掉这三个按钮，只留
+    删除/合并/丢弃/先留着这些链级动作（走 pipelineControlActions 的
+    看屏幕/捎话/我来看/继续/审稿相关不受影响）。"""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert (
+        "suppressWindowActions: hasReview, suppressMemberActions: hasReview"
+    ) in js
+    for piece in (
+        '!opts.suppressMemberActions && RUNNOW_STATES.indexOf(state) >= 0',
+        '!opts.suppressMemberActions && (RUNNOW_STATES.indexOf(state) >= 0 || ACTIVE_STATES.indexOf(state) >= 0)',
+        '!opts.suppressMemberActions && CANCEL_STATES.indexOf(state) >= 0',
+    ):
+        assert piece in js, piece
+    # 删除/合并/丢弃三个链级动作没有被这个新开关挡住
+    assert "if (TERMINAL_STATES.indexOf(state) >= 0 && !hasTree) {" in js
+    assert "if (MERGE_BUTTON_STATES.indexOf(state) >= 0 && hasTree) {" in js
+
+
 def test_app_js_pipeline_window_actions_are_role_aware():
     js = (WEB / "app.js").read_text(encoding="utf-8")
     for piece in (

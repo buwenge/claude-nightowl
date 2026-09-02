@@ -398,17 +398,21 @@ function taskActions(item, chainIds, opts) {
     box.appendChild(el("button", { type: "button", class: cls, text: text, onclick: handler }));
   }
   chainIds = chainIds || [task.id];
-  if (RUNNOW_STATES.indexOf(state) >= 0) {
+  // 总review二 G10：hasReview 的流水线卡片上，「现在就跑/编辑/取消」这几个
+  // 按钮以前挂在 chain.latest（可能是审稿班）身上，点了改的是那一班的顶层
+  // 字段，容易让人以为在操作整条链；这三个成员级动作全走 pipelineControlActions
+  // （看屏幕/捎话/我来看/继续/审稿相关），这里只留删除/合并/丢弃这些链级动作。
+  if (!opts.suppressMemberActions && RUNNOW_STATES.indexOf(state) >= 0) {
     add("现在就跑", "primary", function () {
       api("POST", "./api/tasks/" + task.id + "/run-now")
         .then(function () { refreshTasks(); banner("已改到现在，等调度器下一轮预检"); })
         .catch(function () {});
     });
   }
-  if (RUNNOW_STATES.indexOf(state) >= 0 || ACTIVE_STATES.indexOf(state) >= 0) {
+  if (!opts.suppressMemberActions && (RUNNOW_STATES.indexOf(state) >= 0 || ACTIVE_STATES.indexOf(state) >= 0)) {
     add("编辑", "", function () { enterEdit(item); });
   }
-  if (CANCEL_STATES.indexOf(state) >= 0) {
+  if (!opts.suppressMemberActions && CANCEL_STATES.indexOf(state) >= 0) {
     add("取消", "danger", function () {
       if (!confirm("确定取消「" + task.title + "」？")) return;
       api("POST", "./api/tasks/" + task.id + "/cancel")
@@ -937,7 +941,9 @@ function chainCard(chain, now) {
   var ids = chain.shifts.map(function (it) { return it.task.id; });
   var hasReview = !!(chain.latest.task.review && chain.latest.task.review.enabled);
   var phaseInfo = pipelinePhaseInfo(chain);
-  var card = taskCard(chain.latest, now, ids, { suppressWindowActions: hasReview, phaseInfo: phaseInfo });
+  var card = taskCard(chain.latest, now, ids, {
+    suppressWindowActions: hasReview, suppressMemberActions: hasReview, phaseInfo: phaseInfo
+  });
   if (chain.shifts.length > 1) {
     var row = el("div", { class: "shifts" });
     chain.shifts.forEach(function (it, i) {
