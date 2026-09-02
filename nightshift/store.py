@@ -919,14 +919,21 @@ def append_event(task_id: str, text: str) -> None:
 
 
 def render(template: str, **vars) -> str:
-    """只对已知占位符做字面替换。
+    """只对已知占位符做字面替换，一遍扫描完成。
 
     不用 str.format——任务正文里可能有花括号；没认出的 {xxx} 与 {{ 原样保留。
+    总review二 G8：以前是逐个 key 顺序 `str.replace`——先替换进去的值
+    （比如 task_text/审稿意见，都是用户或模型写的自由文本）如果自己也含着
+    另一个占位符的字面写法（如 `{title}`），会被后面轮到的那次替换二次
+    展开，纯属误伤。现在按占位符名一次性正则替换，被替换进来的内容不会
+    再被当成模板扫描第二遍。
     """
-    out = template
-    for key, value in vars.items():
-        out = out.replace("{" + key + "}", str(value))
-    return out
+    if not vars:
+        return template
+    pattern = re.compile(
+        "{(" + "|".join(re.escape(key) for key in vars) + ")}"
+    )
+    return pattern.sub(lambda m: str(vars[m.group(1)]), template)
 
 
 def _context_limit_text(model: str, config: dict, runner: str) -> str:

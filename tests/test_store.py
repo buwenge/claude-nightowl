@@ -104,6 +104,23 @@ def test_render_only_known_placeholders():
     assert out == "你好 T，正文是 正文A，{不认识的} 和 {{ 保持原样"
 
 
+def test_render_does_not_double_expand_placeholder_written_in_another_values_text():
+    """总review二 G8：以前顺序替换——先换的值里如果自己写着别的占位符字面
+    （用户/模型的自由文本，不是注入），会被后面轮到的那次替换二次展开。
+    现在一遍扫描，被替换进去的内容不会再被当模板扫第二遍。"""
+    tpl = "标题：{title}\n正文：{task}"
+    out = store.render(
+        tpl, title="真标题",
+        task="正文里写了 {title} 这个词，不该被展开成「真标题」",
+    )
+    assert out == (
+        "标题：真标题\n正文：正文里写了 {title} 这个词，不该被展开成「真标题」"
+    )
+    # 反过来：先出现在模板里的 {task} 值里写了 {task} 自己，也不该递归展开
+    out2 = store.render("{task}", task="{task} 还是 {task}")
+    assert out2 == "{task} 还是 {task}"
+
+
 def test_build_prompt_known_placeholders():
     """build_prompt 与 cmd_add 的模板渲染同一套占位符。"""
     config = dict(CONFIG)
