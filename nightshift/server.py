@@ -133,6 +133,20 @@ DEFAULT_CODEX_STOP_BACKGROUND_TEXT = (
 )
 
 
+def _never_launched(status: dict) -> bool:
+    """这个任务记录是否从没走到过"开窗口"那一步。
+
+    总review二 G2：`launcher.launch()` 在真正碰 tmux 之前第一步就会落盘
+    `launched_at`（见该函数③），之后不管起跑成功与否都不会清掉它；缺这个
+    字段说明 `_try_launch` 在调用 `launcher.launch()` 之前就判定失败了
+    （前置任务被删、同流水线已有同角色 held 等状态异常）——这类
+    needs_attention 跟"已经开过窗口、会话真的跑过"的 needs_attention
+    （coordinator 坏/stale intent/后台完成通知失败等）不是一回事，放行
+    编辑与「现在就跑」只该对前者开口子。
+    """
+    return not status.get("launched_at")
+
+
 def _trigger_text(task: dict) -> str:
     """给前端的一句话触发说明（卡片上替代"计划 … 还有 …"那行）。"""
     trigger = task.get("trigger") or {}
@@ -940,8 +954,14 @@ class _Handler(BaseHTTPRequestHandler):
     def _api_run_now(self, task_id: str) -> None:
         if self._load_existing(task_id) is None:
             return
-        state = store.read_status(task_id).get("state")
-        if state not in _RUN_NOW_STATES:
+        status = store.read_status(task_id)
+        state = status.get("state")
+        # 总review二 G2：从没开过窗口的 needs_attention（前置任务被删/同流水线
+        # 状态异常）跟"现在就跑"允许的未跑状态是同一类，一起放行；已经起跑过
+        # 又变 needs_attention 的（coordinator 坏/后台通知失败等）仍然 409。
+        if state not in _RUN_NOW_STATES and not (
+            state == "needs_attention" and _never_launched(status)
+        ):
             return self._send_json(
                 409,
                 {"error": f"状态 {state or '-'} 不能现在就跑"
@@ -1004,10 +1024,14 @@ class _Handler(BaseHTTPRequestHandler):
         """编辑任务（S4②）：按状态分级——未跑全字段、活跃只四个维度、终态 409。"""
         if self._load_existing(task_id) is None:
             return
-        state = store.read_status(task_id).get("state")
-        if state in _EDIT_TERMINAL_STATES:
+        status0 = store.read_status(task_id)
+        state = status0.get("state")
+        # 总review二 G2：从没开过窗口的 needs_attention 按未跑状态放行编辑
+        # （与 run-now 同一个判据），已经起跑过又变 needs_attention 的仍是终态。
+        never_launched_na = state == "needs_attention" and _never_launched(status0)
+        if state in _EDIT_TERMINAL_STATES and not never_launched_na:
             return self._send_json(409, {"error": f"任务已结束（{state}），不能再改"})
-        unrun = state in _RUN_NOW_STATES
+        unrun = state in _RUN_NOW_STATES or never_launched_na
         allowed = _EDITABLE_UNRUN if unrun else _EDITABLE_ACTIVE
         data = self._read_json()
         if data is None:
@@ -1042,9 +1066,9 @@ class _Handler(BaseHTTPRequestHandler):
         # 按早已过去的时间悄悄立刻起跑"（cancelled 的任务多半 run_at 已过），
         # failed/cancelled 且按时间触发时，新时间必须在未来，否则 400 让人明确
         # 选择：改时间，或用「现在就跑」。postponed 保持原口径（它本来就在等重试）。
-        reschedule = state in ("postponed", "failed", "cancelled")
+        reschedule = state in ("postponed", "failed", "cancelled") or never_launched_na
         if (
-            state in ("failed", "cancelled") and ttype == "time"
+            (state in ("failed", "cancelled") or never_launched_na) and ttype == "time"
             and str(task.get("run_at") or "") <= store.utc_now_iso()
         ):
             return self._send_json(

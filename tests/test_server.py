@@ -761,6 +761,31 @@ def test_run_now_rejects_idle(authed):
     assert "idle" in body["error"]
 
 
+def test_run_now_needs_attention_never_launched_allowed(authed):
+    """总review二 G2：从没开过窗口的 needs_attention 跟"现在就跑"的其它
+    未跑状态同口径，放行。"""
+    task_id = make_task(authed, "从未起跑就异常")
+    store.update_status(
+        task_id, state="needs_attention", error="同流水线状态异常",
+    )
+    assert "launched_at" not in store.read_status(task_id)
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/run-now")
+    assert status == 200, body
+    assert store.read_status(task_id)["state"] == "scheduled"
+
+
+def test_run_now_needs_attention_already_launched_still_rejected(authed):
+    """已经开过窗口又变 needs_attention 的不属于"从未起跑"，仍然 409。"""
+    task_id = make_task(authed, "起跑过又异常")
+    store.update_status(
+        task_id, state="needs_attention", error="coordinator 坏了",
+        launched_at="2026-08-28T10:00:00Z",
+    )
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/run-now")
+    assert status == 409
+    assert "needs_attention" in body["error"]
+
+
 def test_cancel_follows_cli_rules(authed):
     task_id = make_task(authed, "要取消的")
     status, _, _ = authed.request("POST", f"/api/tasks/{task_id}/cancel")
@@ -984,10 +1009,50 @@ def test_put_task_active_restricted(authed):
 
 def test_put_task_terminal_conflict(authed):
     task_id = make_task(authed, "完了的")
-    for state in ("finished", "exited", "chained", "chain_exhausted", "needs_attention"):
+    # needs_attention 不在这个表里：总review二 G2 之后它是否可编辑要看有没有
+    # 起跑过（见 test_put_task_needs_attention_*），不是无条件终态。
+    for state in ("finished", "exited", "chained", "chain_exhausted"):
         store.update_status(task_id, state=state)
         status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {"title": "x"})
         assert status == 409, state
+
+
+def test_put_task_needs_attention_never_launched_editable_and_reschedules(authed):
+    """总review二 G2：从没开过窗口的 needs_attention（前置任务被删/同流水线
+    状态异常这类）跟 failed/cancelled 同口径——放行编辑，改完回 scheduled，
+    按时间触发时新时间必须在未来。"""
+    task_id = make_task(authed, "从未起跑就异常")
+    store.update_status(
+        task_id, state="needs_attention", error="前置任务不存在（被删了？）",
+        attention_noted=True,
+    )
+    assert "launched_at" not in store.read_status(task_id)
+    # 只改标题、不改时间：夹具 run_at 已过，跟 failed/cancelled 一样 400 指路
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {"title": "只改标题"})
+    assert status == 400, body
+    assert "现在就跑" in body["error"]
+    status, _, body = authed.request(
+        "PUT", f"/api/tasks/{task_id}",
+        {"title": "改好了", "run_at": "2099-01-01T15:00:00Z"},
+    )
+    assert status == 200, body
+    assert store.load_task(task_id)["title"] == "改好了"
+    status_data = store.read_status(task_id)
+    assert status_data["state"] == "scheduled"
+    assert "error" not in status_data
+
+
+def test_put_task_needs_attention_already_launched_still_409(authed):
+    """已经开过窗口又变 needs_attention 的（coordinator 坏/后台通知失败等）
+    不属于"从未起跑"，编辑仍然 409——不能靠这条口子绕开活跃态限制。"""
+    task_id = make_task(authed, "起跑过又异常")
+    store.update_status(
+        task_id, state="needs_attention", error="coordinator 坏了",
+        launched_at="2026-08-28T10:00:00Z",
+    )
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {"title": "x"})
+    assert status == 409
+    assert "不能再改" in body["error"]
 
 
 def test_put_task_failed_cancelled_still_editable(authed):
