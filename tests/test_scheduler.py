@@ -1343,6 +1343,10 @@ def test_waiting_wakeup_not_finished_nor_poked(monkeypatch):
     sent = []
     monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t) or subprocess.CompletedProcess([], 0))
     monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: None)
+    # 总review F8：waiting_wakeup/idle 都在 ACTIVE_STATES 里，tick 末尾
+    # _maybe_refresh_quota 会真调 fetch_usage_claude——照 D10 那行假掉。
+    monkeypatch.setattr(sched.quota, "fetch_usage_claude",
+                         lambda c: {"session_pct": 1, "week_all_pct": 1, "per_model": {}, "raw": ""})
     now = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
     tid = make_task()
     store.update_status(tid, state="waiting_wakeup", window_id="@1", pane_pid=1,
@@ -1727,6 +1731,10 @@ def test_keepalive_codex_25_minutes_claude_50_minutes(monkeypatch):
     monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
     sent = []
     monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t) or subprocess.CompletedProcess([], 0))
+    # 总review F8：两个任务都在 waiting_background（ACTIVE_STATES），tick
+    # 末尾会真调 fetch_usage_claude——照 D10 那行假掉。
+    monkeypatch.setattr(sched.quota, "fetch_usage_claude",
+                         lambda c: {"session_pct": 1, "week_all_pct": 1, "per_model": {}, "raw": ""})
 
     codex_tid = make_task_codex()
     store.update_status(codex_tid, state="waiting_background", window_id="@1", pane_pid=1,

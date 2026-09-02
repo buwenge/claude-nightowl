@@ -1849,6 +1849,10 @@ def test_pipeline_hold_blocks_next_review_verdict_routing(authed, monkeypatch):
     monkeypatch.setattr(
         launcher, "send_keys", lambda wid, text: subprocess.CompletedProcess([], 0)
     )
+    # 总review F8：held 在 ACTIVE_STATES 里，scheduler.tick 末尾会真调
+    # fetch_usage_claude——照 D10 那行假掉。
+    monkeypatch.setattr(scheduler.quota, "fetch_usage_claude",
+                         lambda c: {"session_pct": 1, "week_all_pct": 1, "per_model": {}, "raw": ""})
 
     status, _, _ = authed.request("POST", f"/api/tasks/{review_id}/hold")
     assert status == 200
@@ -1871,6 +1875,10 @@ def test_pipeline_continue_after_hold_reevaluates_blocked_band(authed, monkeypat
     monkeypatch.setattr(
         launcher, "send_keys", lambda wid, text: subprocess.CompletedProcess([], 0)
     )
+    # 总review F8：held 在 ACTIVE_STATES 里，scheduler.tick 末尾会真调
+    # fetch_usage_claude——照 D10 那行假掉。
+    monkeypatch.setattr(scheduler.quota, "fetch_usage_claude",
+                         lambda c: {"session_pct": 1, "week_all_pct": 1, "per_model": {}, "raw": ""})
     authed.request("POST", f"/api/tasks/{review_id}/hold")
     review_file = store.task_dir(review_id) / "review-1.md"
     review_file.write_text("都过了。\n\nNEXT: done", encoding="utf-8")
