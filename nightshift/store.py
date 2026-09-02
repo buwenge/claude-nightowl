@@ -167,6 +167,11 @@ _GUARD_TOKEN_KEYS = ("context_warn_tokens", "context_limit_tokens")
 # 任务 id 的形状（与 server 路由正则一致）：trigger.task 也只认这个形状，不让
 # "../tasks/<id>" 这类能凑出 task.json 的相对路径混进 task.json
 _RE_TASK_ID = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$")
+# 总review二 G11：表外模型名（新建页「自定义…」填的）只查形状，不查是否在
+# config 模型表里——真实模型 id 都是这个形状（如 claude-fable-5-1、
+# gpt-5.6-luna），打错字/凭空编一个会在起跑时 claude/codex 报错才知道，
+# 不受单模型周线保护（前端已在自定义输入框旁写了这句提醒）。
+_RE_MODEL_NAME = re.compile(r"^[a-z0-9][a-z0-9.\-]{0,63}$")
 
 # trigger.type == "after" 且 when == "ended" 时，前置链最新一班落在这些状态
 # 就算"已结束"（调度器与网页共用这一个定义）
@@ -393,6 +398,13 @@ def runner_config(config: dict) -> dict:
     return compat
 
 
+def _looks_like_model_name(value) -> bool:
+    """G11：表外模型名的形状校验——不在配置的模型表里，但长得像一个真实
+    模型 id（小写字母/数字/点/短横线）就放行，交给起跑时的 claude/codex
+    自己去认。"""
+    return isinstance(value, str) and bool(_RE_MODEL_NAME.match(value))
+
+
 def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> str:
     """校验一个完整任务 dict；不合法抛 ValueError，通过返回归一后的触发类型。
 
@@ -435,7 +447,7 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
     if task["effort"] not in (rc.get("efforts") or []):
         raise ValueError(f"{label} 不支持这个档位：{task['effort']}")
     models = rc.get("models") or {}
-    if models and task["model"] not in models:
+    if models and task["model"] not in models and not _looks_like_model_name(task["model"]):
         raise ValueError(f"{label} 不支持这个模型：{task['model']}")
 
     for key in ("guards", "chain"):
@@ -537,7 +549,10 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
             if review.get("effort") not in (r_rc.get("efforts") or []):
                 raise ValueError(f"审稿方 {r_label} 不支持这个档位：{review.get('effort')}")
             r_models = r_rc.get("models") or {}
-            if r_models and review.get("model") not in r_models:
+            if (
+                r_models and review.get("model") not in r_models
+                and not _looks_like_model_name(review.get("model"))
+            ):
                 raise ValueError(f"审稿方 {r_label} 不支持这个模型：{review.get('model')}")
 
     trigger = task.get("trigger")

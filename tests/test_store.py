@@ -759,18 +759,52 @@ def test_validate_task_rejects_runner_not_configured():
         store.validate_task(make_task(runner="codex", model="x", effort="high"), CONFIG)
 
 
-def test_validate_task_cross_runner_model_rejected():
-    """拿 Claude 的模型给 codex 任务用：按 codex 的模型表校验，直接拒。"""
-    with pytest.raises(ValueError, match="Codex"):
+def test_validate_task_cross_runner_model_now_allowed_by_shape():
+    """总review二 G11 之前：拿 Claude 的模型给 codex 任务用（反之亦然）按
+    对方模型表校验，直接拒。G11 之后：不在自己模型表里的名字只查形状，
+    不再区分"是另一个 runner 的模型"还是"纯粹编的名字"——两边形状都合法，
+    现在都放行（真起跑时 claude/codex 自己会认不出来）。"""
+    assert store.validate_task(
+        make_task(runner="codex", model="claude-fable-5", effort="high"),
+        RUNNERS_CONFIG,
+    ) == "time"
+    assert store.validate_task(
+        make_task(runner="claude", model="gpt-5.6-luna", effort="high"),
+        RUNNERS_CONFIG,
+    ) == "time"
+
+
+def test_validate_task_off_table_model_name_shape_gate():
+    """总review二 G11：表外模型名不再一律 400——形状合法（小写字母/数字
+    开头，其余可跟点/短横线）就放行；形状不合法仍然拒绝。review.model
+    同一套规则。"""
+    assert store.validate_task(
+        make_task(model="claude-made-up-9.9"), RUNNERS_CONFIG,
+    ) == "time"
+    with pytest.raises(ValueError, match="不支持这个模型"):
         store.validate_task(
-            make_task(runner="codex", model="claude-fable-5", effort="high"),
-            RUNNERS_CONFIG,
+            make_task(model="Claude 带大写和空格"), RUNNERS_CONFIG,
         )
-    with pytest.raises(ValueError, match="Claude Code"):
-        store.validate_task(
-            make_task(runner="claude", model="gpt-5.6-luna", effort="high"),
-            RUNNERS_CONFIG,
-        )
+    with pytest.raises(ValueError, match="不支持这个模型"):
+        store.validate_task(make_task(model="-开头是短横线"), RUNNERS_CONFIG)
+
+    review_task = make_task(
+        worktree=True,
+        review={
+            "enabled": True, "runner": "claude",
+            "model": "claude-made-up-9.9", "effort": "high",
+        },
+    )
+    assert store.validate_task(review_task, RUNNERS_CONFIG) == "time"
+    bad_review_task = make_task(
+        worktree=True,
+        review={
+            "enabled": True, "runner": "claude",
+            "model": "带空格 的名字", "effort": "high",
+        },
+    )
+    with pytest.raises(ValueError, match="审稿方 Claude Code 不支持这个模型"):
+        store.validate_task(bad_review_task, RUNNERS_CONFIG)
 
 
 def test_validate_task_cross_runner_effort_rejected():

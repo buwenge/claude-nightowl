@@ -509,6 +509,25 @@ def test_create_task_value_errors_are_400(authed):
     assert status == 400
 
 
+def test_create_task_off_table_model_name_allowed_by_shape_rejected_otherwise(authed):
+    """总review二 G11：新建页「自定义…」填表外模型名——形状合法（201），
+    形状不合法仍 400。"""
+    base = {
+        "title": "表外模型", "project": "demo", "effort": "high",
+        "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+    }
+    status, _, body = authed.request(
+        "POST", "/api/tasks", {**base, "model": "claude-made-up-9.9"}
+    )
+    assert status == 201, body
+    status, _, body = authed.request(
+        "POST", "/api/tasks", {**base, "model": "带空格 的模型名"}
+    )
+    assert status == 400
+    assert "不支持这个模型" in body["error"]
+
+
 # ---------- S8①：keepalive 表单落盘口 ----------
 
 

@@ -101,6 +101,31 @@ def test_app_js_merge_button_states_widened_to_discard_states():
     ) in js
 
 
+def test_index_has_off_table_model_hint():
+    """总review二 G11：自定义模型输入框旁的灰字提示——表外模型不受单模型
+    周线保护。"""
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    for piece in (
+        'id="f-model-custom-hint"',
+        'id="f-review-model-custom-hint"',
+        "表外模型不受单模型周线保护，名字打错会起跑失败",
+    ):
+        assert piece in html, piece
+
+
+def test_app_js_off_table_model_hint_visibility_follows_custom_input():
+    """提示文字的显隐跟自定义输入框绑在一起（setModelCustomVisible /
+    setReviewModelCustomVisible），不会散在各处各写一遍容易漏改。"""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    for piece in (
+        "function setModelCustomVisible(visible)",
+        "function setReviewModelCustomVisible(visible)",
+        'setModelCustomVisible($("f-model").value === "__custom__")',
+        'setReviewModelCustomVisible($("f-review-model").value === "__custom__")',
+    ):
+        assert piece in js, piece
+
+
 def test_css_has_touch_affordance_and_new_state_chips():
     css = (WEB / "style.css").read_text(encoding="utf-8")
     for piece in (

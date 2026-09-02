@@ -1188,6 +1188,19 @@ function currentModel() {
     $("f-model-custom").value.trim() : $("f-model").value;
 }
 
+// 总review二 G11：自定义模型名输入框与它旁边那句灰字提示（表外模型不受
+// 单模型周线保护）永远一起显隐——两个 helper 把这对 hidden 赋值收进一处，
+// 免得散在建/编辑/切换三处各写一遍时漏改其中一个。
+function setModelCustomVisible(visible) {
+  $("f-model-custom").hidden = !visible;
+  $("f-model-custom-hint").hidden = !visible;
+}
+
+function setReviewModelCustomVisible(visible) {
+  $("f-review-model-custom").hidden = !visible;
+  $("f-review-model-custom-hint").hidden = !visible;
+}
+
 function recalcWarnDefault() {
   if (WARN_EDITED) return;
   var ratio = CFG && CFG.guards ? CFG.guards.context_warn_ratio : null;
@@ -1363,8 +1376,8 @@ function enterCreate() {
     // 它的，直接"新建"会复制出一份旧任务（时间若已过，下一 tick 就起跑）。
     // 只在这种情况清空——用户自己填了一半切去看任务页再回来，草稿要留着。
     $("new-form").reset();
-    $("f-model-custom").hidden = true;
-    $("f-review-model-custom").hidden = true;
+    setModelCustomVisible(false);
+    setReviewModelCustomVisible(false);
     if (CFG) populateNewForm();
     FORM_STALE = false;
   }
@@ -1404,10 +1417,10 @@ function enterEdit(item) {
   var modelSel = $("f-model");
   if (rc.models && rc.models[task.model]) {
     modelSel.value = task.model;
-    $("f-model-custom").hidden = true;
+    setModelCustomVisible(false);
   } else {
     modelSel.value = "__custom__";
-    $("f-model-custom").hidden = false;
+    setModelCustomVisible(true);
     $("f-model-custom").value = task.model || "";
   }
   if ((rc.efforts || []).indexOf(task.effort) >= 0) $("f-effort").value = task.effort;
@@ -1437,10 +1450,10 @@ function enterEdit(item) {
   var reviewRc = runnerModelsEfforts(reviewRunner);
   if (review.model && reviewRc.models && reviewRc.models[review.model]) {
     $("f-review-model").value = review.model;
-    $("f-review-model-custom").hidden = true;
+    setReviewModelCustomVisible(false);
   } else if (review.model) {
     $("f-review-model").value = "__custom__";
-    $("f-review-model-custom").hidden = false;
+    setReviewModelCustomVisible(true);
     $("f-review-model-custom").value = review.model;
   }
   if (review.effort && (reviewRc.efforts || []).indexOf(review.effort) >= 0) {
@@ -1881,7 +1894,7 @@ function start() {
     r.addEventListener("change", function () { populateReviewModelEffort(currentReviewRunner()); });
   });
   $("f-review-model").addEventListener("change", function () {
-    $("f-review-model-custom").hidden = $("f-review-model").value !== "__custom__";
+    setReviewModelCustomVisible($("f-review-model").value === "__custom__");
   });
   $("f-title").addEventListener("input", schedulePreview);
   $("f-project").addEventListener("change", schedulePreview);
@@ -1893,7 +1906,7 @@ function start() {
     });
   });
   $("f-model").addEventListener("change", function () {
-    $("f-model-custom").hidden = $("f-model").value !== "__custom__";
+    setModelCustomVisible($("f-model").value === "__custom__");
     recalcWarnDefault();
     schedulePreview();
   });
