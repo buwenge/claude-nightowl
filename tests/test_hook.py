@@ -499,6 +499,37 @@ def test_post_tool_use_stale_quota_ignored(tmp_path):
     assert status.get("quota_warned_at") is None
 
 
+def test_post_tool_use_quota_freshness_floor_at_5_minute_refresh(tmp_path):
+    """总review F4：新鲜度上限是 max(2 × quota_refresh_minutes, 30) 分钟，
+    不是单纯 2 倍——刷新间隔缩到 5 分钟后，20 分钟前的数据仍要算新鲜
+    （在 30 分钟下限之内），35 分钟前的才算过期。"""
+    cfg = dict(CONFIG)
+    cfg["scheduler"] = {"quota_refresh_minutes": 5}
+    store.atomic_write_json(store.home() / "config.json", cfg)
+    task_id = make_task(guards={
+        "session_pct_max": 80, "weekly_pct_max": 95,
+        "context_warn_tokens": 100000, "context_limit_tokens": 200000,
+    })
+    write_quota(session=85, age_minutes=20)  # 20 分钟前：在 30 分钟下限内，仍新鲜
+    payload = make_transcript(tmp_path / "transcript.jsonl", 100)
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", payload)
+    proc = run_hook(task_id, "PostToolUse", payload)  # 第 20 次
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "五小时额度只剩 15%" in ctx
+
+    task_id2 = make_task(guards={
+        "session_pct_max": 80, "weekly_pct_max": 95,
+        "context_warn_tokens": 100000, "context_limit_tokens": 200000,
+    })
+    write_quota(session=85, age_minutes=35)  # 35 分钟前：超过 30 分钟下限，算过期
+    payload2 = make_transcript(tmp_path / "transcript2.jsonl", 100)
+    for _ in range(20):
+        proc = run_hook(task_id2, "PostToolUse", payload2)
+    assert proc.stdout == ""
+    assert store.read_status(task_id2).get("quota_pause_count") is None
+
+
 def test_post_tool_use_context_and_quota_one_json_two_paragraphs(tmp_path):
     task_id = make_task(
         guards={

@@ -147,9 +147,14 @@ def _read_fresh_usage(config: dict) -> dict | None:
     这两个键，会让这个 hook 无声失效（Claude 的五小时暂停、周线收尾、
     别的模型周线提示全部读不到新数据）。
 
-    分片有 error、没有 usage dict、或 `fetched_at` 超过
-    2 × scheduler.quota_refresh_minutes 都当没有——回注提醒宁缺勿滥，
-    过期额度只会吓唬人。
+    分片有 error、没有 usage dict、或 `fetched_at` 超过新鲜度上限都当没有
+    ——回注提醒宁缺勿滥，过期额度只会吓唬人。
+
+    总review F4：新鲜度上限是 `max(2 × quota_refresh_minutes, 30)` 分钟，
+    不再是单纯的 2 倍。刷新间隔从 30 分钟缩到 5 分钟之后，"2 倍"只剩
+    10 分钟——调度器一次 `/usage` 超时（120 s）或服务重启，回注就会静默
+    失效（分片一过期就整段返回 None，五小时暂停/周线收尾/别的模型周线
+    提示全部读不到）。下限 30 分钟保住刷新间隔缩短之前那档容忍度量级。
     """
     from .quota import load_quota_file
 
@@ -166,7 +171,7 @@ def _read_fresh_usage(config: dict) -> dict | None:
         refresh_minutes = (config.get("scheduler") or {}).get(
             "quota_refresh_minutes", 30
         )
-        max_age_seconds = 2 * float(refresh_minutes) * 60
+        max_age_seconds = max(2 * float(refresh_minutes), 30) * 60
         age = datetime.now(timezone.utc) - datetime.fromisoformat(fetched_at)
         if age.total_seconds() > max_age_seconds:
             return None

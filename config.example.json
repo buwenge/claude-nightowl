@@ -100,7 +100,7 @@
     "launch_grace_seconds": 180,
     "postpone_minutes": 30,
     "max_postpone_hours": 6,
-    "quota_refresh_minutes": 30,
+    "quota_refresh_minutes": 5,
     "keepalive_idle_minutes": 50,
     "keepalive_text": "来自nightshift：保活探针——背景任务还在跑吗？简短回一句即可。",
     "stuck_minutes": 15,
