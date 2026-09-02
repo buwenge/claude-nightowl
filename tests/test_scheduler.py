@@ -1392,6 +1392,48 @@ def test_idle_after_alarm_expired_and_hook_cleared_pause_not_repoked(monkeypatch
     assert store.read_status(tid)["state"] == "finished"
 
 
+def test_claude_waiting_wakeup_grace_period_59_minutes_not_poked(monkeypatch):
+    """F3：闹钟没丢的正常路径——刷新时间过了不到 60 分钟，调度器还得再等
+    它自己醒，不许提前敲。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    paused_until = NOW - timedelta(minutes=59)
+    store.update_status(tid, state="waiting_wakeup", window_id="@1", pane_pid=NO_PID,
+                        quota_paused_until=scheduler.to_iso(paused_until),
+                        last_event_at=scheduler.to_iso(NOW - timedelta(hours=1)))
+    scheduler.tick(CONFIG, NOW)
+    assert fakes.send_keys_calls == []
+    status = store.read_status(tid)
+    assert status["state"] == "waiting_wakeup"
+    assert status["quota_paused_until"] == scheduler.to_iso(paused_until)
+
+
+def test_claude_waiting_wakeup_grace_period_61_minutes_poked_once(monkeypatch):
+    """F3：闹钟大概率丢了（CC 的 cron 没触发）——超过 60 分钟宽限期，调度器
+    主动敲一句让它继续，且只敲这一次（quota_resume_sent 落盘后下一 tick
+    不再重复）。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    paused_until = NOW - timedelta(minutes=61)
+    store.update_status(tid, state="waiting_wakeup", window_id="@1", pane_pid=NO_PID,
+                        quota_paused_until=scheduler.to_iso(paused_until),
+                        last_event_at=scheduler.to_iso(NOW - timedelta(hours=1)))
+    scheduler.tick(CONFIG, NOW)
+    assert len(fakes.send_keys_calls) == 1
+    _, text = fakes.send_keys_calls[0]
+    assert "额度应已刷新" in text
+    status = store.read_status(tid)
+    assert status["quota_resume_sent"] is True
+    assert status["quota_paused_until"] is None
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "额度刷新已过 60 分钟仍未自醒" in events
+
+    # 状态还没被下一次 UserPromptSubmit 事件推进（测试里没有真的 hook），
+    # 但 quota_resume_sent 已经落盘，下一 tick 不该再敲第二次
+    scheduler.tick(CONFIG, NOW + timedelta(minutes=1))
+    assert len(fakes.send_keys_calls) == 1
+
+
 # ---------- S6③：Codex 额度、按 runner 预检、缓存唤醒、保活分家 ----------
 
 CODEX_CONFIG = {

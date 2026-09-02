@@ -58,6 +58,17 @@ DEFAULT_CODEX_QUOTA_PAUSE_TEXT = (
 DEFAULT_CODEX_RESUME_TEXT = (
     "来自nightshift：五小时额度应已刷新，请从刚才停下的地方继续。"
 )
+# Claude 走缓存闹钟自己醒来的正常路径不需要这句（那是它自己接着干）；
+# 只有 idle 分支（闹钟已经响完但没等到 UserPromptSubmit）与 F3 的
+# 60 分钟宽限期兜底（闹钟大概率丢了）两处会真的 send-keys 这句。
+DEFAULT_CLAUDE_RESUME_TEXT = (
+    "来自nightshift：五小时额度应已刷新，请从刚才停下的地方继续。"
+)
+# F3：Claude 没有调度器能感知的"闹钟到底响没响"信号——ScheduleWakeup 若被
+# CC 的 cron 丢了（没触发），waiting_wakeup 会永远等下去。给一段宽限期：
+# 超过额度刷新时间这么多分钟仍没等到它自己醒（UserPromptSubmit/Stop 都没
+# 来），调度器主动 send-keys 叫它继续，跟 idle 分支走同一套文案/失败处理。
+CLAUDE_WAKEUP_GRACE_MINUTES = 60
 # S7.1 阻断二/三：review 角色因额度到线转 held（on_no_quota=hold）后的
 # 恢复文案——明确要求"继续完成这一轮审稿"，结尾仍然只用 NEXT: done/fix/
 # pending 三选一，不能沿用 build 那句"从刚才停下的地方继续"（不成协议）。
@@ -823,6 +834,25 @@ def _reconcile_codex_background(
 # ---------- 运行期巡检：working / waiting_background / idle（设计稿 §5.2） ----------
 
 
+def _send_quota_resume(task_id: str, window_id: str, text: str) -> list[str] | None:
+    """F3：额度刷新时间到了、叫它继续这一步的 send-keys + 失败处理——idle
+    分支（闹钟已响完但没等到事件）与 Claude waiting_wakeup 超过 60 分钟
+    宽限期两处共用，不许各自复制一份（S6.1 B2：send-keys 真失败不能假装
+    已经叫醒了它）。失败只记事件、返回给调用方的 action 提示；成功返回
+    None，落盘 quota_resume_sent/清 quota_paused_until 与记事件的措辞由
+    调用方决定（两种场景说法不同）。
+    """
+    proc = launcher.send_keys(window_id, text)
+    if proc.returncode != 0:
+        store.append_event(
+            task_id,
+            f"额度刷新时间已到但 send-keys 失败（returncode={proc.returncode}），"
+            "未能让它继续",
+        )
+        return [f"{task_id} 额度刷新但叫醒失败"]
+    return None
+
+
 def _check_running(
     task: dict, status: dict, config: dict, now: datetime
 ) -> list[str]:
@@ -1048,23 +1078,36 @@ def _check_running(
             text = (
                 config.get("codex_resume_text") or DEFAULT_CODEX_RESUME_TEXT
                 if runner == "codex"
-                else "来自nightshift：五小时额度应已刷新，请从刚才停下的地方继续。"
+                else DEFAULT_CLAUDE_RESUME_TEXT
             )
             # S6.1 B2：send-keys 真失败不能假装已经叫醒了它——不写
             # quota_resume_sent/清 quota_paused_until，留在原状态下 tick 重试
-            proc = launcher.send_keys(str(window_id), text)
-            if proc.returncode != 0:
-                store.append_event(
-                    task_id,
-                    f"额度刷新时间已到但 send-keys 失败（returncode={proc.returncode}），"
-                    "未能让它继续",
-                )
-                return [f"{task_id} 额度刷新但叫醒失败"]
+            failure = _send_quota_resume(task_id, str(window_id), text)
+            if failure is not None:
+                return failure
             store.update_status(task_id, quota_resume_sent=True, quota_paused_until=None)
             store.append_event(task_id, "额度刷新时间已到，已 send-keys 让它继续")
             return [f"{task_id} 额度刷新，敲它继续"]
         if status.get("state") == "waiting_wakeup":
-            return []  # Claude：闹钟还没响完，等它自己醒
+            # F3：Claude 的闹钟若被 CC 的 cron 丢了（没触发），永远没人敲——
+            # 给个宽限期，超过 CLAUDE_WAKEUP_GRACE_MINUTES 仍没等到它自己醒
+            # 就由调度器主动 send-keys 叫它继续，跟上面 idle 分支同一套
+            # 文案/失败处理。没到宽限期（或本来就是 Codex，已经在上面的
+            # codex_waiting_wakeup 分支处理过）仍然只能等。
+            if (
+                runner == "claude"
+                and not status.get("quota_resume_sent")
+                and now >= parse_iso(paused_until) + timedelta(minutes=CLAUDE_WAKEUP_GRACE_MINUTES)
+            ):
+                failure = _send_quota_resume(task_id, str(window_id), DEFAULT_CLAUDE_RESUME_TEXT)
+                if failure is not None:
+                    return failure
+                store.update_status(task_id, quota_resume_sent=True, quota_paused_until=None)
+                store.append_event(
+                    task_id, "额度刷新已过 60 分钟仍未自醒，已 send-keys 让它继续"
+                )
+                return [f"{task_id} 额度刷新已过 60 分钟未自醒，敲它继续"]
+            return []  # Claude：闹钟还没响完/还没到宽限期，等它自己醒
 
     # S7.1 阻断二/三：review 角色因额度到线转 held（scheduler._review_pending
     # 的 on_no_quota=hold 分支）——上面那段只认 idle/waiting_wakeup，held
