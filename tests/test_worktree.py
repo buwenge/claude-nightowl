@@ -421,6 +421,43 @@ def test_title_change_after_tree_created_does_not_block_merge(repo):
     assert store.read_status(task["id"])["state"] == "merged"
 
 
+def test_is_ancestor_ignores_same_named_tag_shadowing_the_branch(repo):
+    """总review二 G13：`_is_ancestor` 显式查 `refs/heads/<branch>`，不裸传
+    短名。git 解析裸短名时 tag 排在 branch 前面——一个跟分支同名的 tag
+    指向一个跟主线无关的提交，裸短名会被那个 tag 顶替，"已经合并"的判断
+    对象就变成了不相干的东西。"""
+    proj, config = repo
+    branch = "ns/shadow-test"
+    # 分支就地建在 HEAD 上：trivially 是 HEAD 的祖先（就是 HEAD 自己）
+    _gitSimple("branch", branch, cwd=proj)
+    # 同名 tag 指向一个跟主线历史无关的孤儿提交
+    orphan_dir = proj.parent / "orphan"
+    orphan_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=orphan_dir, check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(orphan_dir), "config", "user.email", "ns@example.test"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(orphan_dir), "config", "user.name", "ns"],
+                   check=True, capture_output=True)
+    (orphan_dir / "unrelated.txt").write_text("跟主线无关\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(orphan_dir), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(orphan_dir), "commit", "-q", "-m", "孤儿提交"],
+                   check=True, capture_output=True)
+    orphan_sha = _gitSimple("rev-parse", "HEAD", cwd=orphan_dir).strip()
+    subprocess.run(
+        ["git", "-C", str(proj), "fetch", "-q", str(orphan_dir), orphan_sha],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(proj), "tag", branch, "FETCH_HEAD"],
+        check=True, capture_output=True,
+    )
+
+    # 裸短名会被 refs/tags/<branch> 顶替（tag 优先于 branch），指向不相干
+    # 的孤儿提交、不是 HEAD 祖先；refs/heads/<branch> 才是我们建的那条本地
+    # 分支，就是 HEAD 本身，trivially 是祖先。
+    assert worktree._is_ancestor(proj, branch) is True
+
+
 def test_merge_refuses_fully_gone_without_persisted_proof(repo):
     """树/分支被手工删掉不等于已合并；没有 merge_sha 证据绝不猜成功。"""
     proj, config = repo

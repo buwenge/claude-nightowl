@@ -564,8 +564,13 @@ def check_task_tree(
 
 
 def _is_ancestor(project_path: str | Path, branch: str) -> bool:
-    """分支是否已经是主线 HEAD 的祖先（= 已经合并过）。"""
-    proc = _git(project_path, "merge-base", "--is-ancestor", branch, "HEAD")
+    """分支是否已经是主线 HEAD 的祖先（= 已经合并过）。
+
+    总review二 G13：显式 `refs/heads/<branch>`，不裸传短名——裸短名走 git
+    自己的 ref 解析顺序，同名 tag/远端分支存在时会被那个顶替，"已经合并"
+    这个判断的对象就不是我们自己建的这条本地分支了。
+    """
+    proc = _git(project_path, "merge-base", "--is-ancestor", f"refs/heads/{branch}", "HEAD")
     return proc.returncode == 0
 
 

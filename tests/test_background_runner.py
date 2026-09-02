@@ -200,6 +200,36 @@ def test_cmd_start_monitor_exception_still_records_finished(tmp_path):
     assert "监工异常" in finished["output_tail"]
 
 
+def test_mark_finished_write_failure_appends_reason_to_output_not_crashes(tmp_path, monkeypatch):
+    """总review二 G13：登记终态（modify_registry 里的 mark_finished）写不
+    进去（磁盘满等）不能让 wrapper 带着未捕获异常退出——原因追加到
+    output_path 尾部，registry 停在 running（90 秒心跳超时兜底会接手，
+    不会永久卡死）。"""
+    task_id = make_task()
+    background_id = "bg-test"
+    output_path = tmp_path / f"{background_id}.log"
+    bgr.modify_registry(task_id, lambda d: d.update({
+        background_id: {"state": "running", "background_id": background_id},
+    }))
+
+    real_modify_registry = bgr.modify_registry
+
+    def flaky_modify_registry(tid, mutator):
+        if mutator.__name__ == "mark_finished":
+            raise OSError("模拟磁盘满")
+        return real_modify_registry(tid, mutator)
+
+    monkeypatch.setattr(bgr, "modify_registry", flaky_modify_registry)
+
+    # 不该抛出——异常被新加的 try/except 接住
+    bgr._run_foreground(task_id, background_id, ["bash", "-c", "echo hi"], output_path)
+
+    tail = output_path.read_bytes().decode("utf-8", errors="replace")
+    assert "登记终态失败" in tail
+    assert "模拟磁盘满" in tail
+    assert bgr.load_registry(task_id)[background_id]["state"] == "running"
+
+
 def test_heartbeat_updates_while_running(tmp_path):
     task_id = make_task()
     proc, background_id, _ = start_bg(["sleep", "2.5"], task_id)

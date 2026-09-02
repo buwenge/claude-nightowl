@@ -185,7 +185,18 @@ def _run_foreground(task_id: str, background_id: str, argv: list[str], output_pa
         rec["output_tail"] = tail
         rec["heartbeat_at"] = finished_at
 
-    modify_registry(task_id, mark_finished)
+    try:
+        modify_registry(task_id, mark_finished)
+    except Exception as exc:
+        # 总review二 G13：登记终态这一步写不进去（磁盘满等）不能让 wrapper
+        # 带着未捕获异常退出——registry 停在 running，90 秒后调度器按心跳
+        # 超时转 needs_attention，不会永久卡死，但原因原本只留在沙箱 stderr
+        # 里没人看得到；追加到 output_path 尾部，至少刷屏幕/看输出能看到。
+        try:
+            with open(output_path, "ab") as out:
+                out.write(f"\n[nightshift background_runner 登记终态失败：{exc!r}]\n".encode())
+        except OSError:
+            pass
 
 
 def _task_id_from_env() -> str | None:
