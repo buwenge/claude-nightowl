@@ -1,6 +1,6 @@
 # claude-nightowl（夜猫子）
 
-> 包名与命令仍叫 `nightshift`（夜班）——让 Claude Code 在你睡觉时按计划在 tmux 里干活。
+> 包名与命令仍叫 `nightshift`（夜班）——让 Claude Code 在你睡觉时按计划在 tmux 里干活。English version: [README.md](README.md).
 
 到点在 tmux 里开一个新窗口、跑一个**正常的交互式 `claude`** 的定时任务调度器。
 你早上 ssh 进来 `Ctrl+B w` 选窗口就能接着聊；跑的时候靠 Claude Code 自己的
