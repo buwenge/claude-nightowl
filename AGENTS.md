@@ -6,7 +6,7 @@
 - **Python 3.12 标准库 only**，不装任何第三方包，没有 venv。`python3` 就是 `/usr/bin/python3`。
 - **代码/配置样例/注释里不许出现任何私人信息**：没有私人项目路径、没有人名代号、没有域名、没有 token。运行时一切个性化内容都从数据目录的 `config.json` 读（数据目录 = 环境变量 `NIGHTSHIFT_HOME`，默认 `~/.nightshift`）。仓库里只放 `config.example.json`。
 - 数据目录里所有文件写盘一律"写临时文件 + `os.replace`"原子替换；`status.json` 的读改写要拿 `fcntl.flock` 文件锁（hook 进程和调度器会并发写）。
-- **不许碰名为 `claude` 的 tmux 会话**（那是用户的），测试用的 tmux 会话只能叫 `ns-selftest`，用完 `tmux kill-session -t ns-selftest`。
+- **不许碰名为 `claude` 的 tmux 会话**（那是用户的），测试用的 tmux 会话只能叫 `ns-selftest`，用完 `tmux kill-session -t ns-selftest`。测试文件里的 CONFIG/夹具 `tmux_session` 一律写 `ns-selftest`；`tests/conftest.py` 有守卫，tmux 命令指向别的会话会直接抛错（9/2 加，起因是 test_scheduler.py 的 CONFIG 曾写成 `claude`，漏打桩的测试把通知窗口真开进了用户会话）。
 - **不许真的起 `claude`**（花钱）。launcher 通过环境变量 `NIGHTSHIFT_CLAUDE_BIN` 换成 `tests/fake_claude.sh` 做集成测试。
 - 测试：在仓库根目录执行 `python3 -m pytest tests -q`，测试写盘一律指 `tmp_path`，`NIGHTSHIFT_HOME` 在测试里必须指向临时目录。
 - 注释、docstring、验收单用中文；标识符英文。

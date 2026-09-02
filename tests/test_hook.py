@@ -22,7 +22,7 @@ DEFAULT_WARN_TEXT = (
 )
 
 CONFIG = {
-    "tmux_session": "claude",
+    "tmux_session": "ns-selftest",  # 测试专用会话名（AGENTS.md 硬规矩），别写真实用户会话
     "window_prefix": "ns:",
     "claude_bin": "claude",
     "probe_model": "claude-haiku-4-5-20251001",

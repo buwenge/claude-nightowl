@@ -19,7 +19,9 @@ NOW = datetime(2026, 8, 27, 18, 0, 0, tzinfo=timezone.utc)
 NO_PID = 2**24  # 必然不存在的 pid（同 test_launcher 的用法）
 
 CONFIG = {
-    "tmux_session": "claude",
+    # 测试专用会话名（AGENTS.md 硬规矩）。9/2 之前这里写的是真实用户会话名
+    # "claude"，任何漏打桩的测试都会把通知窗口真开进用户的 tmux 里。
+    "tmux_session": "ns-selftest",
     "window_prefix": "ns:",
     "claude_bin": "claude",
     "probe_model": "claude-haiku-4-5-20251001",
