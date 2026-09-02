@@ -575,3 +575,18 @@ def test_refresh_tasks_guards_stale_response_and_reports_failure():
     body = _js_fn("refreshTasks")
     assert "TASKS_SEQ" in body
     assert _re.search(r"catch\(function \(err\)\s*\{[^}]*banner\(", body, _re.S)
+
+
+# ---------- 总review F1：额度暂停文案按工人区分 ----------
+
+
+def test_task_card_quota_paused_text_differs_by_runner():
+    """Claude 五小时线到线跟 Codex 不是一回事：Claude 自带缓存闹钟到点
+    自行继续，Codex 没有 ScheduleWakeup 只能等调度器主动叫醒——"等 Codex
+    额度刷新"这句只许在 codex 分支出现，Claude 分支要提"会话自带闹钟"。"""
+    body = _js_fn("taskCard")
+    assert "会话自带闹钟" in body
+    codex_idx = body.index("等 Codex 额度刷新")
+    # "等 Codex 额度刷新" 只出现一次，且紧跟在 runner === "codex" 分支的判断之后
+    assert "等 Codex 额度刷新" not in body[codex_idx + 1:]
+    assert 'runner === "codex"' in body[max(0, codex_idx - 200):codex_idx]

@@ -1002,12 +1002,23 @@ function taskCard(item, now, chainIds, opts) {
       text: "审稿：" + reviewRunnerLabel + " · " + task.review.model + " · " + task.review.effort }));
   }
 
-  // S6⑤：Codex 额度到线等刷新的具体时间点；waiting_wakeup 对 Claude 走
-  // ScheduleWakeup（会话自己缓存闹钟），不落 quota_paused_until，这条只对
-  // 设了这个字段的 Codex 任务显示
-  if (state === "waiting_wakeup" && status.quota_paused_until) {
-    card.appendChild(el("div", { class: "quota-line",
-      text: "等 Codex 额度刷新，" + fmtLocal(status.quota_paused_until) + " 自动叫醒" }));
+  // 总review F1：`quota_paused_until` 两家都会落（hook._post_tool_use_refresh
+  // 的 pause 分支对 Claude 同样写这个字段），文案必须按 runner 分——Codex
+  // 没有 ScheduleWakeup，只能等调度器主动叫醒；Claude 自己设了缓存闹钟，
+  // 到点自行继续（超过 60 分钟没醒，调度器兜底叫，见 F3）。
+  if (status.quota_paused_until) {
+    if (runner === "codex" && state === "waiting_wakeup") {
+      card.appendChild(el("div", { class: "quota-line",
+        text: "等 Codex 额度刷新，" + fmtLocal(status.quota_paused_until) + " 自动叫醒" }));
+    } else if (runner === "claude" && state === "waiting_wakeup") {
+      card.appendChild(el("div", { class: "quota-line",
+        text: "五小时额度到线，预计 " + fmtLocal(status.quota_paused_until) +
+          " 刷新；会话自带闹钟到点自行继续（超过 60 分钟未醒由调度器叫醒）" }));
+    } else if (runner === "claude" && state === "idle") {
+      card.appendChild(el("div", { class: "quota-line",
+        text: "五小时额度到线已停下，预计 " + fmtLocal(status.quota_paused_until) +
+          " 刷新后由调度器叫醒" }));
+    }
   }
 
   // S6⑤：F12 后台任务摘要——运行中 / 已完成待读取的数量
