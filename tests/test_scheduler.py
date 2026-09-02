@@ -1312,6 +1312,46 @@ def test_waiting_wakeup_without_handover_not_reevaluated(monkeypatch):
     assert fakes.send_keys_calls == []
 
 
+def test_waiting_wakeup_never_evaluated_without_handover_stays_put(monkeypatch):
+    """H7.1（监理返工）：从未评估过（chain_checked 还没落）也没有交接
+    文件的 waiting_wakeup——挂着闹钟不代表写了交接，绝不能被当成"没交接
+    也没被提醒过 → 正常干完"直接终结/续班（那是 idle 专属的既有语义，
+    对还在等自己闹钟的会话是回归）。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    store.update_status(
+        tid, state="waiting_wakeup", window_id="@30", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=1)),
+    )
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "waiting_wakeup"
+    assert "chain_checked" not in status
+    assert status.get("successor_id") is None
+    assert fakes.send_keys_calls == []
+    assert len(store.list_tasks()) == 1
+
+
+def test_waiting_wakeup_context_warned_without_handover_stays_put(monkeypatch):
+    """同上，但这班之前被上下文到线提醒过（`context_warned_at` 有值）却
+    没写交接——对 idle 而言这会按 `chain.on_no_handover` 续班/停下，但对
+    waiting_wakeup 一样不成立：它只是设了闹钟等着，没有交接就什么都不做。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    store.update_status(
+        tid, state="waiting_wakeup", window_id="@30", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=1)),
+        context_warned_at=scheduler.to_iso(NOW - timedelta(minutes=10)),
+    )
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "waiting_wakeup"
+    assert "chain_checked" not in status
+    assert status.get("successor_id") is None
+    assert fakes.send_keys_calls == []
+    assert len(store.list_tasks()) == 1
+
+
 def test_waiting_wakeup_idle_settle_debounce_before_chain_eval(monkeypatch):
     """同 F11：交接刚写、last_event_at 就是 now 时这一 tick 不评估，过了
     IDLE_SETTLE_SECONDS 才评估。"""

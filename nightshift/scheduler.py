@@ -1301,6 +1301,17 @@ def _check_running(
     # H7：waiting_wakeup 挂着闹钟但交接已写好，也按 idle 走换班——写完交接
     # 的班只要还挂着缓存闹钟，就永远不会被下面 S3 那段 idle 专属的换班
     # 判定摸到（9/2 真机事故②）；build 专属语义，review 不设闹钟不进这段。
+    #
+    # H7.1（监理返工）：waiting_wakeup 本身就是"会话自己设了闹钟、还没
+    # 干完"的语义——挂着闹钟不代表写了交接。没有交接文件时绝不能走
+    # `_check_idle_chain`：那条路对"没交接"的既有解释是"正常干完"（没被
+    # 提醒过 → 直接 finished）或"提醒过没交接 → on_no_handover=continue
+    # 直接续班"，两条对 idle（会话真的停手、没有任何自我安排）成立，但
+    # 对 waiting_wakeup 是回归——中途按家规挂 50 分钟缓存闹钟、或五小时
+    # 额度闹钟醒来后 quota_paused_until 已被 hook 清掉又续了个闹钟，都会
+    # 被误判成"干完了"而终结/续班，跟真正还在干活的会话打架。交接文件
+    # 是这班"我干完了/该换班了"的唯一信号，闹钟从来不是——所以这里在
+    # `_handover_needs_eval` 之外，额外要求交接文件真的存在才评估。
     if (
         status.get("state") == "waiting_wakeup"
         and not paused_until
@@ -1314,7 +1325,7 @@ def _check_running(
             settled = not (0 <= delta < IDLE_SETTLE_SECONDS)
         if not settled:
             return []
-        if _handover_needs_eval(task, status):
+        if _handover_mtime_ns(task) is not None and _handover_needs_eval(task, status):
             result = _check_idle_chain(task, status, config, now)
             # 换班成功（父班已经是 chained）就敲一句让它撤掉还挂着的闹钟，
             # 不然闹钟每 50 分钟把已换班的窗口拉起来一次（H8 会摁回
