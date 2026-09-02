@@ -86,6 +86,28 @@ def test_check_guards_session_over():
     assert "五小时" in reason and "85%" in reason and "80%" in reason
 
 
+def test_check_guards_session_equal_line_also_blocks():
+    """总review F7：三条线的比较统一成 >=（"到线"就拦，不再等真的超过才
+    拦）——五小时/七日/单模型周线各测一次等号边界。"""
+    usage = usage_fixture()
+    usage["session_pct"] = GUARDS["session_pct_max"]
+    ok, reason = check_guards(usage, "claude-fable-5", CONFIG, GUARDS)
+    assert not ok
+    assert "五小时" in reason and "到线" in reason
+
+    usage2 = usage_fixture()
+    usage2["week_all_pct"] = GUARDS["weekly_pct_max"]
+    ok, reason = check_guards(usage2, "claude-fable-5", CONFIG, GUARDS)
+    assert not ok
+    assert "七日" in reason and "到线" in reason
+
+    usage3 = usage_fixture()
+    usage3["per_model"]["Fable"] = GUARDS["weekly_pct_max"]  # model_weekly_pct_max 跟 weekly 线
+    ok, reason = check_guards(usage3, "claude-fable-5", CONFIG, GUARDS)
+    assert not ok
+    assert "Fable" in reason and "到线" in reason
+
+
 def test_check_guards_week_all_over():
     usage = usage_fixture()
     usage["week_all_pct"] = 96

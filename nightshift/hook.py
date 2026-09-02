@@ -180,6 +180,21 @@ def _read_fresh_usage(config: dict) -> dict | None:
     return usage
 
 
+def _guard_line(task: dict, config: dict, key: str, fallback=None):
+    """总review F7：guards 判定的统一口径——task.guards 缺这条线/为 null
+    就回退 config.guards（与 D2 修后的 `quota.check_guards.line()` 一致：
+    网页编辑把某条线清空就是"回到默认"，server 只做 task.update 不回填）。
+    两处都没有就返回 fallback（通常是 None，调用方按"这条线没配，跳过
+    这一条判定"处理，不拖累其余没有依赖它的判定）。
+    """
+    guards = task.get("guards") or {}
+    cfg_guards = config.get("guards") or {}
+    value = guards.get(key)
+    if value is None:
+        value = cfg_guards.get(key)
+    return fallback if value is None else value
+
+
 def _other_model_notes(task: dict, config: dict, status: dict) -> list[tuple[str, str]]:
     """不是本任务模型的单模型周线到了 model_weekly_pct_max → 每个模型提示一次。
 
@@ -188,8 +203,9 @@ def _other_model_notes(task: dict, config: dict, status: dict) -> list[tuple[str
     的语义是"`config.runners` 里有 `claude` 键就整个原样返回，不做字段级
     合并"，顶层 `models` 分裂出去之后就只是个过期快照。
     """
-    guards = task.get("guards") or {}
-    model_max = guards.get("model_weekly_pct_max", guards.get("weekly_pct_max"))
+    model_max = _guard_line(
+        task, config, "model_weekly_pct_max", _guard_line(task, config, "weekly_pct_max")
+    )
     if model_max is None:
         return []
     usage = _read_fresh_usage(config)
@@ -216,14 +232,17 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
     - "wrapup"：七日全模型线或任务模型自己的周线到了 → 收尾交接（优先级高，刷新不了）；
     - "pause"：五小时线到了 → 停下定缓存闹钟等刷新；
     - None：都没到，或没有新鲜额度。
-    阈值取 task.guards.session_pct_max / weekly_pct_max（"已用"百分比）。
+    阈值取 task.guards.session_pct_max / weekly_pct_max（"已用"百分比）；
+    缺 key/None 回退 config.guards（`_guard_line`，总review F7，与
+    `quota.check_guards` 口径统一）；三条线各自独立，两处都没配的那一条
+    只是不判它，不拖累其余两条（不再"session_max 或 weekly_max 有一个
+    没配就整段不判定"）。
     """
-    guards = task.get("guards") or {}
-    session_max = guards.get("session_pct_max")
-    weekly_max = guards.get("weekly_pct_max")
-    model_max = guards.get("model_weekly_pct_max", weekly_max)  # 单模型周线单独一个数，没配就跟全模型线
-    if session_max is None or weekly_max is None:
-        return None, "", {}
+    session_max = _guard_line(task, config, "session_pct_max")
+    weekly_max = _guard_line(task, config, "weekly_pct_max")
+    model_max = _guard_line(task, config, "model_weekly_pct_max", weekly_max)  # 单模型周线单独一个数，没配就跟全模型线
+    if session_max is None and weekly_max is None and model_max is None:
+        return None, "", {}  # 三条线都没配 = 这个任务完全不受额度守卫管
     usage = _read_fresh_usage(config)
     if usage is None:
         return None, "", {}
@@ -234,17 +253,20 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
     per_model = usage.get("per_model") or {}
     model_pct = per_model.get(label) if label else None
 
-    week_hit = isinstance(week_all_pct, int) and week_all_pct >= weekly_max
-    model_hit = isinstance(model_pct, int) and model_pct >= model_max
+    week_hit = weekly_max is not None and isinstance(week_all_pct, int) and week_all_pct >= weekly_max
+    model_hit = model_max is not None and isinstance(model_pct, int) and model_pct >= model_max
     if week_hit or model_hit:
         model_note = f"，{label} 单独周线剩 {100 - model_pct}%（线 {100 - model_max}%）" if model_hit else ""
+        # weekly_max 可能是 None（这条线本身没配、纯靠 model_hit 触发）——
+        # week_line_left 跟 week_left 一样用 "?" 占位，不能直接 100 - None。
+        week_line_left = "?" if weekly_max is None else 100 - weekly_max
         if store.role_of(task) == "review":
             # S7：审稿班收尾话术不一样——写进最终回复正文、末行 NEXT: pending，
             # 不叫它写 handover_path/commit（那是 build 角色的收尾协议）。
             text = store.render(
                 config.get("review_wrapup_text") or DEFAULT_REVIEW_WRAPUP_TEXT,
                 week_left=("?" if week_all_pct is None else 100 - week_all_pct),
-                week_line_left=100 - weekly_max,
+                week_line_left=week_line_left,
                 model_line_left=100 - model_max,
                 model_note=model_note,
             )
@@ -252,7 +274,7 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
             text = store.render(
                 config.get("quota_wrapup_text") or QUOTA_WRAPUP_TEXT,
                 week_left=("?" if week_all_pct is None else 100 - week_all_pct),
-                week_line_left=100 - weekly_max,
+                week_line_left=week_line_left,
                 model_line_left=100 - model_max,
                 model_note=model_note,
                 handover_path=str(handover_path(task)),
@@ -260,7 +282,7 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
             )
         return "wrapup", text, {}
 
-    if isinstance(session_pct, int) and session_pct >= session_max:
+    if session_max is not None and isinstance(session_pct, int) and session_pct >= session_max:
         from .quota import resets_in_minutes
 
         resets_in = resets_in_minutes(usage.get("session_resets"))

@@ -1551,6 +1551,28 @@ def test_codex_working_over_session_line_sends_pause_and_waits(monkeypatch):
     assert len(sent) == 1
 
 
+def test_codex_working_session_equal_line_also_pauses(monkeypatch):
+    """总review F7：`_check_codex_quota_pause` 的比较改成 >=，跟
+    `quota.check_guards` 的口径统一——刚好等于线也该停，不用真的超过。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t) or subprocess.CompletedProcess([], 0))
+    tid = make_task_codex(guards={"session_pct_max": 80, "weekly_pct_max": 95})
+    quota.write_quota_runner("codex", {
+        "usage": {"session_pct": 80, "session_resets": "2026-08-27T20:00:00Z",
+                  "week_all_pct": 1, "per_model": {}},
+        "fetched_at": scheduler.to_iso(NOW), "error": None,
+    })
+    store.update_status(tid, state="working", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "waiting_wakeup"
+    assert len(sent) == 1 and "五小时额度" in sent[0]
+
+
 def test_codex_review_over_session_line_uses_review_text_and_stays_working(monkeypatch):
     """S7.2 阻断六：Codex review 撞五小时线不能走 build 那套协议——旧写法
     发的是 build 语气文案（不要求 NEXT）且转 build 专属的 waiting_wakeup，

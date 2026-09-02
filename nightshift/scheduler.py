@@ -544,8 +544,8 @@ def _check_codex_quota_pause(
     查不到都返回 None（None ≠ "没发生"，只是"这次没什么可做"，调用方按
     正常流程继续走）。查不到刷新时间就按最长（5 小时）估一个，不卡死。
 
-    S6.1 B2：
-    - 等号不拦——跟 `quota.check_guards` 的 `>` 语义统一，只有真超线才停；
+    S6.1 B2（总review F7 把等号改成拦）：
+    - 到线（含等号）就拦——跟 `quota.check_guards` 的 `>=` 语义统一；
     - 分片过期（`fetched_at` 早于一个刷新周期）或它自己记的 `session_resets`
       已经 <= now（意味着这份百分比早该被新一轮刷新覆盖）都不按这份旧快照
       叫停，交给本 tick 末尾的 `_maybe_refresh_quota` 去刷新，不能拿着一份
@@ -573,7 +573,7 @@ def _check_codex_quota_pause(
     if not isinstance(usage, dict):
         return None
     session_pct = usage.get("session_pct")
-    if not isinstance(session_pct, int) or session_pct <= session_max:
+    if not isinstance(session_pct, int) or session_pct < session_max:
         return None
 
     fetched_at = slice_.get("fetched_at")

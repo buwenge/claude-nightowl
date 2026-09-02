@@ -590,6 +590,37 @@ def test_post_tool_use_quota_pause_fires_when_resets_still_in_future(tmp_path):
     assert store.read_status(task_id)["quota_paused_until"]
 
 
+# ---------- 总review F7(a)：guards 缺 key/None 回退 config.guards ----------
+
+
+def test_post_tool_use_quota_check_falls_back_to_config_guards_when_task_has_none():
+    """任务完全没配 guards（网页编辑清空、或老任务）——CONFIG 顶层已有
+    guards.session_pct_max=80/weekly_pct_max=95，以前 hook._quota_check
+    直接整段 return None（跟 quota.check_guards 的口径不一致），现在要
+    回退到 config 照样判定。"""
+    task_id = make_task()  # 不传 guards
+    write_quota(session=85, week=10)  # 85 ≥ config.guards.session_pct_max(80)
+    payload = make_transcript(store.task_dir(task_id) / "transcript.jsonl", 100)
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", payload)
+    proc = run_hook(task_id, "PostToolUse", payload)  # 第 20 次
+    assert proc.stdout, "guards 全靠 config 兜底，也该判定到线"
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "五小时额度只剩 15%" in ctx
+    assert store.read_status(task_id)["quota_paused_until"]
+
+
+def test_post_tool_use_quota_check_task_guard_overrides_config_guard():
+    """任务自己配了 session_pct_max，就该用任务的，不回退 config 那份。"""
+    task_id = make_task(guards={"session_pct_max": 96})  # 高于 config 的 80，几乎不会到线
+    write_quota(session=85, week=10)  # 85 < 96：不到线；但 ≥ config 的 80
+    payload = make_transcript(store.task_dir(task_id) / "transcript.jsonl", 100)
+    for _ in range(20):
+        proc = run_hook(task_id, "PostToolUse", payload)
+    assert proc.stdout == "", "任务自己配了线就该用它，不该被 config 的更低线拦住"
+    assert "quota_paused_until" not in store.read_status(task_id)
+
+
 def test_post_tool_use_context_and_quota_one_json_two_paragraphs(tmp_path):
     task_id = make_task(
         guards={

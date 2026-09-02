@@ -459,7 +459,7 @@ def check_guards(
 ) -> tuple[bool, str]:
     """额度门槛判定：五小时线、七日 all models 线、任务模型自己的单模型周线。
 
-    全过返回 (True, "")；任一超线返回 (False, 中文原因)。
+    全过返回 (True, "")；任一到线（含等号，总review F7）返回 (False, 中文原因)。
 
     S6.1 B3：`usage_label` 查找必须按 `runner` 对应的模型表，不能只看顶层
     `config.models`（那只是 Claude 的兼容视图）——Codex 任务传自己的
@@ -490,16 +490,16 @@ def check_guards(
     # 某条线两处都没配 = 运维明确不设这条线，跳过（与 hook._quota_check 一致）
     session_pct = usage.get("session_pct")
     week_all_pct = usage.get("week_all_pct")
-    if session_max is not None and session_pct is not None and session_pct > session_max:
-        return False, f"五小时额度 {session_pct}% 超线 {session_max}%"
-    if week_max is not None and week_all_pct is not None and week_all_pct > week_max:
-        return False, f"七日额度 {week_all_pct}% 超线 {week_max}%"
+    if session_max is not None and session_pct is not None and session_pct >= session_max:
+        return False, f"五小时额度 {session_pct}% 到线 {session_max}%"
+    if week_max is not None and week_all_pct is not None and week_all_pct >= week_max:
+        return False, f"七日额度 {week_all_pct}% 到线 {week_max}%"
     rc = runner_config(config).get(runner) or {}
     label = rc.get("models", {}).get(model, {}).get("usage_label")
     if label and model_max is not None and label in (usage.get("per_model") or {}):
         pct = usage["per_model"][label]
-        if pct > model_max:
-            return False, f"模型 {label} 周额度 {pct}% 超线 {model_max}%"
+        if pct >= model_max:
+            return False, f"模型 {label} 周额度 {pct}% 到线 {model_max}%"
     return True, ""
 
 
