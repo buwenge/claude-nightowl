@@ -52,7 +52,14 @@ def times_of(config: dict) -> list[str]:
 
 
 def due(config: dict, now: datetime, state: dict | None = None) -> list[str]:
-    """现在该跑哪些预热时刻：开关开着、本地时间已过该时刻、今天这个时刻还没做过。"""
+    """现在该跑哪些预热时刻：开关开着、本地时间已过该时刻、今天这个时刻还没做过。
+
+    总review二 G14：服务重启时若当天错过了不止一个时刻，逐个真发一句
+    haiku 没有意义——窗口是从最近一次发消息起算的，只有最晚那个过点时刻
+    真正决定接下来的窗口。这里只把它放进返回值，更早的几个直接标 done
+    落盘（跟正常"发过了"同一个记账口径），调用方（scheduler.tick）不会
+    看到、也就不会真的为它们各发一句。
+    """
     cfg = config.get("warmup") or {}
     if not cfg.get("enabled"):
         return []
@@ -63,12 +70,19 @@ def due(config: dict, now: datetime, state: dict | None = None) -> list[str]:
     done_today = set((state.get("done") or {}).get(today) or [])
     if state.get("last_date") == today and not state.get("done"):
         done_today.add(state.get("time") or "")  # 旧格式兼容
-    out = []
+    overdue = []
     for t in times_of(config):
         hour, minute = (int(x) for x in t.split(":"))
         if (local_now.hour, local_now.minute) >= (hour, minute) and t not in done_today:
-            out.append(t)
-    return out
+            overdue.append(t)
+    if len(overdue) <= 1:
+        return overdue
+    skip, latest = overdue[:-1], overdue[-1]
+    new_state = dict(state)
+    new_state["last_date"] = today
+    new_state["done"] = {today: sorted(done_today | set(skip))}
+    store.atomic_write_json(state_path(), new_state)
+    return [latest]
 
 
 def run_warmup(config: dict, now: datetime, timeout: int = 120, slot: str | None = None) -> dict:

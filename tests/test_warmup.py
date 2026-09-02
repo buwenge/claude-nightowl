@@ -30,9 +30,13 @@ def test_due_respects_switch_time_and_once_per_day():
     assert warmup.due(cfg(time_local="乱写"), datetime(2026, 8, 27, 23, 0, tzinfo=timezone.utc)) == []
     store.atomic_write_json(warmup.state_path(), {"done": {"2026-08-28": ["07:00"]}})
     assert warmup.due(cfg(), datetime(2026, 8, 27, 23, 30, tzinfo=timezone.utc)) == []
-    # 多时刻：07:00 做过，18:00 到点再来一次；中午加的 12:30 也算
+    # 多时刻：07:00 做过；12:30、18:00 都过点——总review二 G14 之后只返回
+    # 最晚那个（18:00），12:30 直接标 done，不用真发一句
     two = cfg(times=["07:00", "18:00", "12:30"])
-    assert warmup.due(two, datetime(2026, 8, 28, 10, 5, tzinfo=timezone.utc)) == ["12:30", "18:00"]  # 北京 18:05
+    assert warmup.due(two, datetime(2026, 8, 28, 10, 5, tzinfo=timezone.utc)) == ["18:00"]  # 北京 18:05
+    assert "12:30" in warmup.read_state()["done"]["2026-08-28"]
+    # 再查一次：12:30 已经标 done，18:00 还没做过——不会重复冒出来
+    assert warmup.due(two, datetime(2026, 8, 28, 10, 5, tzinfo=timezone.utc)) == ["18:00"]
 
 
 def test_run_warmup_with_fake_claude(tmp_path, monkeypatch):
