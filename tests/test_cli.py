@@ -108,6 +108,34 @@ def test_add_bad_runner_rejected_by_argparse():
         cli.main(add_args("--runner", "gemini"))
 
 
+def test_run_now_refuses_states_outside_web_whitelist(monkeypatch):
+    """审查 D8：CLI run-now 与网页同名动作认同一份状态白名单——working 的任务
+    不许再 launch 一次（会开第二个窗口）；scheduled 照旧直接开窗。"""
+    from nightshift import launcher, server
+    assert cli.main(add_args()) == 0
+    task_id = store.list_tasks()[0]["task"]["id"]
+    calls = []
+    monkeypatch.setattr(launcher, "launch", lambda tid, cfg: (calls.append(tid), {"state": "working"})[-1])
+    store.update_status(task_id, state="working")
+    assert cli.main(["run-now", task_id]) == 1
+    assert calls == []
+    for state in server._RUN_NOW_STATES:
+        store.update_status(task_id, state=state)
+        assert cli.main(["run-now", task_id]) == 0
+    assert calls == [task_id] * len(server._RUN_NOW_STATES)
+
+
+def test_quota_runner_flag(monkeypatch, capsys):
+    """`quota --runner codex` 走 fetch_usage_codex；缺省走 claude。"""
+    from nightshift import quota
+    monkeypatch.setattr(quota, "fetch_usage_claude", lambda c: {"session_pct": 1, "week_all_pct": 2})
+    monkeypatch.setattr(quota, "fetch_usage_codex", lambda c: {"session_pct": 3, "week_all_pct": 4})
+    assert cli.main(["quota"]) == 0
+    assert '"session_pct": 1' in capsys.readouterr().out
+    assert cli.main(["quota", "--runner", "codex"]) == 0
+    assert '"session_pct": 3' in capsys.readouterr().out
+
+
 def test_serve_once_runs_reconcile_and_tick():
     """--once 也跑一次启动对账：无孤儿也原子写 orphan_worktrees.json = []。"""
     rc = cli.main(["serve", "--once"])

@@ -35,6 +35,23 @@ TMUX_SESSION = "ns-selftest"  # 本仓库测试专用 tmux 会话名，用完即
 WAIT_SECONDS = 40
 
 
+def claude_rc_of(config: dict) -> dict:
+    """S6 起 `runners.claude` 是权威表，顶层 `models`/`claude_bin` 只是兼容快照
+    （两表可能分裂，9/1 就是手工分别加的）；有 runner 表就只看 runner 表。"""
+    runners = config.get("runners")
+    rc = runners.get("claude") if isinstance(runners, dict) else None
+    return rc if isinstance(rc, dict) else {}
+
+
+def models_of(config: dict) -> dict:
+    """要核对的模型表：runners.claude.models 优先，退顶层 models。"""
+    return dict(claude_rc_of(config).get("models") or config.get("models") or {})
+
+
+def claude_bin_of(config: dict) -> str:
+    return claude_rc_of(config).get("bin") or config.get("claude_bin") or "claude"
+
+
 def _tmux(*args: str) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
@@ -97,8 +114,9 @@ def main(argv: list[str]) -> int:
 
     config_path = Path(args.config)
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    models = list((config.get("models") or {}).keys())
-    claude_bin = config.get("claude_bin") or "claude"
+    table = models_of(config)
+    models = list(table.keys())
+    claude_bin = claude_bin_of(config)
     if not models:
         print("config 里没有 models，没得核对。")
         return 1
@@ -114,7 +132,7 @@ def main(argv: list[str]) -> int:
     print("\n=== 核对表（模型 → 探到的 context_window_size → 配置值）===")
     print(f"{'模型':<34}{'探到':>16}{'配置':>14}  一致?")
     for model, size in rows:
-        cur = (config.get("models") or {}).get(model, {}).get("context_limit")
+        cur = (table.get(model) or {}).get("context_limit")
         got = "未知" if size is None else f"{size:,}"
         cur_s = "缺" if cur is None else f"{cur:,}"
         mark = "-" if size is None else ("✓" if size == cur else "×")

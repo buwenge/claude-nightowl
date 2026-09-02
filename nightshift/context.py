@@ -29,8 +29,16 @@ def _usage_from_line(line: str) -> dict | None:
         return None
     if not isinstance(record, dict) or record.get("type") != "assistant":
         return None
+    # CC 在 API 出错 / 本地合成消息时也落 type=assistant 的记录
+    # （isApiErrorMessage=true、message.model="<synthetic>"），usage 全零——
+    # 那不是一次真实携带上下文的回执，排在最后会把水位读成 0（卡片 0%、
+    # Stop 时 over_warn_line=False）。跳过，读它前面那条真回执。
+    if record.get("isApiErrorMessage"):
+        return None
     message = record.get("message")
     if not isinstance(message, dict) or not isinstance(message.get("usage"), dict):
+        return None
+    if message.get("model") == "<synthetic>":
         return None
     return message["usage"]
 
@@ -46,8 +54,11 @@ def _sum_usage(usage: dict) -> int:
 def _scan_lines(lines) -> int | None:
     for line in reversed(lines):
         usage = _usage_from_line(line)
-        if usage is not None:
-            return _sum_usage(usage)
+        if usage is None:
+            continue
+        total = _sum_usage(usage)
+        if total > 0:  # 真回执连 system prompt 都有 token，全零只能是合成记录
+            return total
     return None
 
 

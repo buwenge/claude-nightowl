@@ -79,6 +79,25 @@ def test_read_context_tokens_big_file_over_tail_window(tmp_path):
     assert read_context_tokens(path) == 12345
 
 
+def test_read_context_tokens_skips_api_error_and_synthetic_records(tmp_path):
+    """审查 D7：CC 的 API 错误记录也是 type=assistant（isApiErrorMessage=true、
+    model="<synthetic>"、usage 全零）；排在最后不能把水位读成 0，要读前一条真回执。"""
+    path = tmp_path / "t.jsonl"
+    err = {
+        "type": "assistant", "isApiErrorMessage": True, "error": "server_error",
+        "message": {"model": "<synthetic>", "role": "assistant",
+                    "content": [{"type": "text", "text": "API Error: Server error mid-response."}],
+                    "usage": {"input_tokens": 0, "output_tokens": 0,
+                              "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}},
+    }
+    zero = {"type": "assistant", "message": {"model": "<synthetic>", "usage": {"input_tokens": 0}}}
+    path.write_text("\n".join([usage_rec(5, 400000, 3000), line(err), line(zero)]) + "\n", encoding="utf-8")
+    assert read_context_tokens(path) == 403005
+    # 只有合成记录：如实 None，不是 0
+    path.write_text(line(err) + "\n", encoding="utf-8")
+    assert read_context_tokens(path) is None
+
+
 def test_read_context_tokens_no_usage(tmp_path):
     path = tmp_path / "t.jsonl"
     path.write_text(line({"type": "user", "message": {"content": "hi"}}) + "\n",

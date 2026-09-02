@@ -17,7 +17,7 @@ import re
 import select
 import subprocess
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from .store import atomic_write_json, ensure_dirs, home, runner_config
 
@@ -27,7 +27,6 @@ __all__ = [
     "UsageParseError",
     "UsageUnavailable",
     "check_guards",
-    "fetch_usage",
     "fetch_usage_claude",
     "fetch_usage_codex",
     "load_quota_file",
@@ -62,7 +61,16 @@ def _resets_of(line: str, match: re.Match) -> str | None:
 
 
 def parse_usage(text: str) -> dict:
-    """把 /usage 的输出解析成结构化额度；两行主额度都缺则抛 UsageParseError。"""
+    """把 /usage 的输出解析成结构化额度。
+
+    抛 UsageParseError（fail-closed）的两种情形：
+    - session 与 all models 两行主额度都没认出来；
+    - 认出了单模型周线（`Current week (Fable)` 之类）却没认出 all models 那
+      一行——多半是这一行括号里的措辞变了，被 _RE_WEEK_MODEL 当成一个"模型"
+      收走；这时 week_all_pct 静默 None 会让七日线守卫无声失效、只剩五小时
+      线在拦，宁可显式失败让预检推迟并把原文写进原因。
+    只有 session 一行（没有任何 Current week 行）仍按"周线未知"放过。
+    """
     result: dict = {
         "session_pct": None,
         "session_resets": None,
@@ -92,6 +100,8 @@ def parse_usage(text: str) -> dict:
                 result["per_model_resets"][name] = resets
     if result["session_pct"] is None and result["week_all_pct"] is None:
         raise UsageParseError(text)
+    if result["week_all_pct"] is None and result["per_model"]:
+        raise UsageParseError(text)
     return result
 
 
@@ -112,12 +122,17 @@ def fetch_usage_claude(config: dict, timeout: int = 120) -> dict:
     # "校验按新表、实际查额度按旧表"的分裂；兼容视图从顶层键合成，旧
     # config 行为不变。
     rc = runner_config(config).get("claude") or {}
+    probe_model = rc.get("probe_model")
+    if not probe_model:
+        # None 塞进 argv 会让 subprocess 抛 TypeError——那不是调用方接得住的
+        # UsageUnavailable，会把整轮 tick 掀翻；配置缺失就按"查不到"处理。
+        raise UsageUnavailable("runners.claude.probe_model（或顶层 probe_model）没配，查不了额度")
     cmd = [
         rc.get("bin", "claude"),
         "-p",
         "/usage",
         "--model",
-        rc.get("probe_model"),
+        probe_model,
         "--tools",
         "",
     ]
@@ -138,19 +153,20 @@ def fetch_usage_claude(config: dict, timeout: int = 120) -> dict:
         if isinstance(tail, bytes):
             tail = tail.decode("utf-8", "replace")
         raise UsageUnavailable(f"/usage 超时（{timeout}s）{(tail or '')[-500:]}") from exc
-    except FileNotFoundError as exc:
-        if exc.filename != cmd[0]:
+    except OSError as exc:
+        if isinstance(exc, FileNotFoundError) and exc.filename != cmd[0]:
             raise  # 不是可执行文件不在（比如 cwd 建不出来），原样上抛
-        raise UsageUnavailable(f"找不到 claude 可执行文件：{cmd[0]}") from exc
+        # 找不到 / 没执行权限 / 其余起不了进程的错，都算"查不到"
+        raise UsageUnavailable(f"起不了 claude（{cmd[0]}）：{exc}") from exc
     if proc.returncode != 0:
         raise UsageUnavailable(f"/usage 退出码 {proc.returncode}：{proc.stderr[-500:]}")
     return parse_usage(proc.stdout)
 
 
-# 向后兼容别名：__main__.py 的 `nightshift quota` 子命令与一期测试仍按老名字
-# 调用，语义原样不变（就是查 Claude 的额度）。S6 起新代码一律显式写
-# fetch_usage_claude / fetch_usage_codex，不再用这个没有 runner 语义的名字。
-fetch_usage = fetch_usage_claude
+# 审查 D（9/2）：删掉了 `fetch_usage = fetch_usage_claude` 这个兼容别名——
+# test_warmup 曾 monkeypatch 这个别名，而 scheduler 调的是 fetch_usage_claude，
+# 补丁落空导致每跑一次测试就真起一次 `claude -p /usage`。两个名字指同一个
+# 函数就是这种坑，只留带 runner 语义的那个。
 
 
 _RE_RESETS_AT = re.compile(r"([A-Z][a-z]{2}) (\d{1,2}), (\d{1,2})(?::(\d{2}))?(am|pm)\s*\((UTC)\)")
@@ -159,8 +175,10 @@ _RE_RESETS_AT = re.compile(r"([A-Z][a-z]{2}) (\d{1,2}), (\d{1,2})(?::(\d{2}))?(a
 def resets_in_minutes(resets_text: str | None, now: datetime | None = None) -> int | None:
     """把 /usage 的 `Aug 27, 6:40pm (UTC)` 换算成"距现在几分钟刷新"（向上取整，最小 0）。
 
-    认不出来（格式变了 / 不是 UTC）返回 None，调用方按未知处理。年份按当前年，
-    若算出来在一天前以上，视为跨年取下一年。
+    认不出来（格式变了 / 不是 UTC）返回 None，调用方按未知处理。/usage 不给年份：
+    resets 只会落在"过去一天内 ~ 未来八天内"，在去年/今年/明年三个候选里取离
+    现在最近的那个——跨年那几分钟缓存里还是 12 月 31 日，按"当前年"硬解析会
+    算成明年 12 月 31 日（52 万分钟，hook 会排出上万个闹钟）。
     """
     if not resets_text:
         return None
@@ -173,17 +191,35 @@ def resets_in_minutes(resets_text: str | None, now: datetime | None = None) -> i
         hour += 12
     if ampm == "am" and hour == 12:
         hour = 0
-    try:
-        when = datetime.strptime(f"{now.year} {mon} {day} {hour}:{minute}", "%Y %b %d %H:%M").replace(tzinfo=timezone.utc)
-    except ValueError:
+    candidates = []
+    for year in (now.year - 1, now.year, now.year + 1):
+        try:
+            candidates.append(
+                datetime.strptime(f"{year} {mon} {day} {hour}:{minute}", "%Y %b %d %H:%M")
+                .replace(tzinfo=timezone.utc)
+            )
+        except ValueError:
+            continue  # 比如非闰年的 2 月 29 日
+    if not candidates:
         return None
-    if when < now - timedelta(days=1):
-        when = when.replace(year=now.year + 1)
+    when = min(candidates, key=lambda d: abs((d - now).total_seconds()))
     return max(0, math.ceil((when - now).total_seconds() / 60))
 
 
 class AppServerTimeout(UsageUnavailable):
     """codex app-server 在给定超时内没有回应/退出（连不上、卡死、协议不对）。"""
+
+
+def _pct_to_int(value) -> int | None:
+    """usedPercent 取整。codex 核心协议里 used_percent 是 f64（本机 rollout
+    里落成 `47.0`），app-server 转出来可能是 `12` 也可能是 `12.0`——两种都认，
+    浮点向上取整（宁可早拦半个点）；bool/字符串/NaN/缺失 → None，不造数。
+    只认 int 会把 12.0 丢成 None，守卫从此全放行（fail-open）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+    return int(math.ceil(value))
 
 
 def _epoch_to_iso(value) -> str | None:
@@ -216,7 +252,7 @@ def normalize_codex_ratelimits(result: dict) -> dict:
         mins = window.get("windowDurationMins")
         pct = window.get("usedPercent")
         entry = {
-            "used_pct": pct if isinstance(pct, int) else None,
+            "used_pct": _pct_to_int(pct),
             "window_minutes": mins,
             "resets_at": _epoch_to_iso(window.get("resetsAt")),
         }
@@ -240,19 +276,54 @@ def normalize_codex_ratelimits(result: dict) -> dict:
     }
 
 
-def _read_jsonl_response(proc: subprocess.Popen, want_id: int, deadline: float) -> dict:
+class _LineReader:
+    """按行读 app-server 的 stdout：select 盯裸 fd + os.read 进自己的缓冲区。
+
+    审查 D11：不能用 TextIOWrapper.readline()——服务端把一条通知和真正的响应
+    放在同一次 write 里（或两行一起到达）时，第二行留在 Python 的读缓冲里，
+    fd 层面不再"可读"，select 会一直等到 deadline 才报超时（15 s 后
+    fail-closed 推迟，Codex 任务整夜起不来）。
+    """
+
+    def __init__(self, fd: int):
+        self.fd = fd
+        self.buf = bytearray()
+        self.eof = False
+
+    def readline(self, deadline: float) -> bytes | None:
+        """返回一行（不含换行）；EOF 且缓冲空返回 None；到 deadline 抛 AppServerTimeout。"""
+        while True:
+            nl = self.buf.find(b"\n")
+            if nl >= 0:
+                line = bytes(self.buf[:nl])
+                del self.buf[: nl + 1]
+                return line
+            if self.eof:
+                if self.buf:
+                    line = bytes(self.buf)
+                    self.buf.clear()
+                    return line
+                return None
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise AppServerTimeout("codex app-server 超时")
+            ready, _, _ = select.select([self.fd], [], [], remaining)
+            if not ready:
+                continue
+            chunk = os.read(self.fd, 65536)
+            if not chunk:
+                self.eof = True
+            else:
+                self.buf += chunk
+
+
+def _read_jsonl_response(reader: _LineReader, want_id: int, deadline: float) -> dict:
     """从 app-server 的 stdout 按行读 JSON，直到拿到 id 匹配的那条或超时/EOF。"""
     while True:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            raise AppServerTimeout("codex app-server 超时")
-        ready, _, _ = select.select([proc.stdout], [], [], remaining)
-        if not ready:
-            continue
-        line = proc.stdout.readline()
-        if not line:
+        line = reader.readline(deadline)
+        if line is None:
             raise AppServerTimeout("codex app-server 提前退出（EOF）")
-        line = line.strip()
+        line = line.decode("utf-8", "replace").strip()
         if not line:
             continue
         try:
@@ -286,20 +357,21 @@ def fetch_usage_codex(config: dict, timeout: float = 15.0) -> dict:
         raise UsageUnavailable(f"找不到 codex 可执行文件：{bin_path}") from exc
 
     deadline = time.time() + timeout
+    reader = _LineReader(proc.stdout.fileno())  # 只从这里读 stdout，不碰 proc.stdout 的文本缓冲
     try:
         proc.stdin.write(json.dumps({
             "id": 1, "method": "initialize",
             "params": {"clientInfo": {"name": "nightshift", "version": "1"}},
         }) + "\n")
         proc.stdin.flush()
-        _read_jsonl_response(proc, 1, deadline)
+        _read_jsonl_response(reader, 1, deadline)
         proc.stdin.write(json.dumps({"method": "initialized", "params": {}}) + "\n")
         proc.stdin.flush()
         proc.stdin.write(json.dumps({
             "id": 2, "method": "account/rateLimits/read", "params": {},
         }) + "\n")
         proc.stdin.flush()
-        resp = _read_jsonl_response(proc, 2, deadline)
+        resp = _read_jsonl_response(reader, 2, deadline)
     except AppServerTimeout:
         raise
     except OSError as exc:
@@ -352,7 +424,11 @@ def load_quota_file() -> dict:
         return empty
     if "claude" not in data and "codex" not in data:
         return {"claude": data, "codex": {}}  # 一期旧形状：整份就是 claude 那份
-    return {"claude": data.get("claude") or {}, "codex": data.get("codex") or {}}
+    # 分片不是对象（手改/写坏）按空壳，消费方一律 slice_.get(...)，不能炸
+    return {
+        runner: (data.get(runner) if isinstance(data.get(runner), dict) else {})
+        for runner in ("claude", "codex")
+    }
 
 
 def write_quota_runner(runner: str, payload: dict) -> dict:
@@ -389,18 +465,38 @@ def check_guards(
     `config.models`（那只是 Claude 的兼容视图）——Codex 任务传自己的
     `runner="codex"` 就不会被 Claude 那张表误判。
     """
-    session_max = guards["session_pct_max"]
-    week_max = guards["weekly_pct_max"]
-    session_pct = usage["session_pct"]
-    week_all_pct = usage["week_all_pct"]
-    if session_pct is not None and session_pct > session_max:
+    cfg_guards = config.get("guards") or {}
+
+    def line(key: str, fallback=None):
+        # 任务 guards 里缺这条线或为 null → 回退 config.guards（与 create_task
+        # 的合并语义一致：网页编辑把某条线清空就是"回到默认"，server 只做
+        # task.update 不回填）。以前直接 guards["session_pct_max"] 会 KeyError，
+        # _try_launch 抛出去让整轮 tick 中止，排在后面的任务全部不处理。
+        value = guards.get(key)
+        if value is None:
+            value = cfg_guards.get(key)
+        return fallback if value is None else value
+
+    session_max = line("session_pct_max")
+    week_max = line("weekly_pct_max")
+    model_max = line("model_weekly_pct_max", week_max)
+    for name, value in (
+        ("session_pct_max", session_max),
+        ("weekly_pct_max", week_max),
+        ("model_weekly_pct_max", model_max),
+    ):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+            return False, f"guards.{name} 不是数字：{value!r}（fail-closed）"
+    # 某条线两处都没配 = 运维明确不设这条线，跳过（与 hook._quota_check 一致）
+    session_pct = usage.get("session_pct")
+    week_all_pct = usage.get("week_all_pct")
+    if session_max is not None and session_pct is not None and session_pct > session_max:
         return False, f"五小时额度 {session_pct}% 超线 {session_max}%"
-    if week_all_pct is not None and week_all_pct > week_max:
+    if week_max is not None and week_all_pct is not None and week_all_pct > week_max:
         return False, f"七日额度 {week_all_pct}% 超线 {week_max}%"
     rc = runner_config(config).get(runner) or {}
     label = rc.get("models", {}).get(model, {}).get("usage_label")
-    model_max = guards.get("model_weekly_pct_max", week_max)
-    if label and label in usage.get("per_model", {}):
+    if label and model_max is not None and label in (usage.get("per_model") or {}):
         pct = usage["per_model"][label]
         if pct > model_max:
             return False, f"模型 {label} 周额度 {pct}% 超线 {model_max}%"
@@ -410,4 +506,4 @@ def check_guards(
 if __name__ == "__main__":
     from .store import load_config
 
-    print(json.dumps(fetch_usage(load_config()), ensure_ascii=False, indent=2))
+    print(json.dumps(fetch_usage_claude(load_config()), ensure_ascii=False, indent=2))
