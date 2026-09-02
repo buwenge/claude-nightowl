@@ -1012,19 +1012,31 @@ def _check_running(
     stuck_minutes = sch.get("stuck_minutes")
     if stuck_minutes is None:
         stuck_minutes = 15  # config 没写时的兜底（与 config.example.json 一致）
+    # 总review二 G12：waiting_background 用更宽的阈值——Claude 没有 Codex
+    # 那套心跳新鲜度豁免（codex_has_fresh_background），15 分钟对一个合法
+    # 的长后台任务太紧，会把正常挂着等后台完成的任务标成"疑似卡住"，配了
+    # auto_interrupt_minutes 时还会被按 Esc 打断。working（前台工具调用里
+    # 卡住）继续用原来的 stuck_minutes。
+    stuck_minutes_background = sch.get("stuck_minutes_background")
+    if stuck_minutes_background is None:
+        stuck_minutes_background = 60  # 与 config.example.json 一致
+    effective_stuck_minutes = (
+        stuck_minutes_background if status.get("state") == "waiting_background"
+        else stuck_minutes
+    )
     stuck = False
     if (
         not codex_has_fresh_background
         and status.get("state") in ("working", "waiting_background")
-        and stuck_minutes > 0
+        and effective_stuck_minutes > 0
         and status.get("last_event_at")
     ):
-        stuck = now - parse_iso(status["last_event_at"]) >= timedelta(minutes=stuck_minutes)
+        stuck = now - parse_iso(status["last_event_at"]) >= timedelta(minutes=effective_stuck_minutes)
     if stuck and not status.get("stuck"):
         store.update_status(task_id, stuck=True, stuck_since=to_iso(now))
         store.append_event(
             task_id,
-            f"疑似卡住：已经 {stuck_minutes} 分钟没有任何 hook 事件（可能卡在一条工具调用里）",
+            f"疑似卡住：已经 {effective_stuck_minutes} 分钟没有任何 hook 事件（可能卡在一条工具调用里）",
         )
     # 可选自动中止：guards.auto_interrupt_minutes（默认关）。stuck 持续超过它
     # 就往窗口按一次 Esc；auto_interrupted 落盘防重复。

@@ -104,6 +104,7 @@
     "keepalive_idle_minutes": 50,
     "keepalive_text": "来自nightshift：保活探针——背景任务还在跑吗？简短回一句即可。",
     "stuck_minutes": 15,
+    "stuck_minutes_background": 60,
     "launching_timeout_minutes": 10,
     "background_heartbeat_stale_seconds": 90
   },

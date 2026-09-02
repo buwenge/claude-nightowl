@@ -767,9 +767,12 @@ def test_stuck_marked_after_silence_and_not_repeated(monkeypatch):
 
 def test_stuck_uses_configured_minutes(monkeypatch):
     Fakes(monkeypatch)
+    # G12 之后 working 用 stuck_minutes、waiting_background 用
+    # stuck_minutes_background——这条测的是前者，后者见
+    # test_stuck_background_uses_wider_configured_threshold。
     tid = make_task(title="按配置判卡")
     stale = scheduler.to_iso(NOW - timedelta(minutes=6))
-    store.update_status(tid, state="waiting_background", window_id="@54",
+    store.update_status(tid, state="working", window_id="@54",
                         pane_pid=NO_PID, last_event_at=stale)
     config = {**CONFIG, "scheduler": {**CONFIG["scheduler"], "stuck_minutes": 5}}
     scheduler.tick(config, NOW)
@@ -781,6 +784,40 @@ def test_stuck_uses_configured_minutes(monkeypatch):
     config_off = {**CONFIG, "scheduler": {**CONFIG["scheduler"], "stuck_minutes": 0}}
     scheduler.tick(config_off, NOW)
     assert not store.read_status(other).get("stuck")
+
+
+def test_stuck_background_uses_wider_configured_threshold(monkeypatch):
+    """总review二 G12：waiting_background 对着 stuck_minutes_background
+    （默认 60）算，不是 stuck_minutes（默认 15）——合法的长后台任务
+    （>15 分钟）不该被标卡住；30 分钟不标，70 分钟标。working 不受这个新
+    键影响，仍然按 stuck_minutes。"""
+    Fakes(monkeypatch)
+    tid = make_task(title="等长后台")
+    store.update_status(
+        tid, state="waiting_background", window_id="@60", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=30)),
+    )
+    scheduler.tick(CONFIG, NOW)  # CONFIG 没配，走默认 60 分钟
+    assert not store.read_status(tid).get("stuck")
+
+    store.update_status(
+        tid, last_event_at=scheduler.to_iso(NOW - timedelta(minutes=70)),
+    )
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["stuck"] is True
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "已经 60 分钟没有任何 hook 事件" in events
+
+    # 可配置：调小阈值后，30 分钟也该标
+    other = make_task(title="调小阈值")
+    store.update_status(
+        other, state="waiting_background", window_id="@61", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=30)),
+    )
+    config = {**CONFIG, "scheduler": {**CONFIG["scheduler"], "stuck_minutes_background": 20}}
+    scheduler.tick(config, NOW)
+    assert store.read_status(other)["stuck"] is True
 
 
 def test_auto_interrupt_fires_once(monkeypatch):
