@@ -285,6 +285,40 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
     return None, "", {}
 
 
+def _drop_expired_quota_pause(task: dict, status: dict, now_iso: str) -> bool:
+    """总review F2：闹钟响完模型自己接着干、干完收工之后，`quota_paused_until`
+    若还留在 status 里，调度器下一 tick 会把它当"还没恢复"补敲一句"额度应
+    已刷新，请继续"——模型其实早就自己继续/收工了，多烧一轮、还把换班判定
+    推迟一轮（9/1 真机 `ce5f` 任务实录）。
+
+    只对 Claude build 角色清：
+    - Codex 没有 ScheduleWakeup，闹钟到点必须由调度器主动 send-keys 叫醒
+      （`_check_running` 的五小时暂停分支/F3），这里不能替它清掉，否则
+      调度器再也不会去敲它；
+    - review 角色的 hold/resume 协议依赖 `quota_paused_until`
+      （`scheduler._check_running` 的 review-hold 恢复分支、
+      `_review_hold_resume_eta`），提前清掉会让恢复分支永远等不到。
+
+    调用方必须在 `store.modify_status` 的锁内闭包里直接对 status 原地操作
+    （不经过 `update_status`），返回 True 时由调用方记一笔 events。
+    """
+    if store.effective_runner(task) != "claude" or store.role_of(task) == "review":
+        return False
+    paused_until = status.get("quota_paused_until")
+    if not paused_until:
+        return False
+    try:
+        now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        paused_dt = datetime.fromisoformat(paused_until.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if now < paused_dt:
+        return False
+    status.pop("quota_paused_until", None)
+    status.pop("quota_resume_sent", None)
+    return True
+
+
 def _refresh_context(task: dict, payload: dict, fields: dict) -> None:
     """读 transcript 刷新 context_tokens / context_pct（读不到就置 None）。
 
@@ -810,6 +844,12 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             # 这里不能抢先覆盖成 working。
             if not status.get("build_control_kind") and not status.get("review_control_kind"):
                 status["state"] = "working"
+                # F2：不是控制 turn 说明模型自己真的又开了一轮——如果它是自己
+                # 缓存闹钟醒来接着干，残留的 quota_paused_until 该在这里清掉。
+                if _drop_expired_quota_pause(task, status, now):
+                    store.append_event(
+                        task_id, "额度刷新时间已过，会话已自行继续/收工，取消调度器补敲"
+                    )
             status["turns"] = int(status.get("turns") or 0) + 1
             status["session_id"] = payload.get("session_id")
             status["transcript_path"] = payload.get("transcript_path")
@@ -984,6 +1024,13 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             # state 不是 held，会落到这里按 payload 重算——build_control_kind
             # 必须在这里消费掉，不能残留到下一次 Stop 被误判成控制 turn。
             status.pop("build_control_kind", None)
+            # F2：这一支是"真正收工/自己设了新闹钟"的普通 Stop（不是控制
+            # turn）——闹钟响完模型自己继续干完这一轮的场景也会落到这里，
+            # 顺手把过期的 quota_paused_until 清掉。
+            if _drop_expired_quota_pause(task, status, now):
+                store.append_event(
+                    task_id, "额度刷新时间已过，会话已自行继续/收工，取消调度器补敲"
+                )
 
         store.modify_status(task_id, clear_stuck_cycle)
         store.append_event(task_id, f"hook Stop → {fields['state']}")

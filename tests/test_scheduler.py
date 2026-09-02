@@ -1364,6 +1364,34 @@ def test_waiting_wakeup_not_finished_nor_poked(monkeypatch):
     assert len(sent) == 1
 
 
+def test_idle_after_alarm_expired_and_hook_cleared_pause_not_repoked(monkeypatch):
+    """F2 反例（原 A 组报告 N2，反例 test_a6）：Claude build 五小时线到线
+    自己设了缓存闹钟（waiting_wakeup）→ 闹钟响完自己接着干、干完写交接、
+    Stop——hook 这次 Stop 已经按 F2 清掉过期的 quota_paused_until，调度器
+    这一 tick 不该再补敲"额度应已刷新，请继续"，而是正常进入换班判定。"""
+    from nightshift import hook
+
+    fakes = Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    paused_until = NOW + timedelta(hours=2)
+    store.update_status(tid, state="waiting_wakeup", window_id="@1", pane_pid=NO_PID,
+                        quota_paused_until=scheduler.to_iso(paused_until),
+                        session_crons=[{"id": "c1"}], last_event_at=scheduler.to_iso(NOW))
+    _write_handover(tid, "干完了。\nNEXT: done")
+    # 闹钟响完模型自己接着干完，干完写交接、Stop（没有闹钟了）；hook 用的
+    # 是真实墙上时钟（store.utc_now_iso()），paused_until 落在测试用的固定
+    # NOW 附近，早已过去，这次 Stop 会把它清掉。
+    hook.handle_event(tid, "Stop", {"last_assistant_message": "干完了。\nNEXT: done"})
+    status = store.read_status(tid)
+    assert status["state"] == "idle"
+    assert "quota_paused_until" not in status  # F2：hook 已经清掉
+
+    scheduler.tick(CONFIG, paused_until + timedelta(minutes=30))
+    resumes = [t for _, t in fakes.send_keys_calls if "额度应已刷新" in t]
+    assert resumes == [], f"quota_paused_until 已经被 hook 清掉，调度器不该再敲：{resumes}"
+    assert store.read_status(tid)["state"] == "finished"
+
+
 # ---------- S6③：Codex 额度、按 runner 预检、缓存唤醒、保活分家 ----------
 
 CODEX_CONFIG = {

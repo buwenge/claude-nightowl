@@ -1415,6 +1415,77 @@ def test_hook_events_clear_stuck_cycle():
     assert_recovered()
 
 
+# ---------- 总review F2：额度刷新时间过后自己清 quota_paused_until ----------
+
+
+def test_user_prompt_submit_drops_expired_quota_pause():
+    task_id = make_task()
+    store.update_status(
+        task_id, state="waiting_wakeup", quota_paused_until="2020-01-01T00:00:00Z",
+        quota_resume_sent=False, session_crons=[{"id": "c1"}],
+    )
+    proc = run_hook(task_id, "UserPromptSubmit", fixture("hook_userpromptsubmit.json"))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert "quota_paused_until" not in status
+    assert "quota_resume_sent" not in status
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "额度刷新时间已过，会话已自行继续/收工，取消调度器补敲" in events
+
+
+def test_user_prompt_submit_keeps_quota_pause_still_in_future():
+    task_id = make_task()
+    future = (datetime.now(timezone.utc) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.update_status(
+        task_id, state="waiting_wakeup", quota_paused_until=future, quota_resume_sent=False,
+    )
+    run_hook(task_id, "UserPromptSubmit", fixture("hook_userpromptsubmit.json"))
+    status = store.read_status(task_id)
+    assert status["quota_paused_until"] == future
+
+
+def test_user_prompt_submit_control_turn_does_not_drop_quota_pause():
+    """控制 turn（调度器投递的保活/我来看）不该顺带把过期的
+    quota_paused_until 也清掉——那不是模型自己真的又开工了。"""
+    task_id = make_task()
+    store.update_status(
+        task_id, state="held", quota_paused_until="2020-01-01T00:00:00Z",
+        build_control_kind="keepalive",
+    )
+    run_hook(task_id, "UserPromptSubmit", fixture("hook_userpromptsubmit.json"))
+    status = store.read_status(task_id)
+    assert status["quota_paused_until"] == "2020-01-01T00:00:00Z"
+
+
+def test_user_prompt_submit_review_role_does_not_drop_quota_pause():
+    """review 的 hold/resume 协议靠 quota_paused_until 触发调度器主动叫醒，
+    hook 侧提前清掉会让 review 永久卡在 held。"""
+    task_id = make_review_task()
+    store.update_status(
+        task_id, state="held", quota_paused_until="2020-01-01T00:00:00Z",
+    )
+    run_hook(task_id, "UserPromptSubmit", fixture("hook_userpromptsubmit.json"))
+    status = store.read_status(task_id)
+    assert status["quota_paused_until"] == "2020-01-01T00:00:00Z"
+
+
+def test_stop_idle_drops_expired_quota_pause():
+    """闹钟响完模型自己继续、干完、Stop → idle：过期的 quota_paused_until
+    要在这次 Stop 里清掉，调度器下一 tick 才不会误判"还没恢复"再补敲一句。"""
+    task_id = make_task()
+    store.update_status(
+        task_id, state="waiting_wakeup", quota_paused_until="2020-01-01T00:00:00Z",
+        quota_resume_sent=False,
+    )
+    run_hook(task_id, "Stop", fixture("hook_stop_idle.json"))
+    status = store.read_status(task_id)
+    assert status["state"] == "idle"
+    assert "quota_paused_until" not in status
+    assert "quota_resume_sent" not in status
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "额度刷新时间已过，会话已自行继续/收工，取消调度器补敲" in events
+
+
 # ---------- S6：Codex hook（--codex 调用形状，NIGHTOWL_TASK_ID 路由）----------
 
 
