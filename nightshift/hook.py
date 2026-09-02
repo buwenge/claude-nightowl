@@ -24,10 +24,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import store
-from .context import context_limit_for, read_context_tokens
+from .context import context_limit_for, read_codex_context, read_context_tokens
 
 __all__ = [
-    "alarm_plan", "handle_event", "handover_path", "main",
+    "alarm_plan", "commit_step", "handle_event", "handover_path", "main",
     "review_file_path", "warn_threshold",
 ]
 
@@ -111,9 +111,17 @@ def _context_limit(task: dict, config: dict) -> int:
     return context_limit_for(store.effective_model(task), config, runner="claude")
 
 
-def warn_threshold(task: dict, config: dict) -> int:
+def warn_threshold(task: dict, config: dict, limit: int | None = None) -> int:
     """回注警戒线（tokens）：guards.context_warn_tokens 有就用；
-    否则 context_warn_ratio × 上下文上限（上限算法同 _refresh_context）。"""
+    否则 context_warn_ratio × 上下文上限（上限算法同 _refresh_context）。
+
+    总review三 H2：`limit` 允许调用方直接传入已经测得的上限——Codex 走
+    `_context_limit`（内部按 runner="claude" 查模型表）查不到东西
+    （`context_limit_for` 对非 claude runner 恒定 None），它自己的上限只能
+    从 rollout 现读（`context.read_codex_context` 的 `model_context_window`），
+    调用方测出来多少就传多少。不传时保持原样，走 `_context_limit`（Claude
+    走这条）。
+    """
     guards = task.get("guards") or {}
     explicit = guards.get("context_warn_tokens")
     if explicit is not None:
@@ -123,12 +131,19 @@ def warn_threshold(task: dict, config: dict) -> int:
         ratio = (config.get("guards") or {}).get("context_warn_ratio")
     if ratio is None:
         raise ValueError("guards 里既没有 context_warn_tokens 也没有 context_warn_ratio")
-    return int(ratio * _context_limit(task, config))
+    if limit is None:
+        limit = _context_limit(task, config)
+    return int(ratio * limit)
 
 
-def _commit_step(task: dict) -> str:
+def commit_step(task: dict) -> str:
     """收尾话术里的 commit 那一步：工作树任务由调度器打存档点，渲染成空；
-    老式任务（worktree=false）保留"把未提交的改动 commit"的原规矩。"""
+    老式任务（worktree=false）保留"把未提交的改动 commit"的原规矩。
+
+    总review三 H3：scheduler.py 的 Codex 上下文收尾提醒（send-keys 投递，
+    hook 的 stdout 回注对 Codex 不成立）复用这条渲染同一个占位符，不再各
+    写一份——原来是模块内部私有的 `_commit_step`，改成公开名字。
+    """
     return "" if store.worktree_enabled(task) else "把未提交的改动 commit；"
 
 
@@ -295,7 +310,7 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
                 model_line_left=100 - model_max,
                 model_note=model_note,
                 handover_path=str(handover_path(task)),
-                commit_step=_commit_step(task),
+                commit_step=commit_step(task),
             )
         return "wrapup", text, {}
 
@@ -418,15 +433,15 @@ def _drop_expired_quota_pause(task: dict, status: dict, now_iso: str) -> bool:
 
 
 def _refresh_context(task: dict, payload: dict, fields: dict) -> None:
-    """读 transcript 刷新 context_tokens / context_pct（读不到就置 None）。
+    """读 Claude transcript 刷新 context_tokens / context_pct（读不到就置 None）。
 
     算上限失败（config 缺/坏）只记 events.log，不拖垮整个事件：
     context_tokens 照常写，context_pct 留空。
 
-    S6：Codex 没有稳定的上下文水位来源（官方明说 rollout 格式非稳定接口，
-    开工令据此把 config.runners.codex.models.context_limit 定死成 null）——
-    恒定置 None，不去解析 Codex 的 rollout jsonl（那是另一套格式，
-    read_context_tokens 认的是 Claude transcript 的 assistant usage 记录）。
+    只服务 Claude——Codex 走配对的 `_refresh_context_codex`（总review三 H1/
+    H2：Codex 的水位来自 rollout 自己带的 token_count 记录，跟 Claude
+    transcript 的 assistant usage 记录是两套完全不同的格式，`config` 里也
+    没有稳定的模型表可查，`_context_limit` 对它恒定查不到东西）。
     """
     fields["context_tokens"] = None
     fields["context_pct"] = None
@@ -451,6 +466,36 @@ def _refresh_context(task: dict, payload: dict, fields: dict) -> None:
         return
     if limit:
         fields["context_pct"] = round(100 * tokens / limit)
+
+
+def _refresh_context_codex(task: dict, payload: dict, fields: dict) -> None:
+    """读 Codex rollout 刷新 context_tokens / context_limit / context_pct
+    （读不到就置 None）。跟 `_refresh_context`（Claude）配对，上限来源不同：
+
+    Codex 在 config 里的上下文上限恒为 null（S6.1 B3 的设计决定：
+    `context_limit_for` 对非 claude runner 如实返回 None，不编数字），只能
+    从 rollout 自己带的 `model_context_window` 现读；任务
+    `guards.context_limit_tokens` 仍然优先（跟 `_context_limit` 同一个优先
+    级口径），因此测得的上限落进新字段 `status.context_limit`，不写回
+    config（那是 Claude 的字段来源）。
+    """
+    fields["context_tokens"] = None
+    fields["context_limit"] = None
+    fields["context_pct"] = None
+    transcript_path = payload.get("transcript_path")
+    if not transcript_path:
+        return
+    found = read_codex_context(transcript_path)
+    if found is None:
+        return
+    tokens, window = found
+    fields["context_tokens"] = tokens
+    guard_limit = (task.get("guards") or {}).get("context_limit_tokens")
+    limit = int(guard_limit) if guard_limit else window
+    if not limit:
+        return
+    fields["context_limit"] = limit
+    fields["context_pct"] = round(100 * tokens / limit)
 
 
 # S8 审查 B：上下文水位不再只按"固定每 20 次工具调用"刷。审稿班一次 Read 吞
@@ -494,6 +539,55 @@ def _refresh_growth_bytes(task: dict) -> int:
         _REFRESH_GROWTH_MIN_BYTES,
         int(limit * _REFRESH_GROWTH_RATIO * _REFRESH_GROWTH_BYTES_PER_TOKEN),
     )
+
+
+def _decide_refresh(
+    status: dict, now: str, calls: int, size: int | None, growth_limit: int
+) -> tuple[bool, bool]:
+    """这次 PostToolUse 该不该刷新水位——Claude、Codex 两条 PostToolUse 分支
+    共用同一套节奏判定（总review三 H2：Codex 以前这里只计数，现在补齐跟
+    Claude 一样的刷新节奏，不许各写一份）：每 `_REFRESH_EVERY_CALLS` 次一刷；
+    或上次该刷却欠着的补刷（`was_pending`——Codex 不做子 agent 判定，这个
+    分支恒为 False，见 `handle_event` 里 Codex PostToolUse 分支的说明）；
+    或距上次刷新已经过了 `_REFRESH_MAX_INTERVAL_SECONDS`；或 transcript
+    长得太快提前触发（`size`/`growth_limit`，S8 审查 B）。
+
+    副作用：原地更新 `status` 的 `context_refresh_pending` /
+    `context_refresh_size` / `context_refreshed_at` 三个字段——调用方必须
+    在 `store.modify_status` 的锁内闭包里调用。返回 `(refresh, was_pending)`。
+    """
+    was_pending = bool(status.get("context_refresh_pending"))
+    refreshed_at = status.get("context_refreshed_at")
+    time_trigger = False
+    if refreshed_at:
+        try:
+            elapsed = (
+                datetime.fromisoformat(now.replace("Z", "+00:00"))
+                - datetime.fromisoformat(refreshed_at.replace("Z", "+00:00"))
+            ).total_seconds()
+            time_trigger = elapsed >= _REFRESH_MAX_INTERVAL_SECONDS
+        except ValueError:
+            time_trigger = False
+    refresh = False
+    if calls % _REFRESH_EVERY_CALLS == 0 or was_pending or time_trigger:
+        refresh = True  # 每 20 次一刷；或欠着的补刷；或距上次刷新太久了
+    elif size is not None:
+        base = status.get("context_refresh_size")
+        if base is None or size < base:
+            # 没基线（或换了文件/被截断）：只登记基线，不刷
+            status["context_refresh_size"] = size
+        elif size - base >= growth_limit:
+            refresh = True  # transcript 长得太快，提前刷（见 _REFRESH_GROWTH_*）
+    if refresh:
+        status.pop("context_refresh_pending", None)
+        if size is not None:
+            status["context_refresh_size"] = size
+        status["context_refreshed_at"] = now
+    elif refreshed_at is None:
+        # F5：从没记过刷新时刻（老状态/这一班第一次调用）——先登记
+        # 一个起点，不强行触发刷新（不然每个任务第一次调用就必刷）。
+        status["context_refreshed_at"] = now
+    return refresh, was_pending
 
 
 def _is_subagent_call(payload: dict) -> bool:
@@ -577,7 +671,7 @@ def _post_tool_use_refresh(task: dict, status: dict, payload: dict) -> str | Non
                             ctx_k=round(tokens / 1000),
                             limit_k=round(limit / 1000),
                             handover_path=str(handover_path(task)),
-                            commit_step=_commit_step(task),
+                            commit_step=commit_step(task),
                         )
                         inject.append(ctx)
                         count = int(status.get("context_warn_count") or 0) + 1
@@ -619,6 +713,42 @@ def _post_tool_use_refresh(task: dict, status: dict, payload: dict) -> str | Non
     if extra:
         store.update_status(task_id, **extra)
     return "\n\n".join(inject) if inject else None
+
+
+def _post_tool_use_refresh_codex(task: dict, status: dict, payload: dict) -> None:
+    """Codex 版本的刷新 + 到线判定：只刷水位、判到线，不回注——Codex 没有
+    stdout 回注这条路（模块开头说明），到线只落 `context_warn_pending`，
+    真正 send-keys 投递交给 `scheduler._check_codex_context_warn`（总review
+    三 H3）。跟 `_post_tool_use_refresh`（Claude）配对，但不做额度判定
+    ——Codex 的额度到线走 `scheduler._check_codex_quota_pause` 那条独立的
+    路（S6③已有），这里不重复。
+    """
+    task_id = task["id"]
+    now = store.utc_now_iso()
+    fields: dict = {}
+    _refresh_context_codex(task, payload, fields)
+    store.update_status(task_id, **fields)
+    store.append_event(
+        task_id, f"hook PostToolUse(codex) #{status['tool_calls']} 刷新上下文"
+    )
+
+    tokens = fields.get("context_tokens")
+    limit = fields.get("context_limit")
+    if tokens is None or not limit:
+        return
+    if status.get("context_warned_at") or status.get("context_warn_pending"):
+        return  # 已经提醒过、或已经在等调度器投递，不重复判定/不刷屏 events.log
+    try:
+        threshold = warn_threshold(task, store.load_config(), limit=limit)
+    except Exception as exc:
+        store.append_event(task_id, f"算不出警戒线：{exc!r}")
+        return
+    if tokens >= threshold:
+        store.update_status(task_id, context_warn_pending=True)
+        store.append_event(
+            task_id,
+            f"上下文到线，待调度器敲收尾提醒（{tokens} tokens / 上限 {limit}）",
+        )
 
 
 # ---------- S7：审稿意见文件协议（只读班如何交付文件） ----------
@@ -1092,6 +1222,10 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             "last_event_at": now,
         }
         fields["state"] = "waiting_wakeup" if status_now.get("quota_paused_until") else "idle"
+        # 总review三 H2：Codex 的 Stop 也刷新一次水位（跟 Claude 的 Stop 一样
+        # 只刷不注——到线判定/send-keys 投递只在 PostToolUse 那条路做，见
+        # `_post_tool_use_refresh_codex`）。
+        _refresh_context_codex(task, payload, fields)
 
         def clear_stuck_cycle_codex(status: dict) -> None:
             status.update(fields)
@@ -1148,15 +1282,32 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
 
     elif event == "PostToolUse" and runner == "codex":
         # Codex 一律靠调度器 tmux send-keys 投递守卫文案（设计稿 §5.2），
-        # 不依赖 hook stdout 回注——这里只记账，不算上下文、不查额度、不回注。
+        # 不依赖 hook stdout 回注——这里不查额度（额度到线走
+        # `scheduler._check_codex_quota_pause` 那条独立的路，S6③已有）；
+        # 上下文刷新节奏（每 20 次/增量触发/超时触发）总review三 H2 起改成
+        # 跟 Claude 共用 `_decide_refresh`，到线只落 `context_warn_pending`
+        # 交给调度器投递（`_post_tool_use_refresh_codex`）。
+        #
+        # 子 agent 判定（`_is_subagent_call`）认的是 Claude transcript 里
+        # tool_use 记录的形状；Codex rollout 里有没有等价物、怎么定位不
+        # 确定，这里先不做——Codex 一律按主会话处理（H2 原料 3）。
+        size = _transcript_size(payload)
+        growth_limit = _refresh_growth_bytes(task)
+        refresh = False
+
         def bump_tool_calls_codex(status: dict) -> None:
-            status["tool_calls"] = int(status.get("tool_calls") or 0) + 1
+            nonlocal refresh
+            calls = int(status.get("tool_calls") or 0) + 1
+            status["tool_calls"] = calls
             status["stuck"] = False
             status.pop("auto_interrupted", None)
             status.pop("stuck_since", None)
             status["last_event_at"] = now
+            refresh, _was_pending = _decide_refresh(status, now, calls, size, growth_limit)
 
-        store.modify_status(task_id, bump_tool_calls_codex)
+        status = store.modify_status(task_id, bump_tool_calls_codex)
+        if refresh:
+            _post_tool_use_refresh_codex(task, status, payload)
         return None
 
     elif event == "PostToolUse":
@@ -1175,36 +1326,7 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             status.pop("auto_interrupted", None)
             status.pop("stuck_since", None)
             status["last_event_at"] = now
-            was_pending = bool(status.get("context_refresh_pending"))
-            refreshed_at = status.get("context_refreshed_at")
-            time_trigger = False
-            if refreshed_at:
-                try:
-                    elapsed = (
-                        datetime.fromisoformat(now.replace("Z", "+00:00"))
-                        - datetime.fromisoformat(refreshed_at.replace("Z", "+00:00"))
-                    ).total_seconds()
-                    time_trigger = elapsed >= _REFRESH_MAX_INTERVAL_SECONDS
-                except ValueError:
-                    time_trigger = False
-            if calls % _REFRESH_EVERY_CALLS == 0 or was_pending or time_trigger:
-                refresh = True  # 每 20 次一刷；或欠着的补刷；或距上次刷新太久了
-            elif size is not None:
-                base = status.get("context_refresh_size")
-                if base is None or size < base:
-                    # 没基线（或换了文件/被截断）：只登记基线，不刷
-                    status["context_refresh_size"] = size
-                elif size - base >= growth_limit:
-                    refresh = True  # transcript 长得太快，提前刷（见 _REFRESH_GROWTH_*）
-            if refresh:
-                status.pop("context_refresh_pending", None)
-                if size is not None:
-                    status["context_refresh_size"] = size
-                status["context_refreshed_at"] = now
-            elif refreshed_at is None:
-                # F5：从没记过刷新时刻（老状态/这一班第一次调用）——先登记
-                # 一个起点，不强行触发刷新（不然每个任务第一次调用就必刷）。
-                status["context_refreshed_at"] = now
+            refresh, was_pending = _decide_refresh(status, now, calls, size, growth_limit)
 
         status = store.modify_status(task_id, bump_tool_calls)
         if not refresh:

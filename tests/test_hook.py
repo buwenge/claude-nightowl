@@ -1727,6 +1727,123 @@ def test_codex_hook_never_prints_stdout_injection():
     assert store.read_status(task_id)["tool_calls"] == 25
 
 
+# ---------- 总review三 H2：Codex PostToolUse/Stop 刷新水位（读 rollout） ----------
+
+
+def make_codex_rollout(path: Path, tokens: int, window: int | None = 200000) -> str:
+    """手工造 Codex rollout：最后一条 token_count 记录的 total_tokens/
+    model_context_window 可控，返回带这份 transcript_path 的 PostToolUse payload。"""
+    info = {
+        "last_token_usage": {
+            "input_tokens": tokens, "output_tokens": 0,
+            "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+            "reasoning_output_tokens": 0, "total_tokens": tokens,
+        },
+    }
+    if window is not None:
+        info["model_context_window"] = window
+    rec = {"type": "event_msg", "payload": {"type": "token_count", "info": info}}
+    path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    return json.dumps(
+        dict(json.loads(fixture("codex_hook_posttooluse.json")), transcript_path=str(path)),
+        ensure_ascii=False,
+    )
+
+
+def test_codex_post_tool_use_refreshes_context_every_20_calls(tmp_path):
+    """H2：以前 Codex 的 PostToolUse 分支只计数，现在第 20 次要跟 Claude 一样
+    刷出 context_tokens/context_pct——上限没有 config 模型表可查（`gpt-5.6-luna`
+    的 context_limit 是 null），落新字段 context_limit，来自 rollout 自己带
+    的 model_context_window。"""
+    task_id = make_task_codex(guards={"context_warn_tokens": 999999})  # 不想撞到线
+    payload = make_codex_rollout(tmp_path / "rollout.jsonl", tokens=5000, window=200000)
+    for _ in range(19):
+        proc = run_codex_hook(task_id, "PostToolUse", payload)
+        assert proc.stdout == ""
+    status = store.read_status(task_id)
+    assert status["tool_calls"] == 19 and status["context_tokens"] is None  # 未到第 20 次
+    proc = run_codex_hook(task_id, "PostToolUse", payload)
+    assert proc.returncode == 0 and proc.stdout == ""  # Codex 永不 stdout 回注
+    status = store.read_status(task_id)
+    assert status["tool_calls"] == 20
+    assert status["context_tokens"] == 5000
+    assert status["context_limit"] == 200000
+    assert status["context_pct"] == round(100 * 5000 / 200000)
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "hook PostToolUse(codex) #20 刷新上下文" in events
+
+
+def test_codex_post_tool_use_guard_limit_overrides_rollout_window():
+    """guards.context_limit_tokens 优先于 rollout 自己带的 model_context_window
+    （跟 Claude `_context_limit` 同一个优先级口径）。"""
+    task_id = make_task_codex(
+        guards={"context_warn_tokens": 999999, "context_limit_tokens": 10000}
+    )
+    tmp_path = store.task_dir(task_id)
+    payload = make_codex_rollout(tmp_path / "rollout.jsonl", tokens=5000, window=200000)
+    for _ in range(20):
+        run_codex_hook(task_id, "PostToolUse", payload)
+    status = store.read_status(task_id)
+    assert status["context_limit"] == 10000  # 不是 rollout 的 200000
+    assert status["context_pct"] == round(100 * 5000 / 10000)
+
+
+def test_codex_post_tool_use_over_threshold_sets_warn_pending(tmp_path):
+    """到线只落 context_warn_pending，不写 context_warned_at、不打 stdout——
+    真正投递交给调度器（H3）。"""
+    task_id = make_task_codex(guards={"context_warn_tokens": 1000})
+    payload = make_codex_rollout(tmp_path / "rollout.jsonl", tokens=5000, window=200000)
+    for _ in range(20):
+        proc = run_codex_hook(task_id, "PostToolUse", payload)
+        assert proc.stdout == ""
+    status = store.read_status(task_id)
+    assert status["context_warn_pending"] is True
+    assert status.get("context_warned_at") is None
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "上下文到线，待调度器敲收尾提醒（5000 tokens / 上限 200000）" in events
+
+
+def test_codex_post_tool_use_already_warned_does_not_repeat(tmp_path):
+    """已经送达过（context_warned_at 非空）就不再判定，避免调度器已经清过
+    pending 之后又被下一次刷新重新点亮。"""
+    task_id = make_task_codex(guards={"context_warn_tokens": 1000})
+    store.update_status(task_id, context_warned_at="2026-08-27T18:00:00Z")
+    payload = make_codex_rollout(tmp_path / "rollout.jsonl", tokens=5000, window=200000)
+    for _ in range(20):
+        run_codex_hook(task_id, "PostToolUse", payload)
+    status = store.read_status(task_id)
+    assert status.get("context_warn_pending") is not True
+    assert status["context_tokens"] == 5000  # 水位仍然照刷，只是不重复判到线
+
+
+def test_codex_stop_refreshes_context_but_never_sets_warn_pending(tmp_path):
+    """H2：Codex 的 Stop 分支也刷新一次水位（跟 Claude 的 Stop 一样只刷不判
+    到线——到线判定只在 PostToolUse 那条路做）。"""
+    task_id = make_task_codex(guards={"context_warn_tokens": 1000})
+    rollout = tmp_path / "rollout.jsonl"
+    rec = {
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {"input_tokens": 5000, "output_tokens": 0, "total_tokens": 5000},
+                "model_context_window": 200000,
+            },
+        },
+    }
+    rollout.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    stop_payload = json.dumps(
+        dict(json.loads(fixture("codex_hook_stop.json")), transcript_path=str(rollout)),
+        ensure_ascii=False,
+    )
+    proc = run_codex_hook(task_id, "Stop", stop_payload)
+    assert proc.returncode == 0 and proc.stdout == ""
+    status = store.read_status(task_id)
+    assert status["context_tokens"] == 5000
+    assert status["context_limit"] == 200000
+    assert status.get("context_warn_pending") is not True  # Stop 不判到线
+
+
 # ---------- S8 审查 B：水位刷新按增量触发；子 agent 体内不回注 ----------
 
 
