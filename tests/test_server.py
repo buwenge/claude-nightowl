@@ -244,6 +244,44 @@ def test_logout_clears_cookie(authed):
     assert status == 401
 
 
+def test_logout_invalidates_old_token_everywhere(authed):
+    """总review二 G7：token 是无状态 HMAC(exp)，一年有效——logout 不能只让
+    浏览器丢 cookie，别的设备/备份里那份老 token 也该立刻失效。"""
+    old_cookie = authed.cookie  # 登出前的老 token，模拟"另一台设备还带着它"
+    assert old_cookie
+    status, _, _ = authed.request("POST", "/api/logout")
+    assert status == 200
+    # 老 cookie 原样再打：代次不等，401（不是靠"没带 cookie"这条弱验证）
+    authed.cookie = old_cookie
+    status, _, _ = authed.request("GET", "/api/tasks")
+    assert status == 401
+
+
+def test_passwd_invalidates_old_token(authed):
+    """改口令（passwd）顺带让代次 +1，老 cookie 也失效——不止靠换
+    token_secret。"""
+    old_cookie = authed.cookie
+    assert old_cookie
+    auth.reset_password("新的更长的口令啊")
+    authed.cookie = old_cookie
+    status, _, _ = authed.request("GET", "/api/tasks")
+    assert status == 401
+
+
+def test_auth_token_generation_roundtrip(ns_home):
+    """auth 模块级：代次不等就判无效，不用经过 HTTP 层。"""
+    auth.set_password(PASSWORD)
+    token = auth.issue_token(days=365)
+    assert auth.verify_token(token) is True
+    auth.bump_token_generation()
+    assert auth.verify_token(token) is False
+    # 新签的 token（代次已经 +1）依旧有效
+    assert auth.verify_token(auth.issue_token(days=365)) is True
+    # 没设过口令时是 no-op，不炸
+    auth._cred_path().unlink()
+    auth.bump_token_generation()
+
+
 def test_bad_token_is_unauthorized(ns_home):
     auth.set_password(PASSWORD)
     srv, url = start_server()

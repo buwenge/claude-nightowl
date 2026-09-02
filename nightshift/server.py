@@ -679,6 +679,9 @@ class _Handler(BaseHTTPRequestHandler):
         return self._send_json(200, {"ok": True}, {"Set-Cookie": self._login_cookie()})
 
     def _api_logout(self) -> None:
+        # 总review二 G7：token 是无状态 HMAC(exp)，删浏览器 cookie 撤不掉别处
+        # 还留着的那份——代次 +1 让所有设备上的旧 token 立刻失效。
+        auth.bump_token_generation()
         token = self._cookie_token() or ""
         return self._send_json(
             200, {"ok": True}, {"Set-Cookie": self._cookie_header(token, 0)}
