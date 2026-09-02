@@ -814,6 +814,26 @@ def _write_handover(tid: str, text: str, shift: int = 1) -> None:
     )
 
 
+def test_idle_settle_debounces_freshly_idled_build_but_evaluates_after_20s(monkeypatch):
+    """总review F11：hook 的 Stop→idle 与紧接着（排队消息/后台通知重新拉起
+    会话）触发的 UserPromptSubmit→working 之间有个缝，tick 恰好落在这个
+    缝里不该把还在干活的班误判成收工。idle 落定未满 IDLE_SETTLE_SECONDS
+    秒——这一 tick 不评估（chain_checked 不落，state 原样）；过了之后
+    正常评估、按交接收尾。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task(retry_max=2, worktree=False)
+    _go_idle(tid, last_event_at=scheduler.to_iso(NOW))
+    _write_handover(tid, "写完了。\nNEXT: done")
+
+    scheduler.tick(CONFIG, NOW + timedelta(seconds=5))
+    status = store.read_status(tid)
+    assert status["state"] == "idle"
+    assert "chain_checked" not in status  # 瞬时 idle，没被评估
+
+    scheduler.tick(CONFIG, NOW + timedelta(seconds=25))
+    assert store.read_status(tid)["state"] == "finished"  # 过了去抖窗口，正常收尾
+
+
 def test_chain_continue_creates_successor(monkeypatch):
     fakes = Fakes(monkeypatch)
     tid = make_task(retry_max=2, worktree=False)
@@ -885,7 +905,10 @@ def test_chain_continue_codex_closes_parent_window_after_successor_persisted(mon
     store.update_status(tid, state="idle", window_id="@7", pane_pid=1,
                         last_event_at=scheduler.to_iso(NOW), thread_id="thread-1")
     _write_handover(tid, "已完成第一段。\nNEXT: continue")
-    sched.tick(CODEX_CONFIG, NOW)
+    # F11 idle 去抖：last_event_at 就是 NOW，tick 也要过 IDLE_SETTLE_SECONDS
+    # 才评估这个刚落定的 idle，不然直接 return []。
+    settled = NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS)
+    sched.tick(CODEX_CONFIG, settled)
 
     assert close_calls == [["@7"]]
     assert call_order == [("close_windows", "chained", True)]
@@ -2165,7 +2188,9 @@ def test_codex_empty_or_bad_registry_does_not_block_idle_chain(monkeypatch):
     store.update_status(tid, state="idle", window_id="@1", pane_pid=1,
                         last_event_at=scheduler.to_iso(NOW))
     # 没有 background.json：_reconcile 返回 None，交回正常流程
-    sched.tick(CODEX_CONFIG, NOW)
+    # F11 idle 去抖：last_event_at 是 NOW，tick 要过 IDLE_SETTLE_SECONDS
+    # 才评估这个刚落定的 idle。
+    sched.tick(CODEX_CONFIG, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS))
     assert sent == []
     status = store.read_status(tid)
     assert status["state"] == "finished"  # 正常按老式路径收尾，没被拦住
@@ -2507,7 +2532,10 @@ def test_review_pipeline_fix_then_done_reuses_held_session(tmp_path, monkeypatch
     (wt / "canary.txt").write_text("build round1\nbuild round2\n", encoding="utf-8")
     _go_idle(tid, window_id="@1")
     _write_handover(tid, "改好了。\nNEXT: done")
-    scheduler.tick(cfg, NOW)
+    # F11 idle 去抖：上一次 tick 已经把 tid 的 last_event_at 戳成 NOW，这里
+    # 把评估这次 idle 的 tick 往后拨过 IDLE_SETTLE_SECONDS，不然刚落定的
+    # idle 会被当瞬时状态跳过评估。
+    scheduler.tick(cfg, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS))
     build_status2 = store.read_status(tid)
     assert build_status2["state"] == "held"
     c2 = build_status2["checkpoint_sha"]
@@ -2645,7 +2673,9 @@ def test_review_pipeline_round_limit_needs_confirmation_then_continue(tmp_path, 
     (wt / "canary.txt").write_text("r1\nr2\n", encoding="utf-8")
     _go_idle(tid, window_id="@1")
     _write_handover(tid, "第二轮。\nNEXT: done")
-    scheduler.tick(cfg, NOW)
+    # F11 idle 去抖：上一次 tick 已经把 tid 的 last_event_at 戳成 NOW，
+    # 往后拨过 IDLE_SETTLE_SECONDS 再评估，不然这次 idle 落空。
+    scheduler.tick(cfg, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS))
     review2_id = store.read_status(tid)["successor_id"]
     _go_idle(review2_id, window_id="@3")
     rf2 = store.task_dir(review2_id) / "review-2.md"
@@ -2997,7 +3027,9 @@ def test_review_pipeline_codex_build_claude_review_full_cycle(tmp_path, monkeypa
     (wt / "canary.txt").write_text("r1\nr2\n", encoding="utf-8")
     _go_idle(tid, window_id="@1")
     _write_handover(tid, "第二轮写完了。\nNEXT: done", shift=build_task2["shift"])
-    scheduler.tick(cfg, NOW)
+    # F11 idle 去抖：上一次 tick 已经把 tid 的 last_event_at 戳成 NOW，
+    # 往后拨过 IDLE_SETTLE_SECONDS 再评估，不然这次 idle 落空。
+    scheduler.tick(cfg, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS))
     review2_id = store.read_status(tid)["successor_id"]
     review2_task = store.load_task(review2_id)
     review2_task["run_at"] = scheduler.to_iso(NOW)
@@ -3084,7 +3116,9 @@ def test_review_pipeline_codex_build_codex_review_full_cycle(tmp_path, monkeypat
     (wt / "canary.txt").write_text("r1\nr2\n", encoding="utf-8")
     _go_idle(tid, window_id="@1")
     _write_handover(tid, "第二轮写完了。\nNEXT: done", shift=build_task2["shift"])
-    scheduler.tick(cfg, NOW)
+    # F11 idle 去抖：上一次 tick 已经把 tid 的 last_event_at 戳成 NOW，
+    # 往后拨过 IDLE_SETTLE_SECONDS 再评估，不然这次 idle 落空。
+    scheduler.tick(cfg, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS))
     review2_id = store.read_status(tid)["successor_id"]
     review2_task = store.load_task(review2_id)
     review2_task["run_at"] = scheduler.to_iso(NOW)
@@ -3226,7 +3260,9 @@ def test_review_fix_reuse_success_advances_shift_no_cycle(tmp_path, monkeypatch)
     (wt / "canary.txt").write_text("r1\nr2\n", encoding="utf-8")
     _go_idle(tid, window_id="@1")
     _write_handover(tid, "第二轮。\nNEXT: done")
-    scheduler.tick(cfg, NOW)
+    # F11 idle 去抖：上一次 tick 已经把 tid 的 last_event_at 戳成 NOW，
+    # 往后拨过 IDLE_SETTLE_SECONDS 再评估，不然这次 idle 落空。
+    scheduler.tick(cfg, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS))
     review2_id = store.read_status(tid)["successor_id"]
     review2_shift = store.load_task(review2_id)["shift"]
     assert review2_shift > build_reused_shift
@@ -3332,7 +3368,9 @@ def test_review_fix_reuse_clears_stale_round_bookkeeping_so_old_handover_is_igno
     # 第 2 轮审稿——那样会把"第 2 轮其实还没做完"悄悄当成"第 2 轮已经审过了"。
     store.update_status(tid, context_warned_at=scheduler.to_iso(NOW))
     _go_idle(tid, window_id="@1")
-    scheduler.tick(cfg, NOW)
+    # F11 idle 去抖：last_event_at 又被上一次 tick 戳成 NOW，往后拨过
+    # IDLE_SETTLE_SECONDS 再评估。
+    scheduler.tick(cfg, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS))
     after = store.read_status(tid)
     assert after["state"] == "chained"  # 走 on_no_handover=continue，不是误判收工
     events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")

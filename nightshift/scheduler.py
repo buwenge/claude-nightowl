@@ -69,6 +69,12 @@ DEFAULT_CLAUDE_RESUME_TEXT = (
 # 超过额度刷新时间这么多分钟仍没等到它自己醒（UserPromptSubmit/Stop 都没
 # 来），调度器主动 send-keys 叫它继续，跟 idle 分支走同一套文案/失败处理。
 CLAUDE_WAKEUP_GRACE_MINUTES = 60
+# F11：build 的 idle 去抖。hook 的 Stop→idle 与紧接着（排队消息/后台通知
+# 重新拉起会话）触发的 UserPromptSubmit→working 之间有个缝——tick 恰好
+# 落在这个缝里会把还在干活的班误判成收工（9/1 真机 ce5f 任务：
+# 20:33:05Z Stop→idle 与同一秒 UserPromptSubmit→working）。idle 落定不满
+# 这么多秒就不评估，下一 tick 再看。
+IDLE_SETTLE_SECONDS = 20
 # S7.1 阻断二/三：review 角色因额度到线转 held（on_no_quota=hold）后的
 # 恢复文案——明确要求"继续完成这一轮审稿"，结尾仍然只用 NEXT: done/fix/
 # pending 三选一，不能沿用 build 那句"从刚才停下的地方继续"（不成协议）。
@@ -1050,6 +1056,22 @@ def _check_running(
         codex_pause = _check_codex_quota_pause(task, status, config, now, str(window_id))
         if codex_pause is not None:
             return codex_pause
+
+    # F11：build 的 idle 去抖——刚落定的 idle 可能只是 Stop→idle 与紧接着
+    # 的 UserPromptSubmit→working 之间那道缝里的瞬时状态，还没到这一
+    # tick 就已经又在干活了。放在五小时暂停补敲判断之前：补敲同样不该
+    # 打在瞬时 idle 上（会话其实在忙，被当成"该催了"敲一句自作主张的
+    # "请继续"）。review 角色的存活判定走独立分支（S7），不受这条影响。
+    # last_event_at 距 now 为负（测试里 now 常年固定在过去某个时刻）视为
+    # 已经稳定，不当瞬时。
+    if (
+        store.role_of(task) != "review"
+        and status.get("state") == "idle"
+        and status.get("last_event_at")
+    ):
+        delta = (now - parse_iso(status["last_event_at"])).total_seconds()
+        if 0 <= delta < IDLE_SETTLE_SECONDS:
+            return []
 
     # 五小时额度暂停：它该在等缓存闹钟。Claude 没定闹钟就停了的（idle），
     # 刷新时间一到敲一句让它继续；Codex 没有自己定闹钟的能力，闹钟到点
