@@ -1921,6 +1921,10 @@ def test_codex_multiple_finished_items_combine_into_one_message(monkeypatch):
     sched.tick(CODEX_CONFIG, NOW)
     assert len(sent) == 1  # 合并成一条
     assert "bg-1" in sent[0][1] and "bg-2" in sent[0][1]
+    # 总review F9：多条完成通知拼单行用中文分号，不再是裸 LF 块（Codex
+    # TUI 对 paste-buffer -r 保留的裸换行块未验证过是否安全）。
+    assert "\n" not in sent[0][1]
+    assert "；" in sent[0][1]
 
 
 def test_codex_finished_plus_still_running_stays_waiting_background(monkeypatch):

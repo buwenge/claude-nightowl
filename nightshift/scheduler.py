@@ -778,7 +778,10 @@ def _reconcile_codex_background(
             f"（exit={r.get('exit_code')}），结果在 {r.get('result_path')}，请读取并继续。"
             for r in finished_pending
         ]
-        proc = launcher.send_keys(window_id, "\n".join(lines))
+        # 总review F9：send_keys 现在走 paste-buffer -r 保留裸 LF，多条完成
+        # 通知拼成的这一块文本对 Codex TUI 是否安全没验证过——改用中文分号
+        # 拼成单行，不再指望裸换行块。
+        proc = launcher.send_keys(window_id, "；".join(lines))
         if proc.returncode != 0:
             if not status.get("background_attention_noted"):
                 reason = f"后台完成但 send-keys 失败（returncode={proc.returncode}），未能通知它继续"
