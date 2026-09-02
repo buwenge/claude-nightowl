@@ -115,6 +115,7 @@
   "quota_other_model_text": "[nightshift] 提示：{label} 的周额度只剩 {left}%（线 {line_left}%）。本会话的模型不受影响，但接下来别再派 {label} 的子 agent、也别切到它。",
   "subagent_quota_notice_text": "来自nightshift：账号额度已到线（五小时剩 {session_left}% / 七日剩 {week_left}%），请立刻收尾，把已有结果汇报给主会话后停下，不要再开新的工具调用。",
   "chain_template": "你在无人值守的定时会话里工作，项目目录 {project_path}。任务：{title}\n\n{task}\n\n这是第 {shift} 班。上一班交接如下：\n{handover}\n\n先核对交接里说的状态再动手。{worktree_instruction}没有人在场：遇到问题按合理判断继续，不要停下来等确认。长于 20 分钟的外部命令请用后台方式跑。本会话上下文上限约 {context_limit} tokens，快到线时调度器会提醒你收尾。",
+  "chain_stop_alarm_text": "来自nightshift：交接已收到，下一班已经开了。请用 ScheduleWakeup stop 撤掉闹钟，然后停下，不要再干活。",
   "stop_background_text": "来自nightshift：请立刻用 TaskStop 停掉所有后台任务和子 agent，后台起的命令行进程也一并杀掉，然后停下不要继续。",
   "stuck_interrupt_text": "来自nightshift：你疑似卡在一条工具调用里已经 {stuck_minutes} 分钟没反应，刚按了 Esc 把这一轮打断。看看刚才在等的命令/进程是不是真卡死了——换个方式重试、跳过，或者判断已经没救了就当它失败处理，然后照常继续或收尾。",
   "codex_quota_pause_text": "来自nightshift：五小时额度只剩 {session_left}%（线 {session_line_left}%），约 {resets_at} 刷新。现在停下，不要再开新的工具调用，调度器到点会敲你继续。",

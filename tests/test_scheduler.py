@@ -1261,6 +1261,109 @@ def test_exited_chain_not_reevaluated_when_successor_already_exists(monkeypatch)
     assert len(store.list_tasks()) == 2
 
 
+# ---------- H7：waiting_wakeup 挂着闹钟但交接已写好 → 按 idle 走换班 ----------
+
+
+def test_waiting_wakeup_with_handover_switches_shift_and_pokes_alarm(monkeypatch):
+    """真机事故②：写完交接的班只要还挂着缓存闹钟就永远不会被换班判定
+    摸到。换班成功后要敲一句让它撤掉闹钟，且 build_control_kind="stop"
+    要在 send-keys 之前就落盘（F1 的控制 turn 分支要看得到）。"""
+    Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    store.update_status(
+        tid, state="waiting_wakeup", window_id="@30", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=1)),
+    )
+    _write_handover(tid, "登录页已完成。\n还差支付页。\nNEXT: continue")
+
+    seen_kind_at_send = []
+    sent_texts = []
+
+    def fake_send_keys(wid, text):
+        seen_kind_at_send.append(store.read_status(tid).get("build_control_kind"))
+        sent_texts.append(text)
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(launcher, "send_keys", fake_send_keys)
+
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "chained"
+    assert status.get("successor_id")
+    assert seen_kind_at_send == ["stop"]  # 落盘先于 send-keys
+    assert len(sent_texts) == 1 and "撤掉闹钟" in sent_texts[0]
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "已敲父班撤闹钟" in events
+
+
+def test_waiting_wakeup_without_handover_not_reevaluated(monkeypatch):
+    """已经评估过一次（chain_checked=True）且从未写过交接、交接依然不
+    存在（mtime 仍是 None）就不算"被重写"，不重复评估、不重复敲撤闹钟。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    store.update_status(
+        tid, state="waiting_wakeup", window_id="@30", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=1)),
+        chain_checked=True, chain_checked_handover_mtime=None,
+    )
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "waiting_wakeup"
+    assert fakes.send_keys_calls == []
+
+
+def test_waiting_wakeup_idle_settle_debounce_before_chain_eval(monkeypatch):
+    """同 F11：交接刚写、last_event_at 就是 now 时这一 tick 不评估，过了
+    IDLE_SETTLE_SECONDS 才评估。"""
+    Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    store.update_status(
+        tid, state="waiting_wakeup", window_id="@30", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(NOW),
+    )
+    _write_handover(tid, "还差一点。\nNEXT: continue")
+
+    scheduler.tick(CONFIG, NOW + timedelta(seconds=5))
+    status = store.read_status(tid)
+    assert status["state"] == "waiting_wakeup"
+    assert "chain_checked" not in status
+
+    scheduler.tick(CONFIG, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS + 5))
+    assert store.read_status(tid)["state"] == "chained"
+
+
+def test_waiting_wakeup_review_role_not_touched_by_h7(monkeypatch):
+    """review 不设闹钟，这段不该碰它——waiting_wakeup 的 review 什么都
+    不做，跟 H7 之前的行为一致。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_review_task()
+    data = store.load_task(tid)
+    data["role"] = "review"
+    store.atomic_write_json(store.task_dir(tid) / "task.json", data)
+    store.update_status(
+        tid, state="waiting_wakeup", window_id="@1", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=1)),
+    )
+    scheduler.tick(REVIEW_CONFIG, NOW)
+    assert store.read_status(tid)["state"] == "waiting_wakeup"
+    assert fakes.send_keys_calls == []
+
+
+def test_waiting_wakeup_with_done_handover_finishes_without_alarm_poke(monkeypatch):
+    """NEXT: done 走 finished/awaiting_merge 的没有下一班，不敲撤闹钟。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    store.update_status(
+        tid, state="waiting_wakeup", window_id="@30", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=1)),
+    )
+    _write_handover(tid, "全部完成，已提交。\nNEXT: done")
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "finished"
+    assert fakes.send_keys_calls == []
+
+
 # ---------- S5②：收工存档点与完工分流（真 Git 仓库） ----------
 
 

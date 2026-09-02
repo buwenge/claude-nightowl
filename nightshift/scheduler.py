@@ -100,6 +100,15 @@ DEFAULT_BUILD_HOLD_RESUME_TEXT = (
     "来自nightshift：工头看完了，继续刚才的工作——"
     "收工时照常写交接，末行 NEXT: done 或 NEXT: continue。"
 )
+# H7：waiting_wakeup 挂着闹钟的班一旦被判定换班成功（交接已写好、后继已
+# 开），父窗口自己还挂着那个 ScheduleWakeup 缓存闹钟——不撤的话闹钟每
+# 50 分钟把已经换班的窗口拉起来一次（H8 会把状态摁回 chained，但白烧一轮
+# 保活/额度）。跟 _review_done 敲"请停下"同一套 kind="stop"，让 hook 的
+# 控制 turn 分支保持 chained 不翻 working/idle。
+DEFAULT_CHAIN_STOP_ALARM_TEXT = (
+    "来自nightshift：交接已收到，下一班已经开了。请用 ScheduleWakeup stop "
+    "撤掉闹钟，然后停下，不要再干活。"
+)
 # 交接文件末行的换班指令（设计稿 §4.4）
 _RE_NEXT_CONTINUE = re.compile(r"^NEXT:\s*continue\s*$")
 _RE_NEXT_DONE = re.compile(r"^NEXT:\s*done\s*$")
@@ -1288,6 +1297,45 @@ def _check_running(
             return [f"{task_id} 审稿额度刷新但叫醒失败"]
         store.append_event(task_id, "审稿额度刷新时间已到，已 send-keys 让它继续（等待新一轮 verdict）")
         return [f"{task_id} 审稿额度刷新，敲它继续"]
+
+    # H7：waiting_wakeup 挂着闹钟但交接已写好，也按 idle 走换班——写完交接
+    # 的班只要还挂着缓存闹钟，就永远不会被下面 S3 那段 idle 专属的换班
+    # 判定摸到（9/2 真机事故②）；build 专属语义，review 不设闹钟不进这段。
+    if (
+        status.get("state") == "waiting_wakeup"
+        and not paused_until
+        and store.role_of(task) != "review"
+    ):
+        # 同 F11：Stop→waiting_wakeup 与闹钟响的 UserPromptSubmit 之间也有
+        # 同样的缝，去抖一次再评估（真机 05:06:07 两条事件同一秒）。
+        settled = True
+        if status.get("last_event_at"):
+            delta = (now - parse_iso(status["last_event_at"])).total_seconds()
+            settled = not (0 <= delta < IDLE_SETTLE_SECONDS)
+        if not settled:
+            return []
+        if _handover_needs_eval(task, status):
+            result = _check_idle_chain(task, status, config, now)
+            # 换班成功（父班已经是 chained）就敲一句让它撤掉还挂着的闹钟，
+            # 不然闹钟每 50 分钟把已换班的窗口拉起来一次（H8 会摁回
+            # chained，但白烧一轮）。NEXT: done 走 finished/awaiting_merge
+            # 的没有下一班，不敲——闹钟响了自然由 H8 恢复状态。
+            latest = store.read_status(task_id)
+            if (
+                latest.get("state") == "chained"
+                and window_id
+                and launcher.window_alive(str(window_id), config)
+            ):
+                text = config.get("chain_stop_alarm_text") or DEFAULT_CHAIN_STOP_ALARM_TEXT
+                sent = send_review_control(
+                    task_id, str(window_id), text, kind="stop",
+                    pre_send_fields={"build_control_kind": "stop"},
+                    failure_note="，父班闹钟未撤（后继已开，不影响）",
+                )
+                if sent:
+                    store.append_event(task_id, "已敲父班撤闹钟")
+            return result
+        # 为假 → 不动：落到下面 H8 的恢复逻辑，或最终原样落到末尾 return []。
 
     # S3 换班：idle 收尾后按交接文件接下一班（H6 起改成"交接文件重写过就
     # 重新评估"，不再是一次性 chain_checked，见 `_handover_needs_eval`）；
