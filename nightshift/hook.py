@@ -97,6 +97,14 @@ ALARM_UNIT_MINUTES = 50
 ALARM_BUFFER_MINUTES = 3
 ALARM_FALLBACK_COUNT = 6  # 刷新时间没查到：按五小时最长等
 
+# H8：build 角色的终态——这几个状态是调度器已经收工/换班/合并的判定，
+# 一旦有人在同一窗口继续聊天把它们重新唤醒，UserPromptSubmit 要记一笔
+# `rewoken_from`，让调度器（scheduler._check_running）在没有新交接时把
+# 状态摁回去，而不是任它悬在 working 里再也不被巡检摸到。
+_REWOKEN_TERMINAL_STATES = (
+    "finished", "chained", "chain_exhausted", "awaiting_merge", "merged",
+)
+
 
 def _context_limit(task: dict, config: dict) -> int:
     """上下文上限：任务 guards 里的 context_limit_tokens 优先，否则按模型查 config。
@@ -1087,6 +1095,21 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             # 发送前的值（held/chained），改去向要交给对应的 Stop 分支判断，
             # 这里不能抢先覆盖成 working。
             if not status.get("build_control_kind") and not status.get("review_control_kind"):
+                # H8：已收尾的班（finished/chained/…）被重新唤醒——记一笔
+                # rewoken_from（已经有值就不覆盖：连续几轮人工聊天只认第一次
+                # 的原始终态），交给调度器在没有新交接时把状态摁回去。
+                prior_state = status.get("state")
+                if (
+                    store.role_of(task) == "build"
+                    and prior_state in _REWOKEN_TERMINAL_STATES
+                    and not status.get("rewoken_from")
+                ):
+                    status["rewoken_from"] = prior_state
+                    store.append_event(
+                        task_id,
+                        f"已收尾的班（{prior_state}）被重新唤醒：重写交接会重新评估，"
+                        f"否则调度器会把状态恢复成 {prior_state}",
+                    )
                 status["state"] = "working"
                 # F2：不是控制 turn 说明模型自己真的又开了一轮——如果它是自己
                 # 缓存闹钟醒来接着干，残留的 quota_paused_until 该在这里清掉。

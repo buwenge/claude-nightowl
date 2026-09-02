@@ -1337,6 +1337,26 @@ def _check_running(
             return result
         # 为假 → 不动：落到下面 H8 的恢复逻辑，或最终原样落到末尾 return []。
 
+    # H8：已收尾的终态（finished/chained/chain_exhausted/awaiting_merge/
+    # merged）被人工在同一窗口重新唤醒过（hook.py 记的 rewoken_from，见
+    # UserPromptSubmit 分支）——如果没有新交接（H6/H7 都判定不需要重评），
+    # 把状态摁回原来的终态，不留在 idle/waiting_wakeup 里空转（9/2 真机
+    # 事故③）。必须放在 S3 idle 换班分支之前：否则 idle + 不需评估会落到
+    # 下面 idle 分支之后的末尾 `return []`，状态就停在 idle 出不来。
+    if (
+        status.get("state") in ("idle", "waiting_wakeup")
+        and not paused_until
+        and store.role_of(task) != "review"
+        and status.get("rewoken_from")
+        and not _handover_needs_eval(task, status)
+    ):
+        restored = status["rewoken_from"]
+        store.update_status(
+            task_id, state=restored, rewoken_from=None, last_event_at=to_iso(now)
+        )
+        store.append_event(task_id, f"重新唤醒后没有新交接，状态恢复为 {restored}")
+        return [f"{task_id} 重新唤醒后无新交接 → 恢复为 {restored}"]
+
     # S3 换班：idle 收尾后按交接文件接下一班（H6 起改成"交接文件重写过就
     # 重新评估"，不再是一次性 chain_checked，见 `_handover_needs_eval`）；
     # F4：评估中途炸了不再悄悄晾在 idle，_check_idle_chain/_check_exited_chain

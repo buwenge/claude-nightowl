@@ -200,6 +200,39 @@ def test_event_sequence_state_machine():
     assert "SessionEnd" in events
 
 
+# ---------- H8：已收尾的班被重新唤醒——记 rewoken_from 交给调度器摁回去 ----------
+
+
+def test_user_prompt_submit_records_rewoken_from_for_finished_build():
+    task_id = make_task()
+    store.update_status(task_id, state="finished")
+    proc = run_hook(task_id, "UserPromptSubmit", fixture("hook_userpromptsubmit.json"))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert status["state"] == "working"
+    assert status["rewoken_from"] == "finished"
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "已收尾的班（finished）被重新唤醒" in events
+
+
+def test_user_prompt_submit_control_turn_does_not_record_rewoken_from():
+    """调度器投递的控制文字（保活/我来看/停工）触发的 UserPromptSubmit
+    不算"人工重新唤醒"，不记 rewoken_from。"""
+    task_id = make_task()
+    store.update_status(task_id, state="finished", build_control_kind="keepalive")
+    run_hook(task_id, "UserPromptSubmit", fixture("hook_userpromptsubmit.json"))
+    status = store.read_status(task_id)
+    assert "rewoken_from" not in status
+
+
+def test_user_prompt_submit_review_role_does_not_record_rewoken_from():
+    task_id = make_review_task()
+    store.update_status(task_id, state="finished")
+    run_hook(task_id, "UserPromptSubmit", fixture("hook_userpromptsubmit.json"))
+    status = store.read_status(task_id)
+    assert "rewoken_from" not in status
+
+
 def test_subagents_never_negative():
     task_id = make_task()
     bg = background_lines()

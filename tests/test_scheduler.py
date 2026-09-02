@@ -1364,6 +1364,84 @@ def test_waiting_wakeup_with_done_handover_finishes_without_alarm_poke(monkeypat
     assert fakes.send_keys_calls == []
 
 
+# ---------- H8：终态被重新唤醒——没有新交接就把状态摁回去 ----------
+
+
+def test_rewoken_idle_restored_when_no_new_handover(monkeypatch):
+    """真机事故③：已经收尾的班被人工在同一窗口重新唤醒（hook 记的
+    rewoken_from），没有新交接就把状态摁回原来的终态，不留在 idle 里
+    空转。"""
+    Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    _go_idle(tid)
+    _write_handover(tid, "全部完成，已提交。\nNEXT: done")
+    scheduler.tick(CONFIG, NOW)
+    assert store.read_status(tid)["state"] == "finished"
+
+    # 模拟 hook：人工在同一窗口继续聊天，UserPromptSubmit 记了
+    # rewoken_from，Stop 落回 idle（交接文件没动）
+    store.update_status(
+        tid, state="idle", rewoken_from="finished",
+        last_event_at=scheduler.to_iso(NOW),
+    )
+    actions = scheduler.tick(CONFIG, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS))
+    status = store.read_status(tid)
+    assert status["state"] == "finished"
+    assert status.get("rewoken_from") is None
+    assert any("恢复为 finished" in a for a in actions)
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "重新唤醒后没有新交接，状态恢复为 finished" in events
+
+
+def test_rewoken_idle_reevaluated_when_handover_rewritten(monkeypatch):
+    """同样条件但交接被重写——走重评（续班/finished 按 NEXT），
+    rewoken_from 也被清空（_check_idle_chain 开头会清）。"""
+    Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    _go_idle(tid)
+    _write_handover(tid, "全部完成，已提交。\nNEXT: done")
+    scheduler.tick(CONFIG, NOW)
+    assert store.read_status(tid)["state"] == "finished"
+
+    store.update_status(
+        tid, state="idle", rewoken_from="finished",
+        last_event_at=scheduler.to_iso(NOW),
+    )
+    handover_path = store.task_dir(tid) / "handover-1.md"
+    handover_path.write_text("其实还有一步没做。\nNEXT: continue\n", encoding="utf-8")
+    new_mtime = handover_path.stat().st_mtime + 1
+    os.utime(handover_path, (new_mtime, new_mtime))
+
+    scheduler.tick(CONFIG, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS))
+    status = store.read_status(tid)
+    assert status["state"] == "chained"
+    assert status.get("successor_id")
+    assert status.get("rewoken_from") is None
+
+
+def test_rewoken_waiting_wakeup_restored_to_chained(monkeypatch):
+    """闹钟又响、模型又续了个闹钟但没写新交接——摁回 chained（这班已经
+    有后继了，不能再造一个）。"""
+    Fakes(monkeypatch)
+    tid = make_task(worktree=False)
+    _go_idle(tid)
+    _write_handover(tid, "登录页已完成。\n还差支付页。\nNEXT: continue")
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "chained"
+    successor_id = status["successor_id"]
+
+    store.update_status(
+        tid, state="waiting_wakeup", rewoken_from="chained",
+        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=1)),
+    )
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "chained"
+    assert status["successor_id"] == successor_id  # 没造第二个后继
+    assert status.get("rewoken_from") is None
+
+
 # ---------- S5②：收工存档点与完工分流（真 Git 仓库） ----------
 
 
