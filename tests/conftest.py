@@ -52,7 +52,8 @@ def _forbid_user_tmux_session(monkeypatch):
             target = str(target)
             if target.startswith(("@", "%")):
                 continue
-            session = target.split(":", 1)[0]
+            # tmux 的精确匹配写法带前导 "="（`-t =ns-selftest`），比较前剥掉
+            session = target.split(":", 1)[0].lstrip("=")
             if session and session != _ALLOWED_TMUX_SESSION:
                 raise AssertionError(
                     f"测试试图操作 tmux 会话 {session!r}（tmux {' '.join(map(str, args))}）；"
