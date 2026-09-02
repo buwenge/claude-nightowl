@@ -2336,6 +2336,26 @@ def test_pipeline_skip_review_cancels_pending_review_and_finalizes(authed):
     assert store.read_status(build_id)["state"] == "awaiting_merge"  # manual merge_policy
 
 
+def test_pipeline_skip_review_finalize_exception_lands_needs_attention(authed, monkeypatch):
+    """总review二 G3：待审班已取消、_finalize_done 抛异常时不能让 HTTP 层
+    裸 500——build 落 needs_attention、error 说清原因，响应 409 带 error
+    （沿用 C 组 N3 的响应形状）。"""
+    build_id, review_id = make_review_pipeline(authed, review_state="scheduled")
+
+    def boom(*a, **k):
+        raise RuntimeError("模拟收尾炸了")
+
+    monkeypatch.setattr(scheduler, "_finalize_done", boom)
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/skip-review")
+    assert status == 409, body
+    assert store.read_status(review_id)["state"] == "cancelled"  # 待审班已经取消
+    build_status = store.read_status(build_id)
+    assert build_status["state"] == "needs_attention"
+    assert "模拟收尾炸了" in build_status["error"]
+    assert "模拟收尾炸了" in body["error"]
+    assert body["ok"] is False
+
+
 def test_pipeline_skip_review_requires_checkpointed_held_build(authed):
     build_id, review_id = make_review_pipeline(authed, build_state="working")
     status, _, body = authed.request("POST", f"/api/tasks/{build_id}/skip-review")

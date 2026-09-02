@@ -1741,9 +1741,26 @@ class _Handler(BaseHTTPRequestHandler):
             store.update_status(rt["id"], state="cancelled", last_event_at=store.utc_now_iso())
             store.append_event(rt["id"], "网页：跳过审稿，本班取消")
         cfg = store.load_config()
-        actions = scheduler._finalize_done(
-            t, cfg, datetime.now(timezone.utc), skip_review=True
-        )
+        # 总review二 G3：待审班已经取消、_finalize_done 抛异常也不能让 HTTP
+        # 层裸 500——build 半途而废（存档点还在，收尾没完成），得落
+        # needs_attention 让人工能在网页上看到，而不是只有服务器日志一行。
+        try:
+            actions = scheduler._finalize_done(
+                t, cfg, datetime.now(timezone.utc), skip_review=True
+            )
+        except Exception as exc:
+            reason = f"跳过审稿后自动收尾失败：{exc!r}"
+            store.update_status(
+                t["id"], state="needs_attention", error=reason,
+                last_event_at=store.utc_now_iso(),
+            )
+            store.append_event(t["id"], f"网页：跳过审稿，但自动收尾抛异常 → needs_attention：{reason}")
+            logger.warning("网页跳过审稿收尾异常：%s → %s：%s", pipeline_id, t["id"], reason)
+            return self._send_json(
+                409,
+                {"ok": False, "task_id": t["id"], "merge_ok": False,
+                 "error": f"已跳过审稿（取消了 {len(pending_reviews)} 个待审班），但自动收尾没成：{reason}"},
+            )
         build_status = store.read_status(t["id"])
         merge_ok = build_status.get("state") != "needs_attention"
         store.append_event(t["id"], "网页：跳过审稿，直接按 merge policy 收工")
