@@ -781,10 +781,16 @@ def test_validate_task_off_table_model_name_shape_gate():
     assert store.validate_task(
         make_task(model="claude-made-up-9.9"), RUNNERS_CONFIG,
     ) == "time"
+    # G11.1：Claude Code 的 1M 后缀写法（方括号、可带大写）必须放行
+    assert store.validate_task(
+        make_task(model="claude-opus-4-6[1M]"), RUNNERS_CONFIG,
+    ) == "time"
     with pytest.raises(ValueError, match="不支持这个模型"):
         store.validate_task(
             make_task(model="Claude 带大写和空格"), RUNNERS_CONFIG,
         )
+    with pytest.raises(ValueError, match="不支持这个模型"):
+        store.validate_task(make_task(model="claude-opus-4-6[1M"), RUNNERS_CONFIG)
     with pytest.raises(ValueError, match="不支持这个模型"):
         store.validate_task(make_task(model="-开头是短横线"), RUNNERS_CONFIG)
 

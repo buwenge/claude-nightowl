@@ -170,7 +170,10 @@ _RE_TASK_ID = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$")
 # config 模型表里——真实模型 id 都是这个形状（如 claude-fable-5-1、
 # gpt-5.6-luna），打错字/凭空编一个会在起跑时 claude/codex 报错才知道，
 # 不受单模型周线保护（前端已在自定义输入框旁写了这句提醒）。
-_RE_MODEL_NAME = re.compile(r"^[a-z0-9][a-z0-9.\-]{0,63}$")
+# G11.1（工头 9/2 真机撞到）：Claude Code 用 `claude-opus-4-6[1M]` 这种
+# 方括号后缀表示 1M 上下文版本，大小写都见过——字母不限大小写、下划线
+# 也认，末尾允许一段 `[字母数字]`；空格/斜杠/引号这类仍然拒绝。
+_RE_MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,63}(\[[A-Za-z0-9]{1,8}\])?$")
 
 # trigger.type == "after" 且 when == "ended" 时，前置链最新一班落在这些状态
 # 就算"已结束"（调度器与网页共用这一个定义）
