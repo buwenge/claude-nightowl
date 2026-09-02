@@ -89,8 +89,21 @@ def wait_until_state(task_id: str, background_id: str, states=("finished",), tim
 def test_load_registry_missing_and_bad_json(tmp_path):
     task_id = make_task()
     assert bgr.load_registry(task_id) == {}
+    # 总review F12：registry_path 挪进 background/ 子目录，这个子目录在生产
+    # 由 launcher.launch 预建；离线测试直接手工建一下，不靠 launch。
+    bgr.background_dir(task_id).mkdir(parents=True, exist_ok=True)
     bgr.registry_path(task_id).write_text("不是json", encoding="utf-8")
     assert bgr.load_registry(task_id) == {}
+
+
+def test_registry_path_lives_under_background_subdir():
+    """总review F12：登记簿必须落在 <task_dir>/background/registry.json，
+    不是 <task_dir>/background.json——Codex 沙箱对 task_dir 本身只读，
+    只有 background/ 子目录会被预建、放开写权限。"""
+    task_id = make_task()
+    path = bgr.registry_path(task_id)
+    assert path == bgr.background_dir(task_id) / "registry.json"
+    assert path.parent == store.task_dir(task_id) / "background"
 
 
 def test_modify_registry_roundtrip():

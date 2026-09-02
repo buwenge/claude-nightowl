@@ -14,7 +14,7 @@ import tomllib
 import uuid
 from pathlib import Path
 
-from . import store, worktree
+from . import background_runner, store, worktree
 
 __all__ = [
     "CodexTrustError",
@@ -339,12 +339,23 @@ def _codex_command(task: dict, config: dict, workdir: str, resume_thread_id: str
     删除——监理实测坐实 Codex 的信任闸门根本不认这个覆盖，留着只会误导人
     以为信任问题已经处理（见 ensure_codex_trusted 的 docstring）。真正的
     信任现在由 launch() 在起会话前调用 ensure_codex_trusted() 持久化写进
-    Codex 自己的 config.toml 解决，这里不再需要它。"""
+    Codex 自己的 config.toml 解决，这里不再需要它。
+
+    总review F12：build 角色（workspace-write 沙箱）额外放开 F12 后台
+    登记簿目录的写权限——`sandbox_mode="workspace-write"` 默认只放开
+    task cwd，Codex 官方沙箱实测对 task_dir 本身仍是只读（监理 9/2 坐实：
+    `codex sandbox -c 'sandbox_mode="workspace-write"' -- touch
+    ~/.nightshift/x` 报 Read-only file system），background_runner 起跑
+    时第一步就是往 `<task_dir>/background/registry.json` 落盘登记，必炸。
+    只放开登记簿目录，不放开整个 task_dir（那样模型能改自己的
+    status.json）；review 角色（read-only 沙箱）不加这条，read-only 下
+    这个 writable_roots 覆盖没有意义。"""
     d = store.task_dir(task["id"])
     rc = store.runner_config(config).get("codex") or {}
     profile = rc.get("profile", "nightowl")
     effort_override = f'model_reasoning_effort="{store.effective_effort(task)}"'
-    sandbox = "read-only" if store.role_of(task) == "review" else "workspace-write"
+    is_review = store.role_of(task) == "review"
+    sandbox = "read-only" if is_review else "workspace-write"
     parts = [_sq(codex_bin(config))]
     if resume_thread_id:
         parts += ["resume", _sq(resume_thread_id)]
@@ -354,6 +365,12 @@ def _codex_command(task: dict, config: dict, workdir: str, resume_thread_id: str
         "--ask-for-approval never",
         f"-m {_sq(store.effective_model(task))}",
         f"-c {_sq(effort_override)}",
+    ]
+    if not is_review:
+        bg_dir_literal = json.dumps(str(background_runner.background_dir(task["id"])))
+        writable_roots_override = f"sandbox_workspace_write.writable_roots=[{bg_dir_literal}]"
+        parts.append(f"-c {_sq(writable_roots_override)}")
+    parts += [
         f"--profile {_sq(profile)}",
         f"\"$(cat {_sq(d / 'prompt.txt')})\"",
     ]
@@ -608,6 +625,11 @@ def launch(task_id: str, config: dict) -> dict:
         )
 
     # ③ 任务三件套落盘
+    # 总review F12：F12 后台登记簿目录必须由调度器侧预建——Codex 的
+    # workspace-write 沙箱对 task_dir 本身是只读的（沙箱内 mkdir 不了），
+    # background_runner 起跑时第一步就要往这个目录下落盘登记簿，等它自己
+    # 建就晚了。两家 runner 都建，反正只是个空目录，无害。
+    background_runner.background_dir(task_id).mkdir(parents=True, exist_ok=True)
     write_task_files(task, config, session_id, resume_thread_id=resume_thread_id)
 
     # ④ 先落盘 launching（含预订的 session/transcript），再去碰 tmux

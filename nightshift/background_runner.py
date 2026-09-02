@@ -25,10 +25,16 @@ unified-exec 有"yield"机制，能在命令还没跑完时就把这次工具调
 "停止"改成请求-响应：`stop` 只原子写 `stop_requested_at`，仍在跑、仍持有
 `Popen` 对象的原 wrapper 自己在等待循环里发现请求，终止自己直接持有的子进程。
 
-登记簿是每任务一份 JSON：`<task_dir>/background.json`，`.background.lock`
-文件锁串行化读改写（wrapper 与 CLI 主进程会并发写）。命令全文只存安全摘要
-（可能含秘密），输出尾部限长且不落原始密钥类内容的假设由调用方负责
-（这层只截断，不脱敏）。
+登记簿是每任务一份 JSON：`<task_dir>/background/registry.json`（总review
+F12：从 `<task_dir>/background.json` 挪进 `background/` 子目录——监理
+9/2 实测坐实 Codex 的 workspace-write 沙箱对 task_dir 本身是只读的
+（`codex sandbox -c 'sandbox_mode="workspace-write"' -- touch
+~/.nightshift/x` 报 Read-only file system），只有 `<task_dir>/background`
+这个子目录会被 launcher 起跑前预建、且 Codex 命令行额外放开写权限，
+登记簿必须落在这个目录下才写得进去；F12 在生产从未真正工作过），
+`background/.lock` 文件锁串行化读改写（wrapper 与 CLI 主进程会并发写）。
+命令全文只存安全摘要（可能含秘密），输出尾部限长且不落原始密钥类内容的
+假设由调用方负责（这层只截断，不脱敏）。
 """
 
 from __future__ import annotations
@@ -58,7 +64,9 @@ _STOP_GRACE_SECONDS = 5
 
 
 def registry_path(task_id: str) -> Path:
-    return store.task_dir(task_id) / "background.json"
+    # 总review F12：从 <task_dir>/background.json 挪进 background/ 子目录
+    # ——Codex 沙箱对 task_dir 本身只读，只有这个子目录会被预建并放开写权限。
+    return background_dir(task_id) / "registry.json"
 
 
 def background_dir(task_id: str) -> Path:
@@ -79,10 +87,16 @@ def load_registry(task_id: str) -> dict:
 
 
 def modify_registry(task_id: str, mutator) -> dict:
-    """锁内读-改-写整份登记簿（同任务多个后台项并发落盘不许互相覆盖）。"""
-    d = store.task_dir(task_id)
+    """锁内读-改-写整份登记簿（同任务多个后台项并发落盘不许互相覆盖）。
+
+    总review F12：mkdir 的是 background_dir(task_id)（`<task_dir>/
+    background`），不是 task_dir 本身——Codex 沙箱内 task_dir 只读，
+    这个子目录才是被预建、放开写权限的那个（见 launcher.launch）。锁
+    文件同样挪进这个子目录：`background/.lock`。
+    """
+    d = background_dir(task_id)
     d.mkdir(parents=True, exist_ok=True)
-    with open(d / ".background.lock", "a+") as lock:
+    with open(d / ".lock", "a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             data = load_registry(task_id)

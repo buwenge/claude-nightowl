@@ -221,10 +221,16 @@ def test_run_sh_text_codex_new_session_command():
     cmd_line = next(line for line in run_sh.splitlines() if line.startswith("'codex'"))
     # S7.6：命令行 trust 覆盖已删除（Codex 信任闸门根本不认它，见
     # ensure_codex_trusted）；信任改由 launch() 起会话前持久化写盘解决。
+    # 总review F12：build 角色多一段 -c 'sandbox_workspace_write.
+    # writable_roots=[...]'，放开 F12 登记簿目录的写权限。
+    from nightshift import background_runner
+
+    bg_dir_literal = json.dumps(str(background_runner.background_dir(task_id)))
     assert cmd_line == (
         "'codex' -C '/home/user/projects/demo' --sandbox workspace-write "
         "--ask-for-approval never -m 'gpt-5.6-luna' "
         '-c \'model_reasoning_effort="high"\' '
+        f"-c 'sandbox_workspace_write.writable_roots=[{bg_dir_literal}]' "
         "--profile 'nightowl' "
         f"\"$(cat '{store.task_dir(task_id) / 'prompt.txt'}')\""
     )
@@ -978,6 +984,53 @@ def test_codex_command_review_role_uses_read_only_sandbox():
     build_cmd = launcher._codex_command(build_task, CODEX_CONFIG, "/work/tree", None)
     assert "--sandbox workspace-write" in build_cmd
     assert "model_reasoning_effort=\"high\"" in build_cmd  # build 用顶层 effort
+
+
+def test_codex_command_build_role_opens_writable_roots_for_background_dir():
+    """总review F12：Codex 的 workspace-write 沙箱实测对 task_dir 本身只读
+    （监理 9/2 坐实），background_runner 起跑时要往 <task_dir>/background/
+    registry.json 落盘，必须显式放开这个目录的写权限——只放这一个子目录，
+    不是整个 task_dir（那样模型能改自己的 status.json）。review 角色
+    （read-only 沙箱）不该出现这个覆盖，没有意义。"""
+    from nightshift import background_runner
+
+    task_id = "20260830-000000-aaaa"
+    task = {
+        "id": task_id, "title": "T", "project": "demo",
+        "runner": "codex", "model": "gpt-5.6-luna", "effort": "high", "role": "build",
+    }
+    cmd = launcher._codex_command(task, CODEX_CONFIG, "/work/tree", None)
+    bg_dir = str(background_runner.background_dir(task_id))
+    assert "sandbox_workspace_write.writable_roots=" in cmd
+    assert bg_dir in cmd
+
+    review_task = {
+        **task, "role": "review",
+        "review": {
+            "enabled": True, "runner": "codex", "model": "gpt-5.6-luna",
+            "effort": "high", "max_rounds": 5, "on_no_quota": "release",
+            "merge_policy": "manual", "criteria_text": "",
+        },
+    }
+    review_cmd = launcher._codex_command(review_task, CODEX_CONFIG, "/work/tree", None)
+    assert "sandbox_workspace_write.writable_roots=" not in review_cmd
+
+
+def test_launch_precreates_background_dir_for_both_runners(monkeypatch):
+    """总review F12：background_dir 必须由调度器侧（launch）预建——沙箱内
+    mkdir 不了只读的 task_dir，登记簿第一次落盘那一步必炸。两家 runner
+    都建（Claude 不受沙箱限制，建了也无害）。"""
+    from nightshift import background_runner
+
+    monkeypatch.setattr(launcher, "is_trusted", lambda path: True)
+    monkeypatch.setattr(
+        launcher, "_tmux",
+        lambda *a: subprocess.CompletedProcess(a, 0, "@1\n" if a[0] == "new-window" else "123\n", ""),
+    )
+
+    task_id, config = make_task(worktree=False)
+    launcher.launch(task_id, config)
+    assert background_runner.background_dir(task_id).is_dir()
 
 
 def test_write_task_files_review_codex_skips_settings_json(tmp_path):
