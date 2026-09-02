@@ -264,6 +264,16 @@ def _quota_check(task: dict, config: dict) -> tuple[str | None, str, dict]:
         from .quota import resets_in_minutes
 
         resets_in = resets_in_minutes(usage.get("session_resets"))
+        if resets_in == 0:
+            # F6：resets_in==0 意味着缓存里这份 usage 自己说的刷新时刻已经
+            # 过去了——这份数据早于本轮刷新（多半是闹钟刚醒、这次工具调用
+            # 触发的刷新还没把 quota.json 换成新数据），不能拿着它再判一次
+            # "到线"，那只会让模型白等一轮。等下一次真正刷新（resets_in
+            # is None 时不知道新旧，按原行为放行判定，不在这里拦）。
+            store.append_event(
+                task["id"], "缓存额度早于刷新时刻，跳过五小时暂停判定，等下一次刷新"
+            )
+            return None, "", {}
         if store.role_of(task) == "review":
             # S7.1 阻断二：review 不走 build 那套 ScheduleWakeup 多轮自我唤醒
             # 闹钟——那套闹钟醒来的中间回复不带 NEXT，会被 review 的 Stop

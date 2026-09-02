@@ -350,6 +350,14 @@ def write_quota_dual(session=10, week=10, per_model=None, age_minutes=0) -> None
     )
 
 
+def _resets_text(dt: datetime) -> str:
+    """把 datetime 格成 /usage 那种 `Aug 27, 6:40pm (UTC)` 文本，喂给
+    `quota.resets_in_minutes` 用。"""
+    hour12 = dt.hour % 12 or 12
+    ampm = "am" if dt.hour < 12 else "pm"
+    return f"{dt.strftime('%b')} {dt.day}, {hour12}:{dt.minute:02d}{ampm} (UTC)"
+
+
 def test_post_tool_use_injects_context_warn_at_20_and_40(tmp_path):
     task_id = make_task(
         guards={
@@ -528,6 +536,58 @@ def test_post_tool_use_quota_freshness_floor_at_5_minute_refresh(tmp_path):
         proc = run_hook(task_id2, "PostToolUse", payload2)
     assert proc.stdout == ""
     assert store.read_status(task_id2).get("quota_pause_count") is None
+
+
+# ---------- 总review F6：缓存额度早于本轮刷新时刻时不重复注入五小时暂停 ----------
+
+
+def test_post_tool_use_quota_pause_skipped_when_cached_usage_predates_refresh(tmp_path):
+    """模型闹钟醒来后第一次工具调用触发刷新，quota.json 若还是刷新前抓的
+    （session_resets 已经过去）——这份数据早于本轮刷新，不该再注一次
+    "停下定闹钟"，让模型白等一轮。"""
+    task_id = make_task(guards={
+        "session_pct_max": 80, "weekly_pct_max": 95,
+        "context_warn_tokens": 100000, "context_limit_tokens": 200000,
+    })
+    past = datetime.now(timezone.utc) - timedelta(minutes=10)
+    store.atomic_write_json(store.home() / "quota.json", {
+        "usage": {
+            "session_pct": 90, "week_all_pct": 10, "per_model": {},
+            "session_resets": _resets_text(past),
+        },
+        "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    payload = make_transcript(tmp_path / "transcript.jsonl", 100)
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", payload)
+    proc = run_hook(task_id, "PostToolUse", payload)  # 第 20 次
+    assert proc.stdout == ""
+    status = store.read_status(task_id)
+    assert "quota_paused_until" not in status
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "缓存额度早于刷新时刻，跳过五小时暂停判定，等下一次刷新" in events
+
+
+def test_post_tool_use_quota_pause_fires_when_resets_still_in_future(tmp_path):
+    task_id = make_task(guards={
+        "session_pct_max": 80, "weekly_pct_max": 95,
+        "context_warn_tokens": 100000, "context_limit_tokens": 200000,
+    })
+    future = datetime.now(timezone.utc) + timedelta(minutes=30)
+    store.atomic_write_json(store.home() / "quota.json", {
+        "usage": {
+            "session_pct": 90, "week_all_pct": 10, "per_model": {},
+            "session_resets": _resets_text(future),
+        },
+        "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    payload = make_transcript(tmp_path / "transcript.jsonl", 100)
+    for _ in range(19):
+        run_hook(task_id, "PostToolUse", payload)
+    proc = run_hook(task_id, "PostToolUse", payload)  # 第 20 次
+    ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "五小时额度只剩 10%" in ctx
+    assert store.read_status(task_id)["quota_paused_until"]
 
 
 def test_post_tool_use_context_and_quota_one_json_two_paragraphs(tmp_path):
