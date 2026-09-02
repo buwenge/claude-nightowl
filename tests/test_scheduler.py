@@ -1419,32 +1419,39 @@ def test_idle_after_alarm_expired_and_hook_cleared_pause_not_repoked(monkeypatch
     assert store.read_status(tid)["state"] == "finished"
 
 
-def test_claude_waiting_wakeup_grace_period_59_minutes_not_poked(monkeypatch):
-    """F3：闹钟没丢的正常路径——刷新时间过了不到 60 分钟，调度器还得再等
-    它自己醒，不许提前敲。"""
+def test_claude_waiting_wakeup_grace_period_not_yet_silent_55_minutes_not_poked(monkeypatch):
+    """F3：闹钟没丢的正常路径——刷新时间已过但会话静默还不到 55 分钟（最后一个
+    hook 事件是 54 分钟前），调度器还得再等它自己醒，不许提前敲；刷新时间
+    没到时哪怕静默两小时也不敲（那是它自己在等刷新）。"""
     fakes = Fakes(monkeypatch)
     tid = make_task()
-    paused_until = NOW - timedelta(minutes=59)
+    paused_until = NOW - timedelta(minutes=10)
     store.update_status(tid, state="waiting_wakeup", window_id="@1", pane_pid=NO_PID,
                         quota_paused_until=scheduler.to_iso(paused_until),
-                        last_event_at=scheduler.to_iso(NOW - timedelta(hours=1)))
+                        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=54)))
     scheduler.tick(CONFIG, NOW)
     assert fakes.send_keys_calls == []
     status = store.read_status(tid)
     assert status["state"] == "waiting_wakeup"
     assert status["quota_paused_until"] == scheduler.to_iso(paused_until)
+    # 刷新时间还没到：静默再久也不敲
+    store.update_status(tid, quota_paused_until=scheduler.to_iso(NOW + timedelta(minutes=5)),
+                        last_event_at=scheduler.to_iso(NOW - timedelta(hours=2)))
+    scheduler.tick(CONFIG, NOW)
+    assert fakes.send_keys_calls == []
 
 
-def test_claude_waiting_wakeup_grace_period_61_minutes_poked_once(monkeypatch):
-    """F3：闹钟大概率丢了（CC 的 cron 没触发）——超过 60 分钟宽限期，调度器
-    主动敲一句让它继续，且只敲这一次（quota_resume_sent 落盘后下一 tick
-    不再重复）。"""
+def test_claude_waiting_wakeup_grace_period_silent_56_minutes_poked_once(monkeypatch):
+    """F3：闹钟大概率丢了（CC 的 cron 没触发）——刷新时间已过、会话静默满
+    55 分钟（最后一个 hook 事件 56 分钟前），调度器主动敲一句让它继续（缓存
+    TTL 60 分钟，敲进去时还是热的），且只敲这一次（quota_resume_sent 落盘后
+    下一 tick 不再重复）。"""
     fakes = Fakes(monkeypatch)
     tid = make_task()
-    paused_until = NOW - timedelta(minutes=61)
+    paused_until = NOW - timedelta(minutes=10)
     store.update_status(tid, state="waiting_wakeup", window_id="@1", pane_pid=NO_PID,
                         quota_paused_until=scheduler.to_iso(paused_until),
-                        last_event_at=scheduler.to_iso(NOW - timedelta(hours=1)))
+                        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=56)))
     scheduler.tick(CONFIG, NOW)
     assert len(fakes.send_keys_calls) == 1
     _, text = fakes.send_keys_calls[0]
@@ -1453,7 +1460,7 @@ def test_claude_waiting_wakeup_grace_period_61_minutes_poked_once(monkeypatch):
     assert status["quota_resume_sent"] is True
     assert status["quota_paused_until"] is None
     events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
-    assert "额度刷新已过 60 分钟仍未自醒" in events
+    assert "会话静默超过 55 分钟仍未自醒" in events
 
     # 状态还没被下一次 UserPromptSubmit 事件推进（测试里没有真的 hook），
     # 但 quota_resume_sent 已经落盘，下一 tick 不该再敲第二次

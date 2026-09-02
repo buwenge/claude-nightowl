@@ -1005,7 +1005,7 @@ function taskCard(item, now, chainIds, opts) {
   // 总review F1：`quota_paused_until` 两家都会落（hook._post_tool_use_refresh
   // 的 pause 分支对 Claude 同样写这个字段），文案必须按 runner 分——Codex
   // 没有 ScheduleWakeup，只能等调度器主动叫醒；Claude 自己设了缓存闹钟，
-  // 到点自行继续（超过 60 分钟没醒，调度器兜底叫，见 F3）。
+  // 到点自行继续（刷新后静默满 55 分钟没醒，调度器兜底叫，见 F3）。
   if (status.quota_paused_until) {
     if (runner === "codex" && state === "waiting_wakeup") {
       card.appendChild(el("div", { class: "quota-line",
@@ -1013,7 +1013,7 @@ function taskCard(item, now, chainIds, opts) {
     } else if (runner === "claude" && state === "waiting_wakeup") {
       card.appendChild(el("div", { class: "quota-line",
         text: "五小时额度到线，预计 " + fmtLocal(status.quota_paused_until) +
-          " 刷新；会话自带闹钟到点自行继续（超过 60 分钟未醒由调度器叫醒）" }));
+          " 刷新；会话自带闹钟到点自行继续（静默满 55 分钟未醒由调度器叫醒）" }));
     } else if (runner === "claude" && state === "idle") {
       card.appendChild(el("div", { class: "quota-line",
         text: "五小时额度到线已停下，预计 " + fmtLocal(status.quota_paused_until) +
