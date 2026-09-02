@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from nightshift import __main__ as cli
-from nightshift import auth, launcher, server, store
+from nightshift import auth, launcher, scheduler, server, store
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -991,14 +991,19 @@ def test_put_task_terminal_conflict(authed):
 
 
 def test_put_task_failed_cancelled_still_editable(authed):
+    """failed/cancelled 仍可全字段编辑；9/1 起编辑成功即重排回 scheduled，
+    夹具的 run_at（2026-08-28）已过，所以要连时间一起改（只改标题会 400 指向
+    「现在就跑」，见 test_put_task_failed_cancelled_reschedules_or_refuses_past_time）。"""
     task_id = make_task(authed, "失败还能改")
     for state in ("failed", "cancelled"):
         store.update_status(task_id, state=state)
         status, _, body = authed.request(
-            "PUT", f"/api/tasks/{task_id}", {"title": f"{state}改的"}
+            "PUT", f"/api/tasks/{task_id}",
+            {"title": f"{state}改的", "run_at": "2099-01-01T15:00:00Z"},
         )
-        assert status == 200, state
+        assert status == 200, (state, body)
         assert store.load_task(task_id)["title"] == f"{state}改的"
+        assert store.read_status(task_id)["state"] == "scheduled"
 
 
 def test_put_task_validation_400_and_404(authed):
@@ -2577,3 +2582,144 @@ def test_pipeline_detail_old_pipeline_falls_back_to_root_id(authed):
     assert status == 200
     assert body["pipeline_id"] == task_id
     assert [m["id"] for m in body["members"]] == [task_id]
+
+
+# ---------- 9/1 Fable 审查 C 组回归 ----------
+
+
+def test_cancel_refused_when_pipeline_member_is_held_waiting(authed):
+    """C1：流水线卡片上"最新一班"是还没起跑的审稿班，单独取消它会让 held 的
+    build 永远等审稿（skip-review/fix-now 都因"审稿已 cancelled"409）。"""
+    build_id, review_id = make_review_pipeline(authed, review_state="scheduled")
+    status, _, body = authed.request("POST", f"/api/tasks/{review_id}/cancel")
+    assert status == 409 and "跳过审稿" in body["error"]
+    assert store.read_status(review_id)["state"] == "scheduled"
+    # 对照：没人 held 着等（build 已 exited）照旧可取消
+    build_id, review_id = make_review_pipeline(authed, build_state="exited", review_state="scheduled")
+    status, _, _ = authed.request("POST", f"/api/tasks/{review_id}/cancel")
+    assert status == 200
+    assert store.read_status(review_id)["state"] == "cancelled"
+
+
+def test_put_task_failed_cancelled_reschedules_or_refuses_past_time(authed):
+    """C2：failed/cancelled 编辑后回 scheduled（同 postponed）；按时间触发且时间
+    已过 → 400 指向「现在就跑」，什么都不写。"""
+    for state in ("failed", "cancelled"):
+        task_id = make_task(authed, f"{state} 重排")
+        store.update_status(task_id, state=state, error="旧错误", retries=2, retry_at="x")
+        status, _, body = authed.request(
+            "PUT", f"/api/tasks/{task_id}", {"run_at": "2099-01-01T15:00:00Z"}
+        )
+        assert status == 200 and body["rescheduled"] is True and body["state"] == "scheduled"
+        st = store.read_status(task_id)
+        assert st["state"] == "scheduled" and st["retries"] == 0
+        assert "error" not in st and "retry_at" not in st
+        events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+        assert f"从 {state} 重新排班" in events
+    task_id = make_task(authed, "时间已过")
+    store.update_status(task_id, state="cancelled")
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {"title": "只改标题"})
+    assert status == 400 and "现在就跑" in body["error"]
+    assert store.read_status(task_id)["state"] == "cancelled"
+    assert store.load_task(task_id)["title"] == "时间已过"
+    # after 触发不看时间：cancelled 的 after 任务改标题照旧重排
+    pre = make_task(authed, "前置")
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "等前置", "project": "demo", "model": "claude-fable-5", "effort": "high",
+        "task_text": "正文", "prompt_final": "提示词",
+        "trigger": {"type": "after", "task": pre, "when": "finished"},
+    })
+    assert status == 201
+    store.update_status(body["id"], state="cancelled")
+    status, _, body2 = authed.request("PUT", f"/api/tasks/{body['id']}", {"title": "改标题"})
+    assert status == 200 and body2["rescheduled"] is True
+    # scheduled 任务编辑不算重排，响应如实说
+    task_id = make_task(authed, "普通编辑")
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {"title": "x"})
+    assert status == 200 and body["rescheduled"] is False and body["state"] == "scheduled"
+
+
+def test_message_send_keys_failure_keeps_draft_returns_502(authed, monkeypatch):
+    task_id = make_task(authed, "捎话失败")
+    store.update_status(task_id, state="working", window_id="@9", pane_pid=1)
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(launcher, "send_keys",
+                        lambda wid, text: subprocess.CompletedProcess([], 1, "", "tmux: bad"))
+    status, _, body = authed.request(
+        "POST", f"/api/tasks/{task_id}/message", {"text": "先跑测试", "send": True}
+    )
+    assert status == 502 and "草稿" in body["error"]
+    assert (store.task_dir(task_id) / "draft.txt").read_text(encoding="utf-8") == "先跑测试"
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "send-keys 失败" in events
+
+
+def test_pipeline_skip_review_merge_failure_body_explains(authed, monkeypatch):
+    build_id, review_id = make_review_pipeline(authed, review_state="scheduled")
+
+    def fake_finalize(task, config, now, skip_review=False):
+        store.update_status(task["id"], state="needs_attention", error="主线有未提交改动")
+        return ["合并没成"]
+
+    monkeypatch.setattr(scheduler, "_finalize_done", fake_finalize)
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/skip-review")
+    assert status == 409 and body["merge_ok"] is False
+    assert "主线有未提交改动" in body["error"] and "取消了 1 个待审班" in body["error"]
+
+
+def test_pipeline_fix_now_reuses_fixed_name_review_file_only(authed, monkeypatch, tmp_path):
+    build_id, review_id = make_review_pipeline(authed, review_state="idle")
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, config: True)
+    monkeypatch.setattr(launcher, "send_keys", lambda wid, text: subprocess.CompletedProcess([], 0))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("任务目录之外的内容", encoding="utf-8")
+    store.update_status(review_id, review_file=str(outside))
+    status, _, body = authed.request("POST", f"/api/tasks/{build_id}/fix-now", {})
+    assert status == 400, body
+    assert not (store.task_dir(review_id) / "review-1.md").exists()
+
+
+@pytest.mark.parametrize("run_at", [
+    "2026-08-27T18:00:00+08:00Z", "2026-08-27 18:00:00Z", "20260827T180000Z",
+])
+def test_create_task_rejects_odd_run_at_forms(authed, run_at):
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "t", "project": "demo", "model": "claude-fable-5", "effort": "high",
+        "run_at": run_at, "task_text": "正文", "prompt_final": "提示词",
+    })
+    assert status == 400 and "run_at" in body["error"], (run_at, body)
+
+
+def test_create_task_accepts_web_millisecond_run_at(authed):
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "t", "project": "demo", "model": "claude-fable-5", "effort": "high",
+        "run_at": "2026-08-28T18:00:00.000Z", "task_text": "正文", "prompt_final": "提示词",
+    })
+    assert status == 201, body
+
+
+@pytest.mark.parametrize("payload", [
+    {"guards": {"session_pct_max": "80"}}, {"guards": {"weekly_pct_max": True}},
+    {"guards": {"model_weekly_pct_max": 150}}, {"guards": {"context_warn_tokens": "abc"}},
+    {"guards": {"context_warn_tokens": -1}}, {"guards": {"context_warn_ratio": 3}},
+    {"guards": {"keepalive": "yes"}}, {"chain": {"max_windows": "3"}},
+    {"chain": {"max_windows": 0}}, {"chain": {"on_no_handover": "panic"}},
+])
+def test_create_task_rejects_mistyped_guards_and_chain(authed, payload):
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "t", "project": "demo", "model": "claude-fable-5", "effort": "high",
+        "run_at": "2026-08-28T18:00:00Z", "task_text": "正文", "prompt_final": "提示词",
+        **payload,
+    })
+    assert status == 400, (payload, body)
+
+
+def test_create_task_trigger_task_must_look_like_a_task_id(authed):
+    pre = make_task(authed, "前置")
+    for bad in (f"../tasks/{pre}", pre.upper(), 123):
+        status, _, body = authed.request("POST", "/api/tasks", {
+            "title": "等前置", "project": "demo", "model": "claude-fable-5", "effort": "high",
+            "task_text": "正文", "prompt_final": "提示词",
+            "trigger": {"type": "after", "task": bad, "when": "finished"},
+        })
+        assert status == 400 and "trigger.task" in body["error"], (bad, body)

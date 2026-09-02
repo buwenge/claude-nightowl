@@ -13,6 +13,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import secrets
 import uuid
 from datetime import datetime, timezone
@@ -153,6 +154,19 @@ _REVIEW_CONFIG_DEFAULTS = {
     "merge_policy": "manual",
     "criteria_text": "",
 }
+
+# run_at 只认 `YYYY-MM-DDTHH:MM:SSZ`（utc_now_iso 写的）或带 1–6 位小数秒的
+# 同形状（网页 Date.toISOString() 写的 .000Z）。9/1 审查：以前只查"Z 结尾且
+# 去掉 Z 能 fromisoformat"，`…T18:00:00+08:00Z` 能过校验但 scheduler.parse_iso
+# 直接 ValueError；空格分隔/紧凑格式能解析但 list_tasks 按字符串排序会错位
+# （A 组 N9）。前端/CLI 正常路径发的两种形状都在这个正则里。
+_RE_RUN_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
+# guards 里的数值线：百分比 0–100，tokens/比例为正数；bool 不算数字
+_GUARD_PCT_KEYS = ("session_pct_max", "weekly_pct_max", "model_weekly_pct_max")
+_GUARD_TOKEN_KEYS = ("context_warn_tokens", "context_limit_tokens")
+# 任务 id 的形状（与 server 路由正则一致）：trigger.task 也只认这个形状，不让
+# "../tasks/<id>" 这类能凑出 task.json 的相对路径混进 task.json
+_RE_TASK_ID = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$")
 
 # trigger.type == "after" 且 when == "ended" 时，前置链最新一班落在这些状态
 # 就算"已结束"（调度器与网页共用这一个定义）
@@ -428,11 +442,45 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
         value = task.get(key)
         if value is not None and not isinstance(value, dict):
             raise ValueError(f"{key} 必须是对象")
-    auto = (task.get("guards") or {}).get("auto_interrupt_minutes")
+    guards = task.get("guards") or {}
+    auto = guards.get("auto_interrupt_minutes")
     if auto is not None and (
         isinstance(auto, bool) or not isinstance(auto, int) or auto <= 0
     ):
         raise ValueError("guards.auto_interrupt_minutes 必须是正整数")
+    # 9/1 审查：其余数值线以前不查类型/范围，"80"（字符串）、True、150 都能落盘，
+    # 到 quota.check_guards 的 `int > str` / hook.warn_threshold 的 int("abc") 才炸
+    # ——预检或 hook 里炸掉的是整条 tick/整个会话，不是这一条任务。
+    for key in _GUARD_PCT_KEYS:
+        value = guards.get(key)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or not 0 <= value <= 100
+        ):
+            raise ValueError(f"guards.{key} 必须是 0–100 的数字")
+    for key in _GUARD_TOKEN_KEYS:
+        value = guards.get(key)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0
+        ):
+            raise ValueError(f"guards.{key} 必须是正数")
+    ratio = guards.get("context_warn_ratio")
+    if ratio is not None and (
+        isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not 0 < ratio <= 1
+    ):
+        raise ValueError("guards.context_warn_ratio 必须是 0–1 之间的数字")
+    if guards.get("keepalive") is not None and not isinstance(guards["keepalive"], bool):
+        raise ValueError("guards.keepalive 必须是布尔值")
+    if guards.get("context_warn_text") is not None and not isinstance(guards["context_warn_text"], str):
+        raise ValueError("guards.context_warn_text 必须是字符串")
+    chain = task.get("chain") or {}
+    max_windows = chain.get("max_windows")
+    if max_windows is not None and (
+        isinstance(max_windows, bool) or not isinstance(max_windows, int) or max_windows <= 0
+    ):
+        raise ValueError("chain.max_windows 必须是正整数")
+    if chain.get("on_no_handover") is not None and chain["on_no_handover"] not in ("continue", "stop"):
+        raise ValueError("chain.on_no_handover 只认 continue / stop")
 
     # S5：worktree 只有显式 true/false 两种
     if task.get("worktree") is not None and not isinstance(task.get("worktree"), bool):
@@ -503,9 +551,10 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
             pass
         elif ttype == "after":
             pre_id = trigger.get("task")
-            if not pre_id or task_id == str(pre_id) or not (
-                task_dir(str(pre_id)) / "task.json"
-            ).is_file():
+            if (
+                not isinstance(pre_id, str) or not _RE_TASK_ID.match(pre_id)
+                or task_id == pre_id or not (task_dir(pre_id) / "task.json").is_file()
+            ):
                 raise ValueError(f"trigger.task 必须是已存在的任务 id：{pre_id}")
             if trigger.get("when") not in ("finished", "ended"):
                 raise ValueError("trigger.when 只认 finished / ended")
@@ -514,7 +563,7 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
 
     run_at = task.get("run_at")
     if run_at:
-        if not (isinstance(run_at, str) and run_at.endswith("Z")):
+        if not (isinstance(run_at, str) and _RE_RUN_AT.match(run_at)):
             raise ValueError("run_at 必须是 Z 结尾的 ISO UTC 时间，如 2026-08-27T18:00:00Z")
         try:
             datetime.fromisoformat(run_at[:-1])

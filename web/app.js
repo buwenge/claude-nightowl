@@ -14,6 +14,10 @@ var EDIT_TASK = null;      // 正在编辑的任务 {id, item, active}；null = 
 var MSG_TASK = null;       // 正在捎话的任务 {id, title}
 var FIXNOW_TASK = null;    // 正在"直接返工"的流水线 {id, title}（id 是 coordinator）
 var PIPELINE_DETAIL_CACHE = {};  // pipeline_id -> {loading:true} | {data: {...}}（按 pipeline_id 缓存，避免 5 秒重画重复请求）
+var PIPELINE_SIG = {};     // pipeline_id -> 上次重画时成员的 state/round/存档点签名；变了就作废详情缓存
+var TASKS_SEQ = 0;         // /api/tasks 请求序号：慢的旧响应不许盖掉快的新响应
+var SUBMIT_INFLIGHT = false;  // 新建/编辑表单正在提交：按钮禁用，防手机双击建两个任务
+var FORM_STALE = false;    // 表单里还留着上一次编辑/已建成任务的内容：下次进「新建」先清空
 var screenTimer = null;
 var previewTimer = null;
 var LAST_ITEMS = [];       // 上一次 /api/tasks 的原始结果，供日期筛选本地重画用
@@ -186,9 +190,15 @@ function showView(name) {
 
 // 终态组按 run_at 降序那段依赖 groupOf 的编号，awaiting_merge 在 0、终态在 3
 function refreshTasks() {
+  var seq = ++TASKS_SEQ;
   api("GET", "./api/tasks").then(function (items) {
+    if (seq !== TASKS_SEQ) return;  // 更晚发出的请求已经回来过了，旧结果作废
     renderTasks(items || []);
-  }).catch(function () { /* banner 已提示 */ });
+  }).catch(function (err) {
+    // GET 失败默认不 banner；任务列表是唯一的状态来源，静默会让页面冻在
+    // 上一次成功的画面上像一切正常——每 5 秒提示一次，直到恢复
+    banner("任务列表拉不到：" + err.message);
+  });
   api("GET", "./api/worktrees").then(function (orphans) {
     renderOrphans(orphans || []);
   }).catch(function () { /* 拉不到就不显示，不拦任务列表 */ });
@@ -743,7 +753,25 @@ function loadPipelineDetail(pipelineId, body) {
 
 // 只在用户首次展开时懒加载，按 pipeline_id 缓存；5 秒重画只是命中缓存
 // 重渲染，不会对每张卡造成 N+1 详情请求（同一 pipeline_id 缓存过就不重发）。
+function pipelineSignature(chain) {
+  var coord = (pipelineCoordinatorItem(chain).status) || {};
+  return chain.shifts.map(function (it) {
+    var s = it.status || {};
+    return it.task.id + ":" + (s.state || "") + ":" + (it.task.round || 1) + ":" +
+      (s.checkpoint_sha || "") + ":" + (s.review_verdict || "");
+  }).join("|") + "|" + (coord.pipeline_phase || "") + ":" + (coord.fix_count || 0);
+}
+
 function pipelineDetailPanel(chain) {
+  // 缓存只在成员没变时命中：某一班换了状态/轮次/存档点/verdict（新一轮审完、
+  // 返工起跑…）就把已拿到的数据作废，展开着的详情下一次重画重新拉；飞行中的
+  // 请求不动（它回来的数据本来就是新的）。没变就照旧不发请求，不回到 N+1。
+  var sig = pipelineSignature(chain);
+  if (PIPELINE_SIG[chain.root] !== undefined && PIPELINE_SIG[chain.root] !== sig) {
+    var cached = PIPELINE_DETAIL_CACHE[chain.root];
+    if (cached && cached.data) PIPELINE_DETAIL_CACHE[chain.root] = null;
+  }
+  PIPELINE_SIG[chain.root] = sig;
   var body = el("div", { class: "pipeline-detail-body" }, [el("p", { class: "hint", text: "展开后加载…" })]);
   var wrap = el("details", { class: "pipeline-detail" }, [
     el("summary", { text: "流水线详情" }),
@@ -1029,8 +1057,8 @@ function taskCard(item, now, chainIds, opts) {
   card.appendChild(el("div", { class: "task-when", text: whenText }));
 
   // 上下文水位条
-  var limit = (task.guards && task.guards.context_limit_tokens) ||
-    (CFG && CFG.models && CFG.models[task.model] && CFG.models[task.model].context_limit);
+  // 上限按 runner 自己的模型表查（modelLimit 内部兜底到旧顶层 CFG.models）
+  var limit = (task.guards && task.guards.context_limit_tokens) || modelLimit(task.model, runner);
   var pct = (typeof status.context_pct === "number") ? status.context_pct :
     (status.context_tokens && limit ? Math.round(100 * status.context_tokens / limit) : null);
   if (pct !== null) {
@@ -1313,6 +1341,16 @@ function applyEditMode() {
 
 function enterCreate() {
   EDIT_TASK = null;
+  if (FORM_STALE) {
+    // 上一次用表单是编辑某任务或刚建成一个：标题/正文/提示词/时间/额度线都还是
+    // 它的，直接"新建"会复制出一份旧任务（时间若已过，下一 tick 就起跑）。
+    // 只在这种情况清空——用户自己填了一半切去看任务页再回来，草稿要留着。
+    $("new-form").reset();
+    $("f-model-custom").hidden = true;
+    $("f-review-model-custom").hidden = true;
+    if (CFG) populateNewForm();
+    FORM_STALE = false;
+  }
   applyEditMode();
   setTriggerMode("time");
   unmarkPromptEdited();
@@ -1338,6 +1376,7 @@ function enterCreate() {
 function enterEdit(item) {
   var task = item.task, status = item.status, guards = task.guards || {};
   EDIT_TASK = { id: task.id, item: item, active: ACTIVE_STATES.indexOf(status.state) >= 0 };
+  FORM_STALE = true;
   $("f-title").value = task.title || "";
   if (task.project) $("f-project").value = task.project;
   var runner = task.runner || "claude";
@@ -1631,16 +1670,24 @@ function submitNewForm(ev) {
     if (mode !== "after") body.run_at = runAtIso;  // after 模式不发
   }
 
+  if (SUBMIT_INFLIGHT) return;  // 手机双击/网络慢再点一下：第二次不发
+  SUBMIT_INFLIGHT = true;
+  $("new-submit").disabled = true;
+  var settle = function () { SUBMIT_INFLIGHT = false; $("new-submit").disabled = false; };
   var req = editing ?
     api("PUT", "./api/tasks/" + EDIT_TASK.id, body) :
     api("POST", "./api/tasks", body);
   req.then(function (data) {
+    settle();
     if (editing) HIGHLIGHT_ID = EDIT_TASK.id;
     else HIGHLIGHT_ID = data.id;
     EDIT_TASK = null;
+    FORM_STALE = true;  // 已建成/已保存：下次进「新建」从空表单开始
     showView("tasks");
-    banner(editing ? "已保存修改" : "任务已建：" + HIGHLIGHT_ID);
-  }).catch(function () { /* 错误已显示 */ });
+    if (!editing) banner("任务已建：" + HIGHLIGHT_ID);
+    else if (data && data.rescheduled) banner("已保存修改，已按新设置重新排班");
+    else banner("已保存修改");
+  }).catch(function () { settle(); /* 错误已显示 */ });
 }
 
 /* ---------- 模板页 ---------- */
