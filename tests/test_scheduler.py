@@ -93,6 +93,10 @@ class Fakes:
         self.close_calls: list[list[str]] = []
 
         monkeypatch.setattr(launcher, "is_trusted", lambda path: self.trusted)
+        monkeypatch.setattr(
+            launcher, "trust_check",
+            lambda path: "trusted" if self.trusted else "untrusted",
+        )
         monkeypatch.setattr(launcher, "launch", self._launch)
         monkeypatch.setattr(
             launcher, "window_alive", lambda wid, config: self.window_alive
@@ -292,6 +296,28 @@ def test_untrusted_project_fails_without_postpone(monkeypatch):
     assert fakes.launch_calls == []
     # 信任检查在额度之前：根本不该去查 /usage
     assert fakes.fetch_calls == []
+
+
+def test_unreadable_trust_file_postpones_not_fails(monkeypatch):
+    """总review二 G5：~/.claude.json 解析失败（撕裂读）跟"真的没信任过"不是
+    一回事——前者该走推迟重试，不能一次读文件的运气不好就判死刑。"""
+    fakes = Fakes(monkeypatch)
+    monkeypatch.setattr(launcher, "trust_check", lambda path: "unreadable")
+    tid = make_task()
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "postponed"
+    assert "信任文件暂时读不了" in status["postpone_reason"]
+    assert fakes.launch_calls == []
+    assert fakes.fetch_calls == []  # 信任检查仍在额度之前
+
+    # 真未信任（trust_check 返回 untrusted）继续判 failed，不受这条改动影响
+    monkeypatch.setattr(launcher, "trust_check", lambda path: "untrusted")
+    tid2 = make_task(title="真没信任")
+    scheduler.tick(CONFIG, NOW)
+    status2 = store.read_status(tid2)
+    assert status2["state"] == "failed"
+    assert "未信任" in status2["error"]
 
 
 def test_launch_failure_reported_from_launch_return(monkeypatch):

@@ -390,6 +390,27 @@ def test_is_trusted_three_cases(tmp_path, monkeypatch):
     assert launcher.is_trusted("/some/dir") is False
 
 
+def test_trust_check_distinguishes_unreadable_from_untrusted(tmp_path, monkeypatch):
+    """总review二 G5：trust_check 的第三态——文件存在但解析失败（撕裂读）
+    跟"文件缺/键缺/显式 false"这几种真未信任要分得清，is_trusted 仍然把
+    三态压平成 False（不区分的调用方用它）。"""
+    claude_json = tmp_path / "claude.json"
+    monkeypatch.setenv("NIGHTSHIFT_CLAUDE_JSON", str(claude_json))
+
+    assert launcher.trust_check("/some/dir") == "untrusted"  # 文件不存在
+
+    claude_json.write_text(
+        json.dumps({"projects": {"/some/dir": {"hasTrustDialogAccepted": True}}}),
+        encoding="utf-8",
+    )
+    assert launcher.trust_check("/some/dir") == "trusted"
+    assert launcher.trust_check("/other/dir") == "untrusted"  # 键缺
+
+    claude_json.write_text("{坏的", encoding="utf-8")
+    assert launcher.trust_check("/some/dir") == "unreadable"
+    assert launcher.is_trusted("/some/dir") is False  # 布尔视图仍然是 False
+
+
 def test_pid_alive():
     assert launcher.pid_alive(os.getpid()) is True
     # 超出 pid_max（默认约 4 百万）的 pid 必然不存在

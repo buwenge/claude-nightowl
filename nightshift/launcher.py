@@ -120,28 +120,38 @@ def codex_resume_thread_id(task: dict) -> str | None:
     return store.read_status(parent_id).get("thread_id") or None
 
 
-def is_trusted(project_path: str) -> bool:
-    """目录是否已在 Claude Code 里点过信任。
+def trust_check(project_path: str) -> str:
+    """目录信任状态的三态判定：'trusted' / 'untrusted' / 'unreadable'。
 
     读 NIGHTSHIFT_CLAUDE_JSON（默认 ~/.claude.json）的
-    projects[project_path].hasTrustDialogAccepted；文件缺/键缺 → False。
-    只读，永远不写这个文件。
+    projects[project_path].hasTrustDialogAccepted；文件不存在/键缺 →
+    'untrusted'（这个目录确实还没被信任过）。总review二 G5：文件存在但
+    解析失败（撕裂读——CC 用 tmp+rename 写这份文件，概率很低但不是零）
+    单独算 'unreadable'，跟"真的没信任过"不是一回事：前者该推迟重试，
+    后者才是该判死刑的终态失败。只读，永远不写这个文件。
     """
     path = Path(os.environ.get("NIGHTSHIFT_CLAUDE_JSON") or (Path.home() / ".claude.json"))
     if not path.is_file():
-        return False
+        return "untrusted"
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (ValueError, OSError):
-        return False
+        return "unreadable"
     projects = data.get("projects")
     if not isinstance(projects, dict):
-        return False
+        return "untrusted"
     entry = projects.get(project_path)
     if not isinstance(entry, dict):
-        return False
-    return entry.get("hasTrustDialogAccepted") is True
+        return "untrusted"
+    return "trusted" if entry.get("hasTrustDialogAccepted") is True else "untrusted"
+
+
+def is_trusted(project_path: str) -> bool:
+    """目录是否已在 Claude Code 里点过信任（trust_check 的布尔视图，
+    不区分"未信任"和"信任文件暂时读不了"——需要区分的调用方用
+    trust_check）。"""
+    return trust_check(project_path) == "trusted"
 
 
 def codex_config_path() -> Path:

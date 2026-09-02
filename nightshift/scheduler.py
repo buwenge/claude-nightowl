@@ -310,11 +310,18 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
     # Codex 不吃这份信任记录（自己的信任状态在 ~/.codex/config.toml），跳过
     # 这条预检——它的信任由 launcher.launch() 在起会话前调用
     # ensure_codex_trusted() 持久化写盘解决（S7.6）。
-    if runner == "claude" and not launcher.is_trusted(project_path):
-        return _fail_now(
-            task, config, now,
-            f"目录未信任，请先手动在该目录开一次 claude：{project_path}",
-        )
+    # 总review二 G5：~/.claude.json 撕裂读（CC 用 tmp+rename 写，概率很低）
+    # 跟"真的没信任过"分开处理——前者推迟重试，不能让一次读文件的运气不好
+    # 把这一班判成终态失败。
+    if runner == "claude":
+        trust = launcher.trust_check(project_path)
+        if trust == "unreadable":
+            return _postpone(task, status, config, now, "信任文件暂时读不了")
+        if trust != "trusted":
+            return _fail_now(
+                task, config, now,
+                f"目录未信任，请先手动在该目录开一次 claude：{project_path}",
+            )
 
     # b. 同 pipeline 互斥（S7.1 阻断四 Part B）：以前只要候选与对方都是
     # worktree=true 就无条件放行，不比较是不是同一条 pipeline——同 pipeline
