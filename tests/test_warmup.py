@@ -74,10 +74,23 @@ def test_run_warmup_ignores_stale_toplevel_when_runner_view_diverges(tmp_path):
     assert result["model"] == "RUNNER_PROBE"
 
 
+def test_run_warmup_missing_probe_model_records_error(tmp_path):
+    """审查 D5：probe_model 没配 → 记一次失败、当天该时刻标 done，不抛 TypeError。"""
+    c = cfg()
+    c["runners"]["claude"].pop("probe_model", None)
+    c["runners"]["claude"]["bin"] = "/bin/false"
+    now = datetime(2026, 8, 27, 23, 0, tzinfo=timezone.utc)
+    result = warmup.run_warmup(c, now, slot="07:00")
+    assert result["ok"] is False and "probe_model" in result["error"]
+    assert warmup.due(c, now) == []  # 标了 done，不会每 tick 重来
+
+
 def test_tick_runs_warmup_once_and_refreshes_quota(monkeypatch):
     calls = []
     monkeypatch.setattr(scheduler.warmup, "run_warmup", lambda c, now, slot=None: (calls.append(slot), store.atomic_write_json(warmup.state_path(), {"done": {"2026-08-28": ["07:00"]}, "ok": True}))[0] or {"ok": True})
-    monkeypatch.setattr(scheduler.quota, "fetch_usage", lambda c: {"session_pct": 1, "week_all_pct": 1, "per_model": {}, "raw": ""})
+    # 审查 D10：必须 patch scheduler 真正调的 fetch_usage_claude——以前 patch 的是
+    # 别名 fetch_usage，落空后这条测试每跑一次就真起一次 `claude -p /usage`。
+    monkeypatch.setattr(scheduler.quota, "fetch_usage_claude", lambda c: {"session_pct": 1, "week_all_pct": 1, "per_model": {}, "raw": ""})
     c = cfg()
     store.atomic_write_json(store.home() / "config.json", c)
     now = datetime(2026, 8, 27, 23, 0, tzinfo=timezone.utc)

@@ -99,14 +99,20 @@ def run_warmup(config: dict, now: datetime, timeout: int = 120, slot: str | None
         "slot": slot,
         "done": done,
     }
-    try:
-        proc = subprocess.run(cmd, cwd=store.home(), env=env, capture_output=True, text=True, timeout=timeout)
-        result["ok"] = proc.returncode == 0
-        result["reply"] = (proc.stdout or "").strip()[:80]
-        if proc.returncode != 0:
-            result["error"] = (proc.stderr or "")[-300:]
-    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+    if not model:
+        # None 塞进 argv 会让 subprocess 抛 TypeError，tick 末尾掀翻、状态不落盘、
+        # 下一轮再来一遍；配置缺失就记成一次失败的预热（该时刻当天不再试）。
         result["ok"] = False
-        result["error"] = str(exc)[:300]
+        result["error"] = "runners.claude.probe_model（或 warmup.model）没配，预热没发"
+    else:
+        try:
+            proc = subprocess.run(cmd, cwd=store.home(), env=env, capture_output=True, text=True, timeout=timeout)
+            result["ok"] = proc.returncode == 0
+            result["reply"] = (proc.stdout or "").strip()[:80]
+            if proc.returncode != 0:
+                result["error"] = (proc.stderr or "")[-300:]
+        except (subprocess.TimeoutExpired, OSError) as exc:  # 找不到/没执行权限都算
+            result["ok"] = False
+            result["error"] = str(exc)[:300]
     store.atomic_write_json(state_path(), result)
     return result

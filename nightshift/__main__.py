@@ -140,6 +140,17 @@ def cmd_run_now(args) -> int:
             f"-t {config['tmux_session']} -n '{window_name}' {d / 'run.sh'}"
         )
         return 0
+    # 审查 D（9/2）：跟网页 run-now 认同一份状态白名单——对正在 working 的任务
+    # 再 launch 一次会开第二个窗口，两个会话共用一份 status.json / 工作树。
+    # 仍然直接开窗（不走 tick 的额度预检与同目录锁），这是 CLI 的老语义。
+    state = store.read_status(args.id).get("state")
+    if state not in server._RUN_NOW_STATES:
+        print(
+            f"状态 {state or '-'} 不能现在就跑（只允许 {'/'.join(server._RUN_NOW_STATES)}，"
+            "与网页同一份白名单）",
+            file=sys.stderr,
+        )
+        return 1
     status = launcher.launch(args.id, config)
     print(json.dumps(status, ensure_ascii=False, indent=2))
     return 0
@@ -161,7 +172,10 @@ def cmd_cancel(args) -> int:
 def cmd_quota(args) -> int:
     config = store.load_config()
     try:
-        usage = quota.fetch_usage(config)
+        usage = (
+            quota.fetch_usage_codex(config)
+            if args.runner == "codex" else quota.fetch_usage_claude(config)
+        )
     except (quota.UsageUnavailable, quota.UsageParseError) as exc:
         print(f"额度查不到：{exc}", file=sys.stderr)
         return 1
@@ -265,7 +279,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id", help="任务 id")
     p.set_defaults(func=cmd_show)
 
-    p = sub.add_parser("run-now", help="不等到点，现在就跑（本期不做额度预检）")
+    p = sub.add_parser("run-now", help="不等到点，现在就直接开窗（跳过额度预检与同目录锁；"
+                                        "状态白名单与网页相同）")
     p.add_argument("id", help="任务 id")
     p.add_argument("--dry-run", action="store_true",
                    help="只打印将要生成的 run.sh 与 tmux 命令，不写盘不开窗")
@@ -276,6 +291,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_cancel)
 
     p = sub.add_parser("quota", help="查一次账号额度并打印解析结果")
+    p.add_argument("--runner", choices=store.RUNNERS, default="claude",
+                   help="查哪家：claude（默认）或 codex")
     p.set_defaults(func=cmd_quota)
 
     p = sub.add_parser("capture", help="抓一个任务窗口的最近屏幕")
