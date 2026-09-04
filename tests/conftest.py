@@ -62,3 +62,11 @@ def _forbid_user_tmux_session(monkeypatch):
         return real_tmux(*args)
 
     monkeypatch.setattr(launcher, "_tmux", guarded)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_oauth_token(monkeypatch):
+    """测试环境（ns-selftest 的 shell 会 source ~/.bashrc）里可能带着一年期令牌
+    CLAUDE_CODE_OAUTH_TOKEN；fetch_usage_claude 见到它会改走真网络探针，测试里一律摘掉，
+    要测那条路的用例自己 setenv。"""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)

@@ -1214,3 +1214,13 @@ def test_launch_codex_trust_conflict_fails_task_with_reason(tmp_path, monkeypatc
     assert status["state"] == "failed"
     assert "写 Codex 信任配置失败" in status["error"] and "不是 trusted" in status["error"]
     assert not any(a[0] == "new-window" and "run.sh" in " ".join(a) for a in calls)
+
+
+def test_new_window_env_args_passes_oauth_token_only_when_set(monkeypatch):
+    """一年期令牌只在调度器进程环境里；工人/通知窗口靠 new-window -e 透传，没设就不加参数。"""
+    from nightshift import launcher
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    assert launcher._new_window_env_args() == []
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+    assert launcher._new_window_env_args() == ["-e", "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-test"]

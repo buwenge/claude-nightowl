@@ -477,6 +477,21 @@ def write_task_files(
     os.chmod(run_sh, 0o700)
 
 
+# 新开窗口时要透传给窗口进程的环境变量：tmux 新窗口的环境来自 tmux 服务端而不是调度器进程，
+# 一年期 CC 令牌（CLAUDE_CODE_OAUTH_TOKEN）只在 systemd 给调度器的环境里，不透传的话工人窗口里的
+# claude 会退回 ~/.claude/.credentials.json 的登录态（那个会按月过期）。tmux ≥ 3.2 的 new-window -e。
+_PASSTHROUGH_ENV = ("CLAUDE_CODE_OAUTH_TOKEN",)
+
+
+def _new_window_env_args() -> list[str]:
+    args: list[str] = []
+    for name in _PASSTHROUGH_ENV:
+        value = os.environ.get(name)
+        if value:
+            args += ["-e", f"{name}={value}"]
+    return args
+
+
 def _tmux(*args) -> subprocess.CompletedProcess:
     """所有 tmux 调用都走这里：10 秒超时，超时当作失败返回。"""
     try:
@@ -659,7 +674,7 @@ def launch(task_id: str, config: dict) -> dict:
     # 会话里恰好有个同名窗口就会落到那个 index 上报 "index N in use"（8/27 真机踩到）。
     proc = _tmux(
         "new-window", "-d", "-P", "-F", "#{window_id}", "-t", f"{session}:",
-        "-n", window_name, run_sh,
+        "-n", window_name, *_new_window_env_args(), run_sh,
     )
     if proc.returncode != 0:
         return _fail(task, config, f"tmux new-window 失败：{proc.stderr.strip()}")
@@ -721,7 +736,7 @@ def open_notice_window(
         return
     proc = _tmux(
         "new-window", "-d", "-t", f"{session}:",
-        "-n", f"{config['window_prefix']}{title}{suffix}", str(script),
+        "-n", f"{config['window_prefix']}{title}{suffix}", *_new_window_env_args(), str(script),
     )
     if proc.returncode != 0:
         store.append_event(task_id, f"通知窗口开不了：{proc.stderr.strip()}")

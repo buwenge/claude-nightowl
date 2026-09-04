@@ -56,7 +56,9 @@
       },
       "efforts": ["low", "medium", "high", "xhigh", "max"],
       "keepalive_idle_minutes": 50,
-      "keepalive_text": "来自nightshift：保活探针——背景任务还在跑吗？简短回一句即可。"
+      "keepalive_text": "来自nightshift：保活探针——背景任务还在跑吗？简短回一句即可。",
+      "rate_limits_file": "~/.claude/rate_limits.json",
+      "scoped_window_labels": {"seven_day_overage_included": "Fable"}
     },
     "codex": {
       "bin": "codex",

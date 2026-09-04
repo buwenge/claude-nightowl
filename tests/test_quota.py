@@ -2,6 +2,7 @@
 
 import json
 import stat
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -546,3 +547,102 @@ def test_write_quota_runner_concurrent_threads_do_not_lose_updates(tmp_path, mon
     # 最终两家都在、都是各自最后一轮写的值——没有一家被另一家的写入顶掉/丢失
     assert data["claude"]["usage"]["session_pct"] == rounds - 1
     assert data["codex"]["usage"]["session_pct"] == rounds - 1
+
+
+# ---- 一年期令牌路径：/usage 在令牌底下是空的，改读状态栏脚本维护的共享水位文件 ----
+
+SHARED_DOC = {
+    # 2026-09-04 statusline.py 写出的形状（utilization 是百分数，resets_at 是 ISO UTC）
+    "updated_at": 1788534712.5,
+    "source": "statusline",
+    "model": "claude-fable-5-1",
+    "windows": {
+        "five_hour": {"utilization": 9.0, "resets_at": "2026-09-04T18:10:00+00:00", "at": 1788534712.5},
+        "seven_day": {"utilization": 15.0, "resets_at": "2026-09-09T12:00:00+00:00", "at": 1788534712.5},
+        "seven_day_overage_included": {"utilization": 21.0, "resets_at": "2026-09-09T12:00:00+00:00", "at": 1788534000.0},
+    },
+}
+NOW = datetime(2026, 9, 4, 15, 0, tzinfo=timezone.utc)
+
+
+def test_usage_from_shared_rate_limits_matches_parse_usage_shape():
+    from nightshift.quota import resets_in_minutes, usage_from_shared_rate_limits
+
+    usage = usage_from_shared_rate_limits(SHARED_DOC, now=NOW)
+    assert usage["session_pct"] == 9
+    assert usage["week_all_pct"] == 15
+    assert usage["per_model"] == {"Fable": 21}
+    assert usage["session_resets"] == "2026-09-04T18:10:00+00:00"
+    assert usage["per_model_resets"] == {"Fable": "2026-09-09T12:00:00+00:00"}
+    # 刷新时刻是 ISO，resets_in_minutes 认得（hook 排闹钟靠它）
+    assert resets_in_minutes(usage["session_resets"], now=NOW) == 190
+    assert "five_hour" in usage["raw"]
+
+
+def test_usage_from_shared_rate_limits_zeroes_windows_past_reset():
+    """读数之后没人再花过、刷新时刻已过：按 0%、刷新时刻未知，别挂着旧数把班拦住。"""
+    from nightshift.quota import usage_from_shared_rate_limits
+
+    later = datetime(2026, 9, 4, 19, 0, tzinfo=timezone.utc)  # 五小时窗口 18:10 已过，周线没过
+    usage = usage_from_shared_rate_limits(SHARED_DOC, now=later)
+    assert usage["session_pct"] == 0
+    assert usage["session_resets"] is None
+    assert usage["week_all_pct"] == 15
+    assert usage["per_model"] == {"Fable": 21}
+
+
+def test_usage_from_shared_rate_limits_unknown_scoped_key_is_ignored_and_labels_configurable():
+    from nightshift.quota import usage_from_shared_rate_limits
+
+    doc = {"windows": dict(SHARED_DOC["windows"], seven_day_xx={"utilization": 50, "resets_at": None, "at": 1})}
+    usage = usage_from_shared_rate_limits(doc, now=NOW)
+    assert usage["per_model"] == {"Fable": 21}
+    usage = usage_from_shared_rate_limits(doc, labels={"seven_day_xx": "Mystery"}, now=NOW)
+    assert usage["per_model"] == {"Mystery": 50}
+
+
+def test_usage_from_shared_rate_limits_without_windows_fails_closed():
+    from nightshift.quota import usage_from_shared_rate_limits
+
+    with pytest.raises(UsageParseError):
+        usage_from_shared_rate_limits({"windows": {"seven_day_overage_included": {"utilization": 1}}}, now=NOW)
+    with pytest.raises(UsageParseError):
+        usage_from_shared_rate_limits({}, now=NOW)
+
+
+def test_fetch_usage_claude_with_oauth_token_reads_shared_file_not_subprocess(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+    shared = tmp_path / "rate_limits.json"
+    shared.write_text(json.dumps(SHARED_DOC), encoding="utf-8")
+    config = {
+        "runners": {
+            "claude": {
+                "bin": "/nonexistent/claude",  # 若还走了子进程这里会抛 UsageUnavailable
+                "probe_model": "claude-haiku-4-5-20251001",
+                "models": {"claude-fable-5-1": {"usage_label": "Fable"}},
+                "rate_limits_file": str(shared),
+            }
+        }
+    }
+    usage = fetch_usage_claude(config)
+    assert usage["session_pct"] == 9
+    assert usage["per_model"] == {"Fable": 21}
+
+
+def test_fetch_usage_claude_with_oauth_token_missing_shared_file_is_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+    config = {"runners": {"claude": {"bin": "/nonexistent/claude", "rate_limits_file": str(tmp_path / "none.json")}}}
+    with pytest.raises(UsageUnavailable) as exc:
+        fetch_usage_claude(config)
+    assert "共享水位文件" in str(exc.value)
+
+
+def test_fetch_usage_claude_with_oauth_token_default_path_is_home_dot_claude(tmp_path, monkeypatch):
+    from nightshift import quota
+
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "rate_limits.json").write_text(json.dumps(SHARED_DOC), encoding="utf-8")
+    usage = quota.fetch_usage_claude({"claude_bin": "/nonexistent/claude", "models": {}})
+    assert usage["week_all_pct"] == 15

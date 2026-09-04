@@ -32,8 +32,21 @@ __all__ = [
     "load_quota_file",
     "normalize_codex_ratelimits",
     "parse_usage",
+    "usage_from_shared_rate_limits",
     "write_quota_runner",
 ]
+
+# 一年期令牌（`claude setup-token`，放在 CLAUDE_CODE_OAUTH_TOKEN）只能发模型请求：
+# 官方文档明写它"can only make model requests"，`claude -p /usage` 在它底下什么都不打印。
+# 但每个 CC 会话每次回复都自带水位（状态栏脚本收到 rate_limits，stream-json 收到 rate_limit_event），
+# 本机的状态栏脚本把它们合并写进一个共享文件（默认 ~/.claude/rate_limits.json，格式见
+# usage_from_shared_rate_limits 的 docstring）。环境里有令牌时改读这个文件——零额外请求，
+# 谁在花额度谁就在刷新它；夜班工人窗口自己也是 CC 会话，开工后读数自然跟着走。
+DEFAULT_RATE_LIMITS_FILE = "~/.claude/rate_limits.json"
+# 共享文件里单模型专属周线的原始键 → usage_label。目前只有 Fable 有专属周线，跑 Fable 的 CC
+# 子进程在 rate_limit_event 里给的键叫 seven_day_overage_included（9/4 实测，数值与 /usage 的
+# "Current week (Fable)" 一致）；可用 runners.claude.scoped_window_labels 覆盖
+DEFAULT_SCOPED_WINDOW_LABELS = {"seven_day_overage_included": "Fable"}
 
 
 class UsageParseError(Exception):
@@ -105,23 +118,110 @@ def parse_usage(text: str) -> dict:
     return result
 
 
-def fetch_usage_claude(config: dict, timeout: int = 120) -> dict:
-    """跑一次无头 /usage 并解析。非零退出或超时抛 UsageUnavailable。
+def usage_from_shared_rate_limits(doc: dict, labels: dict | None = None, now: datetime | None = None) -> dict:
+    """共享水位文件 → 与 parse_usage 同形的额度 dict。
+    文件格式（/root/.claude/statusline.py 与小予 usage_quota.py 共同维护）：
+        {"updated_at": epoch, "source": "statusline", "model": "...",
+         "windows": {"five_hour": {"utilization": 9.0, "resets_at": "<ISO UTC>", "at": epoch},
+                     "seven_day": {...}, "seven_day_overage_included": {...}}}
+    utilization 是百分数；刷新时刻已经过去的窗口（读数之后没人再花过）按 0% 且刷新时刻未知处理。
+    five_hour/seven_day 一个都没有就抛 UsageParseError（fail-closed，与 /usage 解析同样的口径）。"""
+    labels = DEFAULT_SCOPED_WINDOW_LABELS if labels is None else labels
+    now = now or datetime.now(timezone.utc)
+    windows = (doc or {}).get("windows") or {}
+    result: dict = {
+        "session_pct": None,
+        "session_resets": None,
+        "week_all_pct": None,
+        "week_all_resets": None,
+        "per_model": {},
+        "per_model_resets": {},
+        "raw": "",
+    }
+    raw_lines = []
 
-    环境变量 NIGHTSHIFT_FAKE_USAGE_FILE：设了就读该文件当作 /usage 的输出，
-    完全不起子进程——serve --once 的集成测试用（monkeypatch 管不到子进程）。
-    环境里要去掉 CLAUDECODE（在 Claude Code 会话里嵌套调用会报错）。
+    def read(key):
+        w = windows.get(key)
+        if not isinstance(w, dict) or w.get("utilization") is None:
+            return None, None
+        pct = _pct_to_int(w.get("utilization"))
+        resets = w.get("resets_at")
+        try:
+            reset_at = datetime.fromisoformat(str(resets).replace("Z", "+00:00")) if resets else None
+        except ValueError:
+            reset_at = None
+        if reset_at is not None and reset_at.tzinfo is None:
+            reset_at = reset_at.replace(tzinfo=timezone.utc)
+        age_min = None
+        if w.get("at"):
+            age_min = int((now.timestamp() - float(w["at"])) / 60)
+        if reset_at is not None and reset_at <= now:
+            raw_lines.append(f"{key}: {pct}% (已过刷新时刻，按 0% 算；读数 {age_min} 分钟前)")
+            return 0, None
+        raw_lines.append(f"{key}: {pct}% resets {resets} (读数 {age_min} 分钟前)")
+        return pct, resets
+
+    result["session_pct"], result["session_resets"] = read("five_hour")
+    result["week_all_pct"], result["week_all_resets"] = read("seven_day")
+    for key in windows:
+        if key in ("five_hour", "seven_day"):
+            continue
+        label = labels.get(key)
+        if not label:
+            continue
+        pct, resets = read(key)
+        if pct is None:
+            continue
+        result["per_model"][label] = pct
+        if resets:
+            result["per_model_resets"][label] = resets
+    result["raw"] = "\n".join(raw_lines)
+    if result["session_pct"] is None and result["week_all_pct"] is None:
+        raise UsageParseError(result["raw"] or "(共享水位文件里没有 five_hour/seven_day)")
+    return result
+
+
+def fetch_usage_from_shared_file(rc: dict) -> dict:
+    """一年期令牌路径：读共享水位文件。文件没有/读不出来抛 UsageUnavailable（原因写明让谁去开个 CC 会话）。"""
+    path = os.path.expanduser(rc.get("rate_limits_file") or DEFAULT_RATE_LIMITS_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except FileNotFoundError as exc:
+        raise UsageUnavailable(
+            f"共享水位文件 {path} 还没有：一年期令牌下 /usage 是空的，额度只能从 CC 会话的状态栏读数拿——"
+            "随便开一个 claude 窗口让它回一句就有了"
+        ) from exc
+    except (OSError, ValueError) as exc:
+        raise UsageUnavailable(f"共享水位文件 {path} 读不出来：{exc}") from exc
+    labels = rc.get("scoped_window_labels")
+    return usage_from_shared_rate_limits(doc, labels if isinstance(labels, dict) else None)
+
+
+def fetch_usage_claude(config: dict, timeout: int = 120) -> dict:
+    """查一次额度并解析。非零退出或超时抛 UsageUnavailable。
+
+    三条路，按优先级：
+    - 环境变量 NIGHTSHIFT_FAKE_USAGE_FILE：设了就读该文件当作 /usage 的输出，
+      完全不起子进程——serve --once 的集成测试用（monkeypatch 管不到子进程）；
+    - 环境里有 CLAUDE_CODE_OAUTH_TOKEN（一年期令牌）：/usage 在它底下是空的，改读状态栏
+      脚本维护的共享水位文件（见 DEFAULT_RATE_LIMITS_FILE 处说明）；
+    - 否则跑一次无头 `claude -p /usage` 解析。环境里要去掉 CLAUDECODE（在 Claude Code
+      会话里嵌套调用会报错）。
     """
     fake_path = os.environ.get("NIGHTSHIFT_FAKE_USAGE_FILE")
     if fake_path:
         with open(fake_path, encoding="utf-8") as f:
             return parse_usage(f.read())
+    rc = runner_config(config).get("claude") or {}
+    oauth_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if oauth_token:
+        return fetch_usage_from_shared_file(rc)
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-    # S6.1 B3：统一从 runner_config 取 bin/probe_model，不再单独读顶层
+    # S6.1 B3：统一从 runner_config 取 bin/probe_model（上面已取 rc），不再单独读顶层
     # config["claude_bin"]/config["probe_model"]——两处配置一旦不同会出现
     # "校验按新表、实际查额度按旧表"的分裂；兼容视图从顶层键合成，旧
     # config 行为不变。
-    rc = runner_config(config).get("claude") or {}
     probe_model = rc.get("probe_model")
     if not probe_model:
         # None 塞进 argv 会让 subprocess 抛 TypeError——那不是调用方接得住的
