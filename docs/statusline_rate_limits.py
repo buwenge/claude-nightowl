@@ -34,20 +34,24 @@ def record_rate_limits(data: dict) -> None:
         model = (data.get("model") or {}).get("id") or (data.get("model") or {}).get("display_name")
         try:
             doc = json.loads(RATE_LIMITS_FILE.read_text(encoding="utf-8"))
+            if not isinstance(doc, dict):
+                doc = {}
             merged = dict(doc.get("windows") or {})
             models = dict(doc.get("models") or {})  # 各模型最近活动时刻（可选，给别的读方判断"谁在动"）
         except Exception:
-            merged, models = {}, {}
+            doc, merged, models = {}, {}, {}
         merged.update(windows)
         if model:
             models[model] = now
-        payload = {
+        # 在原文档上更新，别重建：别的写方放的字段（如探针的 fable_probe_at）要保留
+        payload = dict(doc)
+        payload.update({
             "updated_at": now,
             "source": "statusline",
             "model": model,
             "windows": merged,
             "models": models,
-        }
+        })
         RATE_LIMITS_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = RATE_LIMITS_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
