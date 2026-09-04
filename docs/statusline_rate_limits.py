@@ -31,16 +31,22 @@ def record_rate_limits(data: dict) -> None:
             windows[key] = {"utilization": float(w["used_percentage"]), "resets_at": resets_iso, "at": now}
         if not windows:
             return
+        model = (data.get("model") or {}).get("id") or (data.get("model") or {}).get("display_name")
         try:
-            merged = dict(json.loads(RATE_LIMITS_FILE.read_text(encoding="utf-8")).get("windows") or {})
+            doc = json.loads(RATE_LIMITS_FILE.read_text(encoding="utf-8"))
+            merged = dict(doc.get("windows") or {})
+            models = dict(doc.get("models") or {})  # 各模型最近活动时刻（可选，给别的读方判断"谁在动"）
         except Exception:
-            merged = {}
+            merged, models = {}, {}
         merged.update(windows)
+        if model:
+            models[model] = now
         payload = {
             "updated_at": now,
             "source": "statusline",
-            "model": (data.get("model") or {}).get("id") or (data.get("model") or {}).get("display_name"),
+            "model": model,
             "windows": merged,
+            "models": models,
         }
         tmp = RATE_LIMITS_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
