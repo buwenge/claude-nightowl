@@ -48,6 +48,7 @@ def record_rate_limits(data: dict) -> None:
             "windows": merged,
             "models": models,
         }
+        RATE_LIMITS_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = RATE_LIMITS_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
         tmp.replace(RATE_LIMITS_FILE)
