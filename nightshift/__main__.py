@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import auth, launcher, quota, scheduler, server, store
+from . import auth, launcher, quota, scheduler, server, store, wellness
 
 __all__ = ["main"]
 
@@ -221,6 +221,14 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def cmd_wellness_serve(args) -> int:
+    """启动独立健康记录服务（鉴权由反向代理负责）。"""
+    config = store.load_config()
+    store.ensure_dirs()
+    wellness.serve_http(config)
+    return 0
+
+
 def cmd_passwd(args) -> int:
     """交互式设置/覆盖登录口令（覆盖后旧的登录 cookie 全部失效）。"""
     store.ensure_dirs()
@@ -306,6 +314,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-http", action="store_true",
                    help="不起网页服务，只跑调度循环")
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser(
+        "wellness-serve", aliases=("wellness", "health"),
+        help="起独立健康记录网页/API（默认只监听 127.0.0.1）",
+    )
+    p.set_defaults(func=cmd_wellness_serve)
 
     p = sub.add_parser("passwd", help="设置/覆盖网页登录口令（覆盖后旧登录全部失效）")
     p.set_defaults(func=cmd_passwd)
