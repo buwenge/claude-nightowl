@@ -1244,6 +1244,70 @@ def test_interrupt_sends_escape_once_and_keeps_state(authed, monkeypatch):
     assert status == 409
 
 
+def test_force_stop_active_task_closes_window_and_cancels(authed, monkeypatch):
+    """9/8 急停：活跃态（哪怕疑似卡住）→ 关窗口 + cancelled + 事件；终态与还没
+    起跑的都 409（后者是「取消」的活）；窗口关不掉也照样标 cancelled。"""
+    task_id = make_task(authed, "模型名打错卡死的")
+    store.update_status(task_id, state="working", window_id="@7", pane_pid=1, stuck=True,
+                        error="旧错误")
+    closed_calls = []
+    monkeypatch.setattr(
+        launcher, "close_windows",
+        lambda ids, cfg: closed_calls.append([str(i) for i in ids]) or ["@7"],
+    )
+    status, _, body = authed.request("POST", f"/api/tasks/{task_id}/force-stop")
+    assert status == 200 and body == {"ok": True, "closed": ["@7"]}
+    assert closed_calls == [["@7"]]
+    st = store.read_status(task_id)
+    assert st["state"] == "cancelled"
+    assert st["exit_reason"] == "force_stop"
+    assert st["stuck"] is False and st["error"] is None
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "强制结束（原状态 working；窗口 @7 已关）" in events
+    # 已经是终态 → 409
+    status, _, _ = authed.request("POST", f"/api/tasks/{task_id}/force-stop")
+    assert status == 409
+    # 还没起跑的 → 409，指向「取消」
+    fresh = make_task(authed, "还没跑")
+    status, _, body = authed.request("POST", f"/api/tasks/{fresh}/force-stop")
+    assert status == 409 and "取消" in body["error"]
+    # 窗口已经没了：关不掉也照样标 cancelled，事件如实写
+    gone = make_task(authed, "窗口没了")
+    store.update_status(gone, state="waiting_wakeup", window_id="@8", pane_pid=1)
+    monkeypatch.setattr(launcher, "close_windows", lambda ids, cfg: [])
+    status, _, body = authed.request("POST", f"/api/tasks/{gone}/force-stop")
+    assert status == 200 and body["closed"] == []
+    assert store.read_status(gone)["state"] == "cancelled"
+    assert "关不掉" in (store.task_dir(gone) / "events.log").read_text(encoding="utf-8")
+
+
+def test_list_omits_big_text_fields_but_detail_keeps_them(authed):
+    """9/8 列表瘦身：/api/tasks 不带 task_text / prompt_final（21 条任务 125 KB
+    是手机端"卡半天"的元凶），详情接口照旧全量（编辑页按需拉）。"""
+    task_id = make_task(authed, "瘦身")
+    status, _, items = authed.request("GET", "/api/tasks")
+    assert status == 200
+    item = next(i for i in items if i["task"]["id"] == task_id)
+    assert "task_text" not in item["task"] and "prompt_final" not in item["task"]
+    assert item["task"]["title"] == "瘦身" and item["task"]["runner"] == "claude"
+    assert store.load_task(task_id)["task_text"] == "正文"  # 盘上没被改
+    status, _, detail = authed.request("GET", f"/api/tasks/{task_id}")
+    assert status == 200
+    assert detail["task"]["task_text"] == "正文" and detail["task"]["prompt_final"] == "提示词"
+
+
+def test_create_rejects_claude_model_with_missing_dash(authed):
+    """9/8：工头把自定义模型打成 claude-fable5-1，网页得当场 400 并给出猜测。"""
+    status, _, body = authed.request("POST", "/api/tasks", {
+        "title": "打错模型", "project": "demo", "model": "claude-fable5-1",
+        "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+    })
+    assert status == 400
+    assert "漏了横杠" in body["error"] and "claude-fable-5-1" in body["error"]
+    assert store.list_tasks() == []
+
+
 def test_stop_background_sends_config_text(authed, monkeypatch):
     task_id = make_task(authed, "停后台")
     store.update_status(task_id, state="waiting_background", window_id="@11", pane_pid=1)

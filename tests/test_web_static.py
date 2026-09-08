@@ -552,7 +552,7 @@ def test_review_model_effort_only_populated_at_three_legitimate_entry_points():
     后续任何调用覆盖）。"""
     js = (WEB / "app.js").read_text(encoding="utf-8")
     create_body = _extract_js_function_body(js, "enterCreate")
-    edit_body = _extract_js_function_body(js, "enterEdit")
+    edit_body = _extract_js_function_body(js, "enterEditWith")
     assert 'populateReviewModelEffort("claude")' in create_body
     assert "populateReviewModelEffort(reviewRunner)" in edit_body
     # 编辑回填：populate 必须先于设值，否则会覆盖掉刚设好的 .value
@@ -612,7 +612,7 @@ def test_submit_button_disabled_while_request_in_flight():
 def test_enter_create_resets_form_left_over_from_edit():
     body = _js_fn("enterCreate")
     assert "reset()" in body and "FORM_STALE" in body
-    assert "FORM_STALE = true" in _js_fn("enterEdit")
+    assert "FORM_STALE = true" in _js_fn("enterEditWith")
 
 
 def test_task_card_uses_runner_aware_model_limit():

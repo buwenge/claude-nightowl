@@ -1369,7 +1369,9 @@ def test_silence_on_missing_task():
 def test_session_end_keeps_terminal_states(tmp_path):
     """finished/chained 之后关窗口，SessionEnd 只记 exit_reason，不把状态盖成 exited。"""
     task_id = make_task()
-    for state in ("finished", "chained"):
+    # 9/8：cancelled 也保——网页「强制结束」先标 cancelled 再关窗，关窗的
+    # SessionEnd 不能把它翻成 exited（exited 会被拿去评估交接、可能续班）
+    for state in ("finished", "chained", "cancelled"):
         store.update_status(task_id, state=state)
         run_hook(task_id, "SessionEnd", '{"reason": "other"}')
         status = store.read_status(task_id)

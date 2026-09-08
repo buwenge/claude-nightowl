@@ -51,7 +51,7 @@ _RE_REVIEW_FILE = re.compile(r"^review-([1-9][0-9]*)\.md$")
 _TASK_ID_RE = r"[0-9]{8}-[0-9]{6}-[0-9a-f]{4}"
 _RE_TASK_DETAIL = re.compile(rf"^/api/tasks/({_TASK_ID_RE})$")
 _RE_TASK_ACTION = re.compile(
-    rf"^/api/tasks/({_TASK_ID_RE})/(run-now|cancel|merge|discard)$"
+    rf"^/api/tasks/({_TASK_ID_RE})/(run-now|cancel|force-stop|merge|discard)$"
 )
 # S7④：流水线控制 action，接受这条流水线任一成员的 task id
 _RE_PIPELINE_ACTION = re.compile(
@@ -138,6 +138,12 @@ DEFAULT_CODEX_STOP_BACKGROUND_TEXT = (
     "看一下登记在这个任务下的后台进程，然后逐个用 "
     "`python3 -m nightshift.background_runner stop <background_id>` 停掉，然后停下不要继续。"
 )
+
+
+# 列表接口不带的大字段（编辑页按需走 /api/tasks/<id> 详情拿全量）
+_LIST_OMIT_TASK_KEYS = frozenset({"task_text", "prompt_final"})
+# 9/8「强制结束」认的状态：会话还活着（或调度器以为活着）的都能急停
+_FORCE_STOP_STATES = ("launching", "working", "waiting_background", "waiting_wakeup", "idle", "held")
 
 
 def _never_launched(status: dict) -> bool:
@@ -599,6 +605,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._api_run_now(task_id)
             if action == "cancel":
                 return self._api_cancel(task_id)
+            if action == "force-stop":
+                return self._api_force_stop(task_id)
             if action == "merge":
                 return self._api_merge(task_id)
             return self._api_discard(task_id)
@@ -876,9 +884,16 @@ class _Handler(BaseHTTPRequestHandler):
     # ---------- 任务 ----------
 
     def _api_list_tasks(self) -> None:
+        """任务列表。9/8 起不带 task_text / prompt_final 两个大字段——21 条
+        任务时整份回包 125 KB、手机上每 5 秒拉一次，页面"卡半天、新建的看
+        不见"就是它；卡片只画标题/状态，正文在编辑时按需 GET /api/tasks/<id>。"""
         items = store.list_tasks()
         for item in items:
             task_id = item["task"]["id"]
+            item["task"] = {
+                key: value for key, value in item["task"].items()
+                if key not in _LIST_OMIT_TASK_KEYS
+            }
             item["task"].setdefault("runner", "claude")  # 仅展示；不回写 task.json
             item["events_tail"] = _tail_lines(store.task_dir(task_id) / "events.log", 5)
             item["trigger_text"] = _trigger_text(item["task"])
@@ -1025,6 +1040,38 @@ class _Handler(BaseHTTPRequestHandler):
         store.append_event(task_id, "网页：已取消")
         logger.info("网页 cancel：%s", task_id)
         return self._send_json(200, {"ok": True})
+
+    def _api_force_stop(self, task_id: str) -> None:
+        """强制结束（9/8）：活跃态任务直接关窗口、标 cancelled。
+
+        「中止」只是按一下 Esc，「取消」只认还没起跑的——工头 9/8 真机：模型
+        名打错的班卡在 working，网页上取消 409、中止按了没用，只能爬起来开
+        电脑。这里是给人用的急停：不走交接评估、不续班（cancelled 是终态，
+        tick 不再碰；hook.py 的 SessionEnd 也不把 cancelled 盖成 exited）。
+        有工作树的照旧留树，卡片上还能合并/丢弃；窗口关不掉（本来就没了）
+        也照样标 cancelled，如实写进事件。"""
+        if self._load_existing(task_id) is None:
+            return
+        status = store.read_status(task_id)
+        state = status.get("state")
+        if state not in _FORCE_STOP_STATES:
+            return self._send_json(
+                409,
+                {"error": f"只有还活着的任务能强制结束（还没起跑的用「取消」），当前是 {state or '-'}"},
+            )
+        cfg = store.load_config()
+        window_id = status.get("window_id")
+        closed = launcher.close_windows([window_id], cfg) if window_id else []
+        store.update_status(
+            task_id, state="cancelled", exit_reason="force_stop", stuck=False,
+            error=None, postpone_reason=None, last_event_at=store.utc_now_iso(),
+        )
+        window_note = "已关" if closed else "本来就不在或关不掉"
+        store.append_event(
+            task_id, f"网页：强制结束（原状态 {state}；窗口 {window_id or '-'} {window_note}）"
+        )
+        logger.info("网页 force-stop：%s（原状态 %s，关窗 %s）", task_id, state, closed)
+        return self._send_json(200, {"ok": True, "closed": closed})
 
     def _api_update_task(self, task_id: str) -> None:
         """编辑任务（S4②）：按状态分级——未跑全字段、活跃只四个维度、终态 409。"""

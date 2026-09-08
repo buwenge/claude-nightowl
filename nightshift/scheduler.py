@@ -587,6 +587,42 @@ def _check_launching(
 # ---------- S6③：Codex 五小时额度到线，调度器主动叫停 ----------
 
 
+# CC 对不存在/无权限的模型只在屏幕打这一句就回到提示符，不触发 Stop hook
+CLAUDE_MODEL_ERROR_MARK = "There's an issue with the selected model"
+
+
+def _check_claude_model_error(
+    task: dict, status: dict, config: dict, now: datetime, window_id: str
+) -> list[str] | None:
+    """working 且一次工具都没调过的 Claude 任务：抓一眼屏幕认 CC 的"模型
+    不可用"报错 → failed + 失败窗口。只在 tool_calls == 0 时抓屏（真干起活
+    来就不再抓，零开销）；抓不到/没这句都返回 None，交给后面的正常流程。
+
+    9/8 真机：工头把自定义模型名打成 claude-fable5-1，CC 打了一句
+    "There's an issue with the selected model" 停在提示符——这一步不触发
+    Stop hook，调度器只看到 UserPromptSubmit 之后一片安静，15 分钟后标
+    "疑似卡住"，卡片一直显示"干活中"，同目录的救援班还被它挡了半小时。
+    不杀窗口：人可以进去 /model 换一个接着用，跟 R2 权限模式提醒同一口径。
+    """
+    if int(status.get("tool_calls") or 0) > 0:
+        return None
+    screen = launcher.capture_pane(window_id, lines=80)
+    if CLAUDE_MODEL_ERROR_MARK not in (screen or ""):
+        return None
+    task_id = task["id"]
+    model = store.effective_model(task)
+    reason = (
+        f"模型不可用：{model}（CC 报 \"{CLAUDE_MODEL_ERROR_MARK}\"，"
+        "多半是名字打错或没权限；窗口留着，可进去 /model 换一个）"
+    )
+    store.update_status(
+        task_id, state="failed", error=reason, stuck=False, last_event_at=to_iso(now),
+    )
+    store.append_event(task_id, f"启动后 CC 报模型不可用 → failed：{model}")
+    launcher.open_failure_window(task, reason, config)
+    return [f"{task_id} 模型不可用 → failed"]
+
+
 def _check_codex_quota_pause(
     task: dict, status: dict, config: dict, now: datetime, window_id: str
 ) -> list[str] | None:
@@ -1073,6 +1109,13 @@ def _check_running(
         )
         store.append_event(task_id, "窗口不在了且没等到 SessionEnd → exited(window_gone)")
         return [f"{task_id} 窗口消失 → exited(window_gone)"]
+
+    # 9/8：模型名不存在/无权限——CC 只在屏幕打一句错就回到提示符，没有任何
+    # hook 会来；趁还没调过工具时抓一眼屏幕认出来，直接判 failed。
+    if runner == "claude" and status.get("state") == "working":
+        model_error = _check_claude_model_error(task, status, config, now, str(window_id))
+        if model_error is not None:
+            return model_error
 
     # S4 疑似卡住：working/waiting_background 静默太久（一条前台工具调用里
     # 轮询、轮次不结束、hook 不响）。只标状态与事件，不动会话、不改 state；

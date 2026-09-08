@@ -790,6 +790,17 @@ def test_validate_task_off_table_model_name_shape_gate():
     assert store.validate_task(
         make_task(model="claude-made-up-9.9"), RUNNERS_CONFIG,
     ) == "time"
+    # 9/8：claude- 开头的名字横杠之间字母数字混段（漏横杠的典型手误）当场拒绝，
+    # 报错里给出猜测的正确写法；别名/Codex 名字/带点的表外名不归这条管
+    with pytest.raises(ValueError, match="漏了横杠.*claude-fable-5-1"):
+        store.validate_task(make_task(model="claude-fable5-1"), RUNNERS_CONFIG)
+    with pytest.raises(ValueError, match="格式不对"):
+        store.validate_task(make_task(model="claude-opus4-6[1M]"), RUNNERS_CONFIG)
+    assert store.claude_model_name_problem("sonnet[1m]") is None
+    assert store.claude_model_name_problem("gpt-5.6-luna") is None
+    assert store.claude_model_name_problem("claude-3-5-haiku-latest") is None
+    assert store.claude_model_name_problem("claude-made-up-9.9") is None
+    assert store.claude_model_name_problem("claude-3-5-sonnet-v2@20241022") is None  # Vertex 写法
     # G11.1：Claude Code 的 1M 后缀写法（方括号、可带大写）必须放行
     assert store.validate_task(
         make_task(model="claude-opus-4-6[1M]"), RUNNERS_CONFIG,

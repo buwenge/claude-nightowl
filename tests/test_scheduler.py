@@ -94,8 +94,10 @@ class Fakes:
         self.send_keys_calls: list[tuple] = []
         self.fetch_calls: list[int] = []
         self.close_calls: list[list[str]] = []
+        self.screen = ""  # capture_pane 的假屏幕（9/8 模型不可用检测用）
 
         monkeypatch.setattr(launcher, "is_trusted", lambda path: self.trusted)
+        monkeypatch.setattr(launcher, "capture_pane", lambda wid, lines=200: self.screen)
         monkeypatch.setattr(
             launcher, "trust_check",
             lambda path: "trusted" if self.trusted else "untrusted",
@@ -290,6 +292,74 @@ def test_same_dir_rescue_task_launches_even_when_other_is_stuck(monkeypatch):
 
     assert store.read_status(rescue)["state"] == "launching"
     assert fakes.launch_calls == [rescue]
+
+
+# ---------- 9/8 模型不可用：CC 只在屏幕报错、不触发 Stop hook ----------
+
+
+def _model_error_screen(model: str) -> str:
+    return (
+        "❯ 你在无人值守的定时会话里工作\n"
+        f"● There's an issue with the selected model ({model}). It may not exist or "
+        "you may not have access to it.\n  Run /model to pick a different model.\n❯ \n"
+    )
+
+
+def test_claude_model_error_on_screen_marks_failed_and_opens_window(monkeypatch):
+    """working、一次工具都没调、屏幕上是 CC 的模型报错 → failed + 失败窗口 +
+    事件；窗口不杀（人可进去 /model 救）。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task(model="claude-fable-5-1")
+    store.update_status(
+        tid, state="working", window_id="@1", pane_pid=NO_PID, tool_calls=0, turns=1,
+        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=1)), stuck=True,
+    )
+    fakes.screen = _model_error_screen("claude-fable-5-1")
+
+    actions = scheduler.tick(CONFIG, NOW)
+
+    status = store.read_status(tid)
+    assert status["state"] == "failed"
+    assert "模型不可用：claude-fable-5-1" in status["error"]
+    assert status["stuck"] is False
+    assert fakes.failure_calls == [(tid, status["error"])]
+    assert fakes.close_calls == []
+    assert any("模型不可用 → failed" in a for a in actions)
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "CC 报模型不可用 → failed" in events
+    # failed 不再是运行态：下一 tick 不重复开窗
+    scheduler.tick(CONFIG, NOW + timedelta(seconds=30))
+    assert len(fakes.failure_calls) == 1
+
+
+def test_claude_model_error_ignored_once_tools_ran_or_clean_screen(monkeypatch):
+    """调过工具的会话不再抓屏（屏幕上哪怕残留这句也不算）；屏幕干净的照常
+    走后面的流程；Codex 任务根本不查这条。"""
+    fakes = Fakes(monkeypatch)
+    busy = make_task(title="已在干活")
+    store.update_status(
+        busy, state="working", window_id="@1", pane_pid=NO_PID, tool_calls=3,
+        last_event_at=scheduler.to_iso(NOW),
+    )
+    clean = make_task(title="屏幕干净")
+    store.update_status(
+        clean, state="working", window_id="@2", pane_pid=NO_PID, tool_calls=0,
+        last_event_at=scheduler.to_iso(NOW),
+    )
+    fakes.screen = _model_error_screen("claude-fable-5")
+    scheduler.tick(CONFIG, NOW)
+    assert store.read_status(busy)["state"] == "working"
+    assert store.read_status(clean)["state"] == "failed"  # 干净与否看屏幕：这里屏幕有错
+    fakes.failure_calls.clear()
+    fakes.screen = "❯ 正常的提示符\n"
+    fresh = make_task(title="屏幕真干净")
+    store.update_status(
+        fresh, state="working", window_id="@3", pane_pid=NO_PID, tool_calls=0,
+        last_event_at=scheduler.to_iso(NOW),
+    )
+    scheduler.tick(CONFIG, NOW)
+    assert store.read_status(fresh)["state"] == "working"
+    assert fakes.failure_calls == []
 
 
 def test_untrusted_project_fails_without_postpone(monkeypatch):

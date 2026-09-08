@@ -233,10 +233,13 @@ function renderOrphans(orphans) {
   box.appendChild(det);
 }
 
-function refreshQuota() {
+function refreshQuota(withConfig) {
   api("GET", "./api/quota").then(function (data) {
     renderQuota(data || {});
   }).catch(function () { /* banner 已提示 */ });
+  // 9/8：config 只在进页面/切回前台时拉，5 秒一轮的巡检不再每次都拉（它不会
+  // 自己变，白占手机流量）
+  if (withConfig === false) return;
   api("GET", "./api/config").then(function (cfg) { CFG = cfg; renderWarmup(cfg); }).catch(function () {});
 }
 
@@ -431,6 +434,17 @@ function taskActions(item, chainIds, opts) {
       if (!confirm("确定取消「" + task.title + "」？")) return;
       api("POST", "./api/tasks/" + task.id + "/cancel")
         .then(function () { refreshTasks(); })
+        .catch(function () {});
+    });
+  }
+  // 9/8 急停：活跃态（含"疑似卡住"）直接关窗口标已取消。取消只认没起跑的、
+  // 中止只是按 Esc，模型名打错卡在 working 时两个都救不了（工头真机）。
+  // 审稿流水线的成员也给——卡死不分流水线。
+  if (ACTIVE_STATES.indexOf(state) >= 0) {
+    add("强制结束", "danger", function () {
+      if (!confirm("强制结束「" + task.title + "」？会直接关掉它的窗口并标成已取消（不写交接、不续班）。卡死、模型名打错时用这个。")) return;
+      api("POST", "./api/tasks/" + task.id + "/force-stop")
+        .then(function () { banner("已强制结束"); refreshTasks(); })
         .catch(function () {});
     });
   }
@@ -1421,6 +1435,16 @@ function enterCreate() {
 }
 
 function enterEdit(item) {
+  // 9/8：列表接口不再带 task_text / prompt_final（回包从 125 KB 瘦到十几 KB），
+  // 编辑前按需拉一次详情，拿全量 task 再填表
+  api("GET", "./api/tasks/" + item.task.id).then(function (data) {
+    enterEditWith({ task: data.task, status: data.status || item.status });
+  }).catch(function (err) {
+    banner("拉不到任务详情，稍后再试：" + err.message, { sticky: true });
+  });
+}
+
+function enterEditWith(item) {
   var task = item.task, status = item.status, guards = task.guards || {};
   EDIT_TASK = { id: task.id, item: item, active: ACTIVE_STATES.indexOf(status.state) >= 0 };
   FORM_STALE = true;
@@ -1948,7 +1972,7 @@ function start() {
     if (!document.hidden && currentView === "tasks") { refreshTasks(); refreshQuota(); }
   });
   setInterval(function () {
-    if (currentView === "tasks" && !document.hidden) { refreshTasks(); refreshQuota(); }
+    if (currentView === "tasks" && !document.hidden) { refreshTasks(); refreshQuota(false); }
   }, 5000);
 
   api("GET", "./api/config").then(function (cfg) {

@@ -1390,9 +1390,12 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
         # 网页上"已完成"不该因为用户关了窗就变"已退出"（8/27 真机发现）。
         # S5②：awaiting_merge/merged/discarded 同理——等合并/已合并的卡片
         # 不许被顺手关窗冲掉
+        # 9/8：cancelled 也保——网页「强制结束」先标 cancelled 再关窗口，
+        # 关窗触发的 SessionEnd 不能把它翻成 exited（exited 会被 tick 拿去评估
+        # 交接、可能续班，急停的本意正是不续）
         keep = (
             "finished", "chained", "chain_exhausted", "needs_attention",
-            "awaiting_merge", "merged", "discarded",
+            "awaiting_merge", "merged", "discarded", "cancelled",
         )
 
         def mark_exit(status: dict) -> None:

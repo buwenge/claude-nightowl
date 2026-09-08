@@ -407,6 +407,34 @@ def _looks_like_model_name(value) -> bool:
     return isinstance(value, str) and bool(_RE_MODEL_NAME.match(value))
 
 
+def claude_model_name_problem(value) -> str | None:
+    """9/8：Claude Code 模型 id 的横杠段校验——`claude-` 开头的名字，横杠之间
+    某一段把字母和数字挤在一起（claude-fable5-1 的 fable5）十有八九是漏了
+    横杠；真实 id 的每段要么纯字母要么纯数字（claude-fable-5-1 /
+    claude-opus-4-1-20250805 / claude-3-5-haiku-latest）。CC 对这种名字不报 Stop hook，只在屏幕打一句就停
+    在提示符，工头 9/8 真机撞过：卡片显示"干活中"其实什么都没干。
+    只管 `claude-` 开头的写法；`sonnet`/`opus[1m]` 这类别名与 Bedrock/Vertex
+    的 `anthropic.claude-…` 不归这里，照旧只走 _looks_like_model_name。
+    有问题返回一句人话（带猜测的正确写法），没问题返回 None。"""
+    if not isinstance(value, str):
+        return None
+    base = value.split("[", 1)[0]
+    if not base.startswith("claude-") or "@" in value:
+        return None  # 别名 / Codex / Vertex 的 model@date 写法不归这里管
+    mixed = [
+        part for part in base.split("-")[1:]
+        if any(c.isalpha() for c in part) and any(c.isdigit() for c in part)
+        and not re.fullmatch(r"v\d+", part)  # -v2 这类版本段是真实写法
+    ]
+    if not mixed:
+        return None
+    guess = re.sub(r"(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])", "-", base) + value[len(base):]
+    return (
+        f"模型名 {value} 格式不对：横杠之间的「{'」「'.join(mixed)}」把字母和数字"
+        f"挤在了一段里，像是漏了横杠（是不是 {guess}？）"
+    )
+
+
 def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> str:
     """校验一个完整任务 dict；不合法抛 ValueError，通过返回归一后的触发类型。
 
@@ -451,6 +479,10 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
     models = rc.get("models") or {}
     if models and task["model"] not in models and not _looks_like_model_name(task["model"]):
         raise ValueError(f"{label} 不支持这个模型：{task['model']}")
+    if runner == "claude" and task["model"] not in models:
+        problem = claude_model_name_problem(task["model"])
+        if problem:
+            raise ValueError(f"{label} {problem}")
 
     for key in ("guards", "chain"):
         value = task.get(key)
@@ -556,6 +588,10 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
                 and not _looks_like_model_name(review.get("model"))
             ):
                 raise ValueError(f"审稿方 {r_label} 不支持这个模型：{review.get('model')}")
+            if r_runner == "claude" and review.get("model") not in r_models:
+                r_problem = claude_model_name_problem(review.get("model"))
+                if r_problem:
+                    raise ValueError(f"审稿方 {r_label} {r_problem}")
 
     trigger = task.get("trigger")
     if trigger is None:
