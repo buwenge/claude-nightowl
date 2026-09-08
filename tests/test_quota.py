@@ -2,7 +2,7 @@
 
 import json
 import stat
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -610,10 +610,26 @@ def test_usage_from_shared_rate_limits_without_windows_fails_closed():
         usage_from_shared_rate_limits({}, now=NOW)
 
 
+def _fresh_shared_doc() -> dict:
+    """SHARED_DOC 的刷新时刻是 9/4 写死的；fetch_usage_claude 走真实时钟，
+    过了那一刻 usage_from_shared_rate_limits 会按"刷新已过、读数作废"归零
+    （见 test_usage_from_shared_rate_limits_zeroes_windows_past_reset），这条
+    测试从 2026-09-04 18:10 UTC 起永远红（9/8 查实：读到 0 不是 9）。喂一份
+    刷新时刻在未来的副本，别让日历替测试做决定。"""
+    now = datetime.now(timezone.utc)
+    doc = json.loads(json.dumps(SHARED_DOC))
+    doc["updated_at"] = now.timestamp()
+    for name, window in doc["windows"].items():
+        window["at"] = now.timestamp()
+        hours = 3 if name == "five_hour" else 24 * 5
+        window["resets_at"] = (now + timedelta(hours=hours)).isoformat()
+    return doc
+
+
 def test_fetch_usage_claude_with_oauth_token_reads_shared_file_not_subprocess(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
     shared = tmp_path / "rate_limits.json"
-    shared.write_text(json.dumps(SHARED_DOC), encoding="utf-8")
+    shared.write_text(json.dumps(_fresh_shared_doc()), encoding="utf-8")
     config = {
         "runners": {
             "claude": {
