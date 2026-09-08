@@ -151,10 +151,113 @@ def test_codex_driver_image_and_timeout(monkeypatch, tmp_path):
     assert seen["input"] == "识别"
 
     def timeout(*args, **kwargs):
+        command = args[0]
+        schema_path = Path(command[command.index("--output-schema") + 1])
+        seen["timeout_schema_path"] = schema_path
+        seen["timeout_schema_exists"] = schema_path.is_file()
         raise estimator.subprocess.TimeoutExpired(kwargs.get("timeout"), "")
     monkeypatch.setattr(estimator.subprocess, "run", timeout)
     with pytest.raises(estimator.EstimatorError, match="超时"):
         estimator.CodexEstimator({"timeout_s": 1}).run("识别")
+    assert seen["timeout_schema_exists"]
+    assert not seen["timeout_schema_path"].exists()
+
+
+def test_codex_driver_output_schema_covers_text_and_image(monkeypatch, tmp_path):
+    """Codex 文字和图片请求都传入公开 schema，并在调用后清理临时文件。"""
+    image = tmp_path / "meal.jpg"
+    image.write_bytes(b"jpeg")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        schema_index = command.index("--output-schema")
+        schema_path = Path(command[schema_index + 1])
+        calls.append({
+            "command": command,
+            "schema_path": schema_path,
+            "schema_exists": schema_path.is_file(),
+            "schema": json.loads(schema_path.read_text(encoding="utf-8")),
+            "input": kwargs.get("input"),
+        })
+
+        class Completed:
+            returncode = 0
+            stdout = json.dumps({"result": json.dumps(_result(), ensure_ascii=False)})
+            stderr = ""
+
+        return Completed()
+
+    monkeypatch.setattr(estimator.subprocess, "run", fake_run)
+    driver = estimator.CodexEstimator({"model": "gpt-test", "timeout_s": 9})
+    assert driver.run("识别图片", image)["items"]
+    assert driver.run("识别文字")["items"]
+
+    assert len(calls) == 2
+    assert all(call["schema_exists"] for call in calls)
+    assert all(call["schema"] == estimator.CODEX_OUTPUT_SCHEMA for call in calls)
+    assert set(estimator.CODEX_OUTPUT_SCHEMA["properties"]) == set(estimator.CODEX_OUTPUT_SCHEMA["required"])
+    assert set(estimator.CODEX_OUTPUT_SCHEMA["properties"]["items"]["items"]["properties"]) == set(
+        estimator.CODEX_OUTPUT_SCHEMA["properties"]["items"]["items"]["required"]
+    )
+    assert all(not call["schema_path"].exists() for call in calls)
+    assert str(image) in calls[0]["command"]
+    assert str(image) not in calls[1]["command"]
+    assert calls[0]["input"] == "识别图片"
+    assert calls[1]["input"] == "识别文字"
+
+
+def test_process_failure_stderr_is_bounded_and_redacted(monkeypatch):
+    """子进程失败只保留定长尾部，不能泄露提示词、路径或会话标识。"""
+    prompt = "这是不应回显的敏感提示词"
+    private_path = "/tmp/private-project/meal.jpg"
+    stderr = (
+        f"{prompt}\n{private_path}\n"
+        + "前部噪声 " * 100
+        + "fatal: upstream request failed; session_id=deadbeef-1234-5678-90ab-cdef12345678"
+    )
+
+    class Completed:
+        returncode = 1
+        stdout = ""
+
+    completed = Completed()
+    completed.stderr = stderr
+
+    monkeypatch.setattr(estimator.subprocess, "run", lambda *args, **kwargs: completed)
+    with pytest.raises(estimator.EstimatorError) as caught:
+        estimator.ClaudeEstimator({"timeout_s": 1}).run(prompt)
+    message = str(caught.value)
+    assert prompt not in message
+    assert private_path not in message
+    assert "fatal: upstream request failed" in message
+    assert "deadbeef-1234-5678-90ab-cdef12345678" not in message
+    assert len(message) <= estimator._ERROR_DETAIL_LIMIT + 20
+
+
+def test_timeout_stderr_is_bounded_and_redacted(monkeypatch):
+    """超时摘要同样不能泄露输入、路径或会话标识。"""
+    prompt = "超时场景中的敏感提示词"
+    private_path = "/tmp/private-project/timeout-image.jpg"
+    session_id = "11111111-2222-3333-4444-555555555555"
+    stderr = (
+        f"{prompt}\n{private_path}\n"
+        + "前部诊断噪声 " * 100
+        + f"fatal: upstream timeout; session_id={session_id}; request_id=req-private"
+    )
+
+    def timeout(*args, **kwargs):
+        raise estimator.subprocess.TimeoutExpired(args[0], kwargs["timeout"], stderr=stderr)
+
+    monkeypatch.setattr(estimator.subprocess, "run", timeout)
+    with pytest.raises(estimator.EstimatorError) as caught:
+        estimator.ClaudeEstimator({"timeout_s": 1}).run(prompt)
+    message = str(caught.value)
+    assert prompt not in message
+    assert private_path not in message
+    assert session_id not in message
+    assert "request_id=req-private" not in message
+    assert "fatal: upstream timeout" in message
+    assert len(message) <= estimator._ERROR_DETAIL_LIMIT + 40
 
 
 def test_codex_missing_item_field_is_rejected(monkeypatch):

@@ -12,6 +12,7 @@ import json
 import math
 import mimetypes
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -22,7 +23,7 @@ from typing import Any, Mapping
 
 __all__ = [
     "DEFAULT_SETTINGS", "EstimatorError", "SettingsError", "MAX_IMAGE_BYTES",
-    "ESTIMATE_JSON_SCHEMA", "ESTIMATION_RESULT_SCHEMA",
+    "ESTIMATE_JSON_SCHEMA", "ESTIMATION_RESULT_SCHEMA", "CODEX_OUTPUT_SCHEMA",
     "settings_path", "load_settings", "save_settings", "update_settings",
     "public_settings", "validate_result", "build_prompt", "estimate",
     "estimate_food", "ClaudeEstimator", "CodexEstimator",
@@ -93,8 +94,32 @@ ESTIMATE_JSON_SCHEMA: dict[str, Any] = {
     "required": ["items", "questions"],
 }
 
+# Codex 的严格输出契约只让模型负责 items/questions；本地补齐其余元数据。
+# Codex CLI 要求顶层 properties 中的每个键都出现在 required 中。
+CODEX_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "items": ESTIMATE_JSON_SCHEMA["properties"]["items"],
+        "questions": ESTIMATE_JSON_SCHEMA["properties"]["questions"],
+    },
+    "required": ["items", "questions"],
+}
+
 # 便于调用方按“结果 schema”语义发现同一份不可变契约。
 ESTIMATION_RESULT_SCHEMA = ESTIMATE_JSON_SCHEMA
+
+_ERROR_DETAIL_LIMIT = 300
+_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w])/(?:[^ \t\r\n\"'`<>]+)")
+_WINDOWS_PATH_RE = re.compile(r"(?<![\w])(?:[A-Za-z]:\\|\\\\)[^ \t\r\n\"'`<>]+")
+_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_SESSION_ID_RE = re.compile(
+    r"(?i)(\b(?:session|thread|turn|request|trace|conversation|run)[ _-]?id)\b"
+    r"\s*[\"']?\s*(?:[:=]\s*|\s+)(?:[\"'][^\"']*[\"']|[A-Za-z0-9._:-]+)"
+)
 
 
 class EstimatorError(Exception):
@@ -439,6 +464,21 @@ def _model_json(raw: str) -> Mapping[str, Any]:
     raise EstimatorError(str(last_error or "模型 JSON 顶层必须是对象"))
 
 
+def _safe_error_detail(detail: Any, input_text: str | None = None) -> str:
+    """截取并脱敏子进程错误摘要，避免回显提示词和本机标识。"""
+    text = str(detail or "")
+    prompt = (input_text or "").strip()
+    if prompt:
+        text = text.replace(prompt, "<提示词已省略>")
+    text = _SESSION_ID_RE.sub(r"\1=<会话标识已省略>", text)
+    text = _UUID_RE.sub("<会话标识已省略>", text)
+    text = _ABSOLUTE_PATH_RE.sub("<路径已省略>", text)
+    text = _WINDOWS_PATH_RE.sub("<路径已省略>", text).strip()
+    if len(text) > _ERROR_DETAIL_LIMIT:
+        text = "…" + text[-(_ERROR_DETAIL_LIMIT - 1):]
+    return text
+
+
 def _run(command: list[str], timeout: float, env: Mapping[str, str] | None = None,
          input_text: str | None = None) -> str:
     child_env = dict(os.environ)
@@ -454,13 +494,14 @@ def _run(command: list[str], timeout: float, env: Mapping[str, str] | None = Non
         detail = exc.stderr or exc.stdout or ""
         if isinstance(detail, bytes):
             detail = detail.decode("utf-8", "replace")
-        suffix = f"；输出摘要：{str(detail)[-500:]}" if str(detail).strip() else ""
+        safe_detail = _safe_error_detail(detail, input_text)
+        suffix = f"；输出摘要：{safe_detail}" if safe_detail else ""
         raise EstimatorError(f"估算超时（超过 {timeout:g} 秒）{suffix}") from exc
     except OSError as exc:
-        raise EstimatorError(f"无法启动估算程序：{exc}") from exc
+        raise EstimatorError(f"无法启动估算程序：{_safe_error_detail(exc)}") from exc
     output = completed.stdout or ""
     if completed.returncode != 0 and not output.strip():
-        detail = (completed.stderr or "").strip()
+        detail = _safe_error_detail(completed.stderr, input_text)
         raise EstimatorError(f"估算程序失败：{detail or f'退出码 {completed.returncode}'}")
     return output
 
@@ -511,20 +552,39 @@ class CodexEstimator:
         image = _image_path(image_path)
         model = str(self.config.get("model") or "gpt-5.6-luna")
         timeout = float(self.config.get("timeout_s", DEFAULT_TIMEOUT))
-        command = [
-            os.environ.get("NIGHTSHIFT_CODEX_BIN", "codex"), "exec",
-            "--sandbox", "read-only", "--ephemeral", "--color", "never",
-            "--skip-git-repo-check", "-C",
-            str(image.parent if image is not None else Path(tempfile.gettempdir())),
-        ]
-        if model:
-            command.extend(["-m", model])
-        # 提示词固定从 stdin 读，避免 -i 的可变文件参数把末尾
-        # 提示词误解为另一张图。
-        command.append("-")
-        if image is not None:
-            command.extend(["-i", str(image)])
-        return _model_json(_run(command, timeout, input_text=prompt))
+        schema_file = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix=".codex-output-schema-", suffix=".json",
+            delete=False,
+        )
+        schema_path = Path(schema_file.name)
+        try:
+            # schema 文件只写公开的结果契约，不混入提示词、图片路径或其他运行数据。
+            with schema_file:
+                json.dump(CODEX_OUTPUT_SCHEMA, schema_file, ensure_ascii=False, separators=(",", ":"))
+                schema_file.write("\n")
+                schema_file.flush()
+                os.fsync(schema_file.fileno())
+            command = [
+                os.environ.get("NIGHTSHIFT_CODEX_BIN", "codex"), "exec",
+                "--sandbox", "read-only", "--ephemeral", "--color", "never",
+                "--skip-git-repo-check", "-C",
+                str(image.parent if image is not None else Path(tempfile.gettempdir())),
+            ]
+            if model:
+                command.extend(["-m", model])
+            command.extend(["--output-schema", str(schema_path)])
+            # 提示词固定从 stdin 读，避免 -i 的可变文件参数把末尾
+            # 提示词误解为另一张图。
+            command.append("-")
+            if image is not None:
+                command.extend(["-i", str(image)])
+            return _model_json(_run(command, timeout, input_text=prompt))
+        finally:
+            # 无论模型成功、返回异常 JSON 还是超时，都不留下 schema 临时文件。
+            try:
+                schema_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 class OpenAICompatibleEstimator:
