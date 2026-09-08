@@ -8,6 +8,9 @@
 from __future__ import annotations
 
 import datetime as _dt
+import base64
+import email
+import email.policy
 import importlib
 import inspect
 import json
@@ -19,13 +22,16 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from . import store
 
 __all__ = ["MAX_BODY_BYTES", "WELLNESS_DIR", "make_server", "serve_http"]
 
-MAX_BODY_BYTES = 256 * 1024
+# 图片文件上限 10 MB；multipart 边界和文字字段允许少量额外开销。
+MAX_BODY_BYTES = 10 * 1024 * 1024 + 64 * 1024
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_JSON_BYTES = 256 * 1024
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DAY_PATH = re.compile(r"^/health/api/days/(\d{4}-\d{2}-\d{2})/entries(?:/([^/]+))?$")
 _SUMMARY_PATH = re.compile(r"^/health/api/days/(\d{4}-\d{2}-\d{2})/summary$")
@@ -233,12 +239,11 @@ def _summary(day: str, entries: list[dict]) -> dict:
     if result is None:
         result = _call(calc, ("calculate_summary", "summary_for_day"), day, entries, _profile())
     if isinstance(result, dict):
-        # 对外保留计划书里的简短字段名，同时兼容计算模块的 calories_* 命名。
+        # API 对外只使用 calories_in / calorie_target 这一套字段。
         result = dict(result)
-        result.setdefault("consumed_kcal", result.get("intake_kcal", result.get("calories_in", 0)))
-        result.setdefault("net_kcal", result.get("net_calories"))
-        result.setdefault("budget_kcal", result.get("target_calories"))
-        result.setdefault("remaining_kcal", result.get("remaining_calories"))
+        result.setdefault("calories_in", 0)
+        result.setdefault("calorie_target", None)
+        result.setdefault("remaining_calories", None)
         result.setdefault("entry_count", result.get("record_count", 0))
         return result
     consumed = 0.0
@@ -255,11 +260,11 @@ def _summary(day: str, entries: list[dict]) -> dict:
         budget = None
     return {
         "date": day,
-        "consumed_kcal": round(consumed, 1),
+        "calories_in": round(consumed, 1),
         "exercise_kcal": round(exercise, 1),
-        "net_kcal": round(consumed - exercise, 1),
-        "budget_kcal": budget,
-        "remaining_kcal": round(budget - consumed, 1) if budget is not None else None,
+        "net_calories": round(consumed - exercise, 1),
+        "calorie_target": budget,
+        "remaining_calories": round(budget - consumed, 1) if budget is not None else None,
         "entry_count": len(entries),
     }
 
@@ -271,12 +276,12 @@ def _safe_budget(profile: dict) -> float | None:
     if calc is not None and all(key in profile for key in required):
         try:
             goal = calc.calculate_goal(profile)
-            target = goal.get("target_calories")
+            target = goal.get("calorie_target")
             if isinstance(target, (int, float)) and not isinstance(target, bool) and math.isfinite(float(target)):
                 return float(target)
         except (TypeError, ValueError, KeyError):
             pass
-    raw = profile.get("daily_target_kcal", profile.get("calorie_budget"))
+    raw = profile.get("calorie_target")
     if not isinstance(raw, (int, float)) or isinstance(raw, bool) or not math.isfinite(float(raw)):
         return None
     floor = 1500.0 if profile.get("sex") in {"male", "m"} else 1200.0
@@ -309,15 +314,14 @@ def _plan(day: str, payload: dict) -> Any:
         options["date"] = day
         safe_budget = _safe_budget(profile)
         if safe_budget is not None:
-            options["target_calories"] = safe_budget
+            options["calorie_target"] = safe_budget
         else:
-            for key in ("calorie_target", "target_calories", "daily_target_kcal"):
-                if isinstance(options.get(key), (int, float)) and options[key] < 1200:
-                    options.pop(key, None)
+            if isinstance(options.get("calorie_target"), (int, float)) and options["calorie_target"] < 1200:
+                options.pop("calorie_target", None)
         values = {
             "profile": profile, "preferences": preferences, "options": options,
             "payload": options, "date": day, "day": day,
-            "target_kcal": payload.get("target_kcal"),
+            "calorie_target": payload.get("calorie_target"),
         }
         signature = inspect.signature(generator)
         kwargs = {
@@ -374,14 +378,14 @@ def _validate_profile(data: Any) -> dict:
     if not isinstance(data, dict):
         raise WellnessError("档案必须是 JSON 对象")
     allowed = {"birth_year", "height_cm", "weight_kg", "target_weight_kg", "sex", "biological_sex", "gender",
-               "activity_level", "activity", "waist_cm", "target_date", "weekly_exercise", "daily_target_kcal",
-               "calorie_budget", "deficit_kcal", "pregnant_or_breastfeeding", "eating_disorder_risk", "medical_condition"}
+               "activity_level", "activity", "waist_cm", "target_date", "weekly_exercise", "calorie_target",
+               "deficit_kcal", "pregnant_or_breastfeeding", "eating_disorder_risk", "medical_condition"}
     unknown = sorted(set(data) - allowed)
     if unknown:
         raise WellnessError("档案包含未知字段", fields={key: "unknown" for key in unknown})
     out = dict(data)
     for key, low, high in (("height_cm", 80, 260), ("weight_kg", 20, 500), ("target_weight_kg", 20, 500),
-                           ("waist_cm", 20, 300), ("daily_target_kcal", 0, 10000), ("calorie_budget", 0, 10000),
+                           ("waist_cm", 20, 300), ("calorie_target", 0, 10000),
                            ("deficit_kcal", 0, 5000)):
         if key in out:
             if out[key] is None:
@@ -431,6 +435,177 @@ def _validate_preferences(data: Any) -> dict:
     return _jsonable(out)
 
 
+_PROVIDERS = {"claude", "codex", "openai_compatible", "mock"}
+
+
+def _settings_path() -> Path:
+    return _home() / "settings.json"
+
+
+def _settings() -> dict:
+    """读取估算设置；优先使用估算模块提供的持久化实现。"""
+    estimator = _mod("wellness_estimator")
+    value = _call(estimator, ("load_settings", "get_settings", "read_settings"))
+    if isinstance(value, dict):
+        return value
+    value = _read_json(_settings_path(), {})
+    return value if isinstance(value, dict) else {}
+
+
+def _public_settings(value: dict) -> dict:
+    """返回设置页所需的脱敏视图，任何 api_key 内容都不出服务。"""
+    estimator = _mod("wellness_estimator")
+    fn = getattr(estimator, "public_settings", None) if estimator else None
+    if callable(fn):
+        try:
+            result = fn(value)
+            if isinstance(result, dict):
+                return result
+        except (TypeError, ValueError):
+            pass
+    result = dict(value)
+    providers = result.get("providers")
+    if isinstance(providers, dict):
+        providers = {name: dict(config) if isinstance(config, dict) else {}
+                     for name, config in providers.items()}
+        for config in providers.values():
+            if isinstance(config, dict):
+                secret = config.pop("api_key", None)
+                config["has_api_key"] = bool(secret) if secret is not None else bool(config.get("has_api_key"))
+        result["providers"] = providers
+    result.pop("api_key", None)
+    result["has_api_key"] = bool(value.get("api_key")) if "api_key" in value else bool(value.get("has_api_key"))
+    return result
+
+
+def _validate_settings(data: Any) -> dict:
+    if not isinstance(data, dict):
+        raise WellnessError("设置必须是 JSON 对象")
+    out = dict(data)
+    if "retain_photos" in out and not isinstance(out["retain_photos"], bool):
+        raise WellnessError("retain_photos 必须是布尔值", fields={"retain_photos": "boolean"})
+    provider = out.get("provider", "mock")
+    if not isinstance(provider, str) or provider not in _PROVIDERS:
+        raise WellnessError("provider 不受支持", fields={"provider": "choice"})
+    out["provider"] = provider
+    if "providers" in out and not isinstance(out["providers"], dict):
+        raise WellnessError("providers 必须是对象", fields={"providers": "object"})
+    configs = {}
+    for name, config in (out.get("providers") or {}).items():
+        if name not in _PROVIDERS:
+            raise WellnessError("存在不支持的 provider 设置", fields={str(name): "choice"})
+        if not isinstance(config, dict):
+            raise WellnessError("provider 设置必须是对象", fields={name: "object"})
+        configs[name] = dict(config)
+    out["providers"] = configs
+    return _jsonable(out)
+
+
+def _save_settings(value: dict) -> dict:
+    estimator = _mod("wellness_estimator")
+    fn = getattr(estimator, "save_settings", None) if estimator else None
+    if callable(fn):
+        try:
+            result = fn(value)
+        except Exception as exc:
+            expected = getattr(estimator, "EstimatorError", ())
+            if isinstance(exc, (TypeError, ValueError)) or (
+                    isinstance(expected, type) and isinstance(exc, expected)):
+                raise WellnessError(
+                    f"估算设置无效：{exc}", fields={"settings": "invalid"},
+                ) from exc
+            raise
+        return result if isinstance(result, dict) else value
+    _atomic_json(_settings_path(), value)
+    return value
+
+
+def _estimate(text: str | None, image_path: str | None) -> dict:
+    estimator = _mod("wellness_estimator")
+    fn = getattr(estimator, "estimate", None) if estimator else None
+    if not callable(fn):
+        raise WellnessError("估算模块尚未就绪", "estimator_unavailable", 503)
+    profile = _profile()
+    settings = _settings()
+    # 允许估算模块使用其自己的签名，同时避免给第三方实现塞入未知参数。
+    values = {"text": text, "image_path": image_path, "profile": profile,
+              "profile_summary": profile, "settings": settings}
+    try:
+        signature = inspect.signature(fn)
+        accepts_keywords = any(
+            parameter.kind is parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        kwargs = {
+            name: value for name, value in values.items()
+            if value is not None and (
+                accepts_keywords
+                or name in signature.parameters
+                and signature.parameters[name].kind in (
+                    signature.parameters[name].POSITIONAL_OR_KEYWORD,
+                    signature.parameters[name].KEYWORD_ONLY,
+                )
+            )
+        }
+        result = fn(**kwargs)
+    except (TypeError, ValueError) as exc:
+        raise WellnessError("估算请求无法处理", "estimator_error", 502) from exc
+    if not isinstance(result, dict):
+        raise WellnessError("估算器返回格式无效", "estimator_invalid", 502)
+    result.setdefault("items", [])
+    result.setdefault("questions", [])
+    result.setdefault("provider", settings.get("provider", "mock"))
+    result.setdefault("model", "")
+    result.setdefault("elapsed_ms", 0)
+    if not isinstance(result["items"], list) or not isinstance(result["questions"], list):
+        raise WellnessError("估算器返回格式无效", "estimator_invalid", 502)
+    return _jsonable(result)
+
+
+def _compress_image(raw: bytes, suffix: str = ".jpg") -> bytes:
+    """用 Pillow 统一压缩图片，失败时给用户可理解的提示。"""
+    try:
+        from PIL import Image
+        from io import BytesIO
+        with Image.open(BytesIO(raw)) as image:
+            image = image.convert("RGB")
+            image.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+            output = BytesIO()
+            image.save(output, format="JPEG", quality=80, optimize=True)
+            return output.getvalue()
+    except ImportError as exc:
+        raise WellnessError("服务器未安装图片处理组件", "image_unavailable", 503) from exc
+    except Exception as exc:
+        raise WellnessError("图片无法读取，请换一张常见格式的照片", "invalid_image", 400) from exc
+
+
+def _retain_photo(data: bytes, filename: str) -> str | None:
+    settings = _settings()
+    if not bool(settings.get("retain_photos")):
+        return None
+    photos = _home() / "photos"
+    suffix = ".jpg"
+    target = photos / f"{_dt.datetime.now(_dt.timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex}.jpg"
+    _atomic_bytes(target, data)
+    return str(target.relative_to(_home()))
+
+
+def _atomic_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def _validate_entry(data: Any) -> dict:
     if not isinstance(data, dict):
         raise WellnessError("记录必须是 JSON 对象")
@@ -438,11 +613,17 @@ def _validate_entry(data: Any) -> dict:
     kind = out.get("type")
     if kind not in _ALLOWED_ENTRY_TYPES:
         raise WellnessError("记录 type 必须是 meal、exercise、weight 或 water", fields={"type": "choice"})
+    source = out.get("source")
+    if source is not None and source not in {"text", "photo", "manual"}:
+        raise WellnessError("source 必须是 text、photo 或 manual", fields={"source": "choice"})
     if kind == "meal":
         if not isinstance(out.get("name", out.get("text")), str) or not out.get("name", out.get("text")).strip():
             raise WellnessError("meal 需要 name", fields={"name": "required"})
         if "calories" in out and out["calories"] is not None:
             _finite_number(out["calories"], "calories", 0, 100000)
+        for key in ("kcal_low", "kcal_high", "kcal_best", "protein_g", "carbs_g", "fat_g", "confidence"):
+            if key in out and out[key] is not None:
+                _finite_number(out[key], key, 0, 1 if key == "confidence" else 100000)
     elif kind == "exercise":
         if not isinstance(out.get("name", out.get("text")), str) or not out.get("name", out.get("text")).strip():
             raise WellnessError("exercise 需要 name", fields={"name": "required"})
@@ -483,7 +664,19 @@ class _Handler(BaseHTTPRequestHandler):
     def _fail(self, exc: WellnessError) -> None:
         self._send(exc.status, _error(exc))
 
-    def _body(self) -> dict:
+    def _body(self, max_bytes: int = MAX_JSON_BYTES) -> dict:
+        raw = self._raw_body()
+        if len(raw) > max_bytes:
+            raise WellnessError("JSON 请求正文过大", "body_too_large", 413)
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise WellnessError("请求正文必须是 UTF-8 JSON", "invalid_json", 400) from exc
+        if not isinstance(data, dict):
+            raise WellnessError("请求正文必须是 JSON 对象", fields={"body": "object"})
+        return data
+
+    def _raw_body(self) -> bytes:
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as exc:
@@ -493,13 +686,35 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         if len(raw) != length:
             raise WellnessError("请求正文不完整", "invalid_body", 400)
-        try:
-            data = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise WellnessError("请求正文必须是 UTF-8 JSON", "invalid_json", 400) from exc
-        if not isinstance(data, dict):
-            raise WellnessError("请求正文必须是 JSON 对象", fields={"body": "object"})
-        return data
+        return raw
+
+    def _multipart(self) -> tuple[dict[str, str], bytes | None, str]:
+        """解析 multipart/form-data，仅读取 text 与一个 image 字段。"""
+        content_type = self.headers.get("Content-Type", "")
+        raw = self._raw_body()
+        message = email.message_from_bytes(
+            b"Content-Type: " + content_type.encode("latin1", "replace") + b"\r\nMIME-Version: 1.0\r\n\r\n" + raw,
+            policy=email.policy.default,
+        )
+        fields: dict[str, str] = {}
+        image: bytes | None = None
+        filename = "upload.jpg"
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if not name:
+                continue
+            payload = part.get_payload(decode=True) or b""
+            if name in {"text", "description"}:
+                charset = part.get_content_charset() or "utf-8"
+                fields[name] = payload.decode(charset, "replace")
+            elif name in {"image", "photo", "file"}:
+                if len(payload) > MAX_IMAGE_BYTES:
+                    raise WellnessError("图片文件过大", "image_too_large", 413)
+                image = payload
+                filename = part.get_filename() or filename
+        if image is None and not fields.get("text", "").strip():
+            raise WellnessError("请提供文字或图片", fields={"text": "required"})
+        return fields, image, filename
 
     def _static(self, name: str) -> None:
         relative = _STATIC_FILES.get(name)
@@ -535,6 +750,17 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(200, _envelope(_preferences()))
             if method == "PUT":
                 return self._put_preferences()
+        if path == "/health/api/settings":
+            if method == "GET":
+                return self._send(200, _envelope(_public_settings(_settings())))
+            if method == "PUT":
+                return self._put_settings()
+        if path == "/health/api/estimate" and method == "POST":
+            return self._post_estimate()
+        if path == "/health/api/range" and method == "GET":
+            return self._get_range()
+        if path == "/health/api/report" and method == "GET":
+            return self._get_report()
         match = _DAY_PATH.fullmatch(path)
         if match:
             day, entry_id = match.groups()
@@ -566,26 +792,218 @@ class _Handler(BaseHTTPRequestHandler):
         data.setdefault("updated_at", _dt.datetime.now(_dt.timezone.utc).isoformat())
         return self._send(200, _envelope(_profile_view(_save_profile(data))))
 
-    def _put_preferences(self) -> None:
-        return self._send(200, _envelope(_save_preferences(_validate_preferences(self._body()))))
+    def _put_settings(self) -> None:
+        incoming = self._body()
+        current = _settings()
+        # PUT 是全量设置，但密钥字段留空时代表沿用已有密钥，避免设置页
+        # 先 GET 脱敏值再保存时意外清空密钥。
+        providers = incoming.get("providers")
+        if isinstance(providers, dict):
+            merged = {name: dict(config) if isinstance(config, dict) else config
+                      for name, config in providers.items()}
+            old = current.get("providers") if isinstance(current.get("providers"), dict) else {}
+            for name, config in merged.items():
+                if isinstance(config, dict) and not config.get("api_key"):
+                    previous = old.get(name) if isinstance(old, dict) else None
+                    if isinstance(previous, dict) and previous.get("api_key"):
+                        config["api_key"] = previous["api_key"]
+            incoming = dict(incoming)
+            incoming["providers"] = merged
+        data = _validate_settings(incoming)
+        saved = _save_settings(data)
+        return self._send(200, _envelope(_public_settings(saved)))
 
-    def _post_entry(self, day: str) -> None:
-        entry = _validate_entry(self._body())
+    def _post_estimate(self) -> None:
+        content_type = self.headers.get("Content-Type", "application/json")
+        image: bytes | None = None
+        filename = "upload.jpg"
+        text_value: str | None = None
+        if content_type.lower().split(";", 1)[0].strip() == "multipart/form-data":
+            fields, image, filename = self._multipart()
+            text_value = fields.get("text", "").strip() or None
+        else:
+            body = self._body(MAX_BODY_BYTES)
+            raw_text = body.get("text", body.get("description"))
+            if raw_text is not None and not isinstance(raw_text, str):
+                raise WellnessError("text 必须是字符串", fields={"text": "string"})
+            text_value = raw_text.strip() if isinstance(raw_text, str) else None
+            encoded = body.get("image_base64", body.get("image"))
+            if encoded:
+                if not isinstance(encoded, str):
+                    raise WellnessError("图片内容格式无效", fields={"image": "base64"})
+                try:
+                    image = base64.b64decode(encoded.split(",", 1)[-1], validate=True)
+                except (ValueError, base64.binascii.Error) as exc:
+                    raise WellnessError("图片内容格式无效", fields={"image": "base64"}) from exc
+                filename = "upload.jpg"
+        if not text_value and image is None:
+            raise WellnessError("请提供文字或图片", fields={"text": "required"})
+        temporary: Path | None = None
+        retained: str | None = None
+        try:
+            image_path: str | None = None
+            if image is not None:
+                if len(image) > MAX_IMAGE_BYTES:
+                    raise WellnessError("图片文件过大", "image_too_large", 413)
+                compressed = _compress_image(image)
+                tmp_dir = _home() / "tmp"
+                temporary = tmp_dir / f"estimate-{uuid.uuid4().hex}.jpg"
+                _atomic_bytes(temporary, compressed)
+                image_path = str(temporary.resolve())
+                retained = _retain_photo(compressed, filename)
+            result = _estimate(text_value, image_path)
+            # source 是稳定枚举；文字和照片同时提交时按照片来源记账。
+            result["source"] = "photo" if image is not None else "text"
+            if retained:
+                result["photo"] = retained
+            return self._send(200, _envelope(result))
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def _create_entry(self, day: str, entry: dict) -> dict:
+        entry = dict(entry)
         entry.setdefault("id", str(uuid.uuid4()))
         entry.setdefault("date", day)
         entry.setdefault("created_at", _dt.datetime.now(_dt.timezone.utc).isoformat())
         created = _call(_mod("wellness_store"), ("create_entry", "add_entry"), day, entry)
         if isinstance(created, dict):
-            return self._send(201, _envelope(created))
+            return created
         entries = _entries(day)
         entries.append(entry)
         _save_entries(day, entries)
-        return self._send(201, _envelope(entry))
+        return entry
+
+    def _put_preferences(self) -> None:
+        return self._send(200, _envelope(_save_preferences(_validate_preferences(self._body()))))
+
+    def _post_entry(self, day: str) -> None:
+        body = self._body()
+        batch = body.get("entries", body.get("items"))
+        if batch is None:
+            body.setdefault("source", "manual")
+            entry = _validate_entry(body)
+            return self._send(201, _envelope(self._create_entry(day, entry)))
+        if not isinstance(batch, list) or not batch:
+            raise WellnessError("entries 必须是非空数组", fields={"entries": "array"})
+        validated: list[dict] = []
+        source = body.get("source", "manual")
+        original = body.get("estimate")
+        for item in batch:
+            if not isinstance(item, dict):
+                raise WellnessError("entries 中每项必须是对象", fields={"entries": "array_of_objects"})
+            item = dict(item)
+            if source and "source" not in item:
+                item["source"] = source
+            if original is not None and "estimate" not in item:
+                item["estimate"] = original
+            if item.get("type", "meal") == "meal":
+                item.setdefault("type", "meal")
+                if "calories" not in item and item.get("kcal_best") is not None:
+                    item["calories"] = item["kcal_best"]
+            validated.append(_validate_entry(item))
+        # 先校验整批，避免后一项错误时前几项已经入账。
+        created = [self._create_entry(day, item) for item in validated]
+        return self._send(201, _envelope({"date": day, "entries": created, "count": len(created)}))
+
+    def _range_dates(self) -> tuple[str, str]:
+        query = parse_qs(urlsplit(self.path).query)
+        today = _dt.date.today()
+        start_raw = (query.get("from") or [None])[0]
+        end_raw = (query.get("to") or [None])[0]
+        try:
+            end = _dt.date.fromisoformat(end_raw) if end_raw else today
+            start = _dt.date.fromisoformat(start_raw) if start_raw else end - _dt.timedelta(days=6)
+        except (TypeError, ValueError) as exc:
+            raise WellnessError("日期必须是 YYYY-MM-DD", fields={"from": "date", "to": "date"}) from exc
+        if start > end:
+            raise WellnessError("from 不能晚于 to", fields={"from": "range"})
+        if (end - start).days > 366:
+            raise WellnessError("日期范围不能超过 367 天", fields={"to": "range"})
+        return start.isoformat(), end.isoformat()
+
+    @staticmethod
+    def _daily_for_range(day: str) -> dict:
+        entries = _entries(day)
+        summary = _summary(day, entries)
+        macros = summary.get("macros") if isinstance(summary.get("macros"), dict) else {}
+        def numeric(*names: str, default: float = 0.0):
+            for name in names:
+                value = summary.get(name)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return round(float(value), 1)
+            return default
+        result = {
+            "date": day,
+            "calories_in": numeric("calories_in", "intake", "calories"),
+            "exercise_kcal": numeric("exercise_kcal", "calories_out", "exercise"),
+            "net_calories": numeric("net_calories"),
+            "calorie_target": summary.get("calorie_target", summary.get("target")),
+            "protein_g": numeric("protein_g", default=macros.get("protein_g", 0.0)),
+            "carbs_g": numeric("carbs_g", default=macros.get("carbs_g", 0.0)),
+            "fat_g": numeric("fat_g", default=macros.get("fat_g", 0.0)),
+            "weight_kg": summary.get("weight_kg"),
+            "entry_count": int(summary.get("entry_count", summary.get("record_count", len(entries))) or 0),
+            "entries": entries,
+        }
+        return result
+
+    def _range_data(self, start: str, end: str) -> dict:
+        # 统一走仓库的聚合实现，确保 HTTP、CLI 和模型读取使用完全相同的数字。
+        store_result = _call(_mod("wellness_store"), ("range_summary", "aggregate_range", "summarize_range"),
+                             start, end, profile=_profile())
+        if isinstance(store_result, dict):
+            return store_result
+        raise WellnessError("范围聚合模块尚未就绪", "report_unavailable", 503)
+
+    def _get_range(self) -> None:
+        start, end = self._range_dates()
+        return self._send(200, _envelope(self._range_data(start, end)))
+
+    def _get_report(self) -> None:
+        query = parse_qs(urlsplit(self.path).query)
+        period = (query.get("period") or ["week"])[0]
+        if period not in {"week", "month"}:
+            raise WellnessError("period 必须是 week 或 month", fields={"period": "choice"})
+        end_raw = (query.get("end") or [None])[0]
+        try:
+            end = _dt.date.fromisoformat(end_raw) if end_raw else _dt.date.today()
+        except ValueError as exc:
+            raise WellnessError("日期必须是 YYYY-MM-DD", fields={"end": "date"}) from exc
+        start = end - _dt.timedelta(days=6 if period == "week" else 29)
+        format_name = (query.get("format") or ["json"])[0]
+        if format_name not in {"json", "md"}:
+            raise WellnessError("format 必须是 json 或 md", fields={"format": "choice"})
+        store_report = _call(_mod("wellness_store"), ("report", "range_report"), period, end.isoformat(), format_name,
+                             profile=_profile())
+        if store_report is not None:
+            if format_name == "json":
+                return self._send(200, _envelope(store_report))
+            return self._send_raw(200, str(store_report).encode("utf-8"), "text/markdown; charset=utf-8")
+        data = self._range_data(start.isoformat(), end.isoformat())
+        if format_name == "json":
+            return self._send(200, _envelope(data))
+        lines = [f"# 健康记录（{data['from']} 至 {data['to']}）", "",
+                 "## 每日汇总", "", "| 日期 | 摄入 | 运动 | 净值 | 目标 | 体重 | 记录 |", "|---|---:|---:|---:|---:|---:|---:|"]
+        for day in data["days"]:
+            target = day.get("calorie_target") if day.get("calorie_target") is not None else "—"
+            weight = day.get("weight_kg") if day.get("weight_kg") is not None else "—"
+            lines.append(f"| {day['date']} | {day['calories_in']:.1f} | {day['exercise_kcal']:.1f} | {day['net_calories']:.1f} | {target} | {weight} | {day['entry_count']} |")
+        lines.extend(["", "## 每日饮食", ""])
+        for day in data["days"]:
+            foods = [str(entry.get("name", entry.get("text", "手动记录"))) for entry in day["entries"] if entry.get("type", "meal") == "meal"]
+            lines.append(f"- **{day['date']}**：" + ("、".join(foods) if foods else "无饮食记录"))
+        lines.extend(["", "## 小结", "", f"- 总摄入：{data['total']['calories_in']:.1f} 千卡；总运动：{data['total']['exercise_kcal']:.1f} 千卡。", f"- 日均摄入：{data['average']['calories_in']:.1f} 千卡；共 {data['total']['entry_count']} 条记录。"])
+        raw = ("\n".join(lines) + "\n").encode("utf-8")
+        return self._send_raw(200, raw, "text/markdown; charset=utf-8")
 
     def _post_plan(self, day: str) -> None:
         payload = self._body()
         # 计划参数允许由计算模块自行扩展，但必须先拒绝明显错误的日期/类型。
-        for key in ("target_kcal", "target_calories", "calorie_target", "daily_target_kcal"):
+        for key in ("calorie_target",):
             if key in payload:
                 _finite_number(payload[key], key, 0, 10000)
         return self._send(200, _envelope(_plan(day, payload)))

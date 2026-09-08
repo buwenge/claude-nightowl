@@ -14,7 +14,7 @@ import re
 import tempfile
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date as calendar_date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
@@ -25,6 +25,7 @@ __all__ = [
     "update_preferences", "load_day", "save_day", "load_entries",
     "save_entries", "create_entry", "get_entry", "update_entry",
     "delete_entry", "load_plan", "save_plan", "update_plan",
+    "range_summary", "report", "range_report",
 ]
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -432,6 +433,209 @@ class WellnessStore:
             _atomic_json(path, document)
         return plan
 
+    # ---------- 范围汇总与报告 ----------
+
+    def range_summary(self, from_day: str, to_day: str, *, target: float | None = None,
+                      profile: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """按日读取并聚合闭区间数据。
+
+        聚合发生在读时，按天 JSON 的存档格式无需迁移。体重移动平均会额外
+        读取区间起点前六天，确保跨月和区间首日的七日窗口完整。
+        """
+        start = _as_calendar_date(from_day)
+        finish = _as_calendar_date(to_day)
+        if start > finish:
+            raise ValueError("from 日期不能晚于 to 日期")
+        budget = _target_from_profile(target, profile)
+        days: list[dict[str, Any]] = []
+        records_by_day: dict[str, list[dict[str, Any]]] = {}
+        cursor = start - timedelta(days=6)
+        while cursor <= finish:
+            key = cursor.isoformat()
+            records_by_day[key] = self.list_entries(key)
+            cursor += timedelta(days=1)
+
+        cursor = start
+        while cursor <= finish:
+            key = cursor.isoformat()
+            records = records_by_day[key]
+            summary = _daily_summary(records, budget, key)
+            summary["foods"] = _food_list(records)
+            summary["weight_7d_average"] = _moving_weight(records_by_day, cursor)
+            days.append(summary)
+            cursor += timedelta(days=1)
+
+        numeric_keys = (
+            "calories_in", "calories_out", "net_calories", "calorie_target",
+            "meals_count", "exercise_count", "record_count",
+        )
+        totals: dict[str, Any] = {
+            key: round(sum(float(day.get(key) or 0) for day in days), 1)
+            for key in numeric_keys
+        }
+        macro_totals = {
+            key: round(sum(float(day.get("macros", {}).get(key) or 0) for day in days), 1)
+            for key in ("protein_g", "carbs_g", "fat_g", "fiber_g")
+        }
+        totals["macros"] = macro_totals
+        totals.update(macro_totals)
+        totals["days"] = len(days)
+        averages: dict[str, Any] = {
+            key: round(totals[key] / len(days), 1) if days else 0.0
+            for key in numeric_keys
+        }
+        averages["macros"] = {
+            key: round(value / len(days), 1) if days else 0.0
+            for key, value in macro_totals.items()
+        }
+        averages.update(averages["macros"])
+        weights = [day["weight_kg"] for day in days if day.get("weight_kg") is not None]
+        averages["weight_kg"] = round(sum(weights) / len(weights), 1) if weights else None
+        moving = [day["weight_7d_average"] for day in days if day.get("weight_7d_average") is not None]
+        averages["weight_7d_average"] = round(sum(moving) / len(moving), 1) if moving else None
+        return {
+            "from": from_day,
+            "to": to_day,
+            "days": days,
+            "totals": totals,
+            "averages": averages,
+            "weight_7d_average": [
+                {"date": day["date"], "weight_kg": day["weight_7d_average"]}
+                for day in days
+            ],
+        }
+
+    aggregate_range = range_summary
+    summarize_range = range_summary
+
+    def report(self, period: str = "week", end: str | None = None,
+               format: str = "json", *, target: float | None = None,
+               profile: Mapping[str, Any] | None = None) -> dict[str, Any] | str:
+        """生成七日或三十日 JSON/Markdown 报告。"""
+        if period not in {"week", "month"}:
+            raise ValueError("period 必须是 week 或 month")
+        if format not in {"json", "md"}:
+            raise ValueError("format 必须是 json 或 md")
+        end_day = _as_calendar_date(end or calendar_date.today().isoformat())
+        count = 7 if period == "week" else 30
+        start_day = end_day - timedelta(days=count - 1)
+        result = self.range_summary(start_day.isoformat(), end_day.isoformat(), target=target, profile=profile)
+        return _markdown_report(result) if format == "md" else result
+
+    range_report = report
+
+
+def _as_calendar_date(value: str) -> calendar_date:
+    """校验日期并返回标准库日期对象。"""
+    normalized = _valid_date(value)
+    return calendar_date.fromisoformat(normalized)
+
+
+def _target_from_profile(target: float | None,
+                         profile: Mapping[str, Any] | None) -> float | None:
+    """从显式目标或档案计算每日目标；档案不完整时保持空值。"""
+    if isinstance(target, (int, float)) and not isinstance(target, bool):
+        return float(target) if target > 0 else None
+    if not isinstance(profile, Mapping):
+        return None
+    value = profile.get("calorie_target")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    try:
+        from .wellness_calc import calculate_goal
+        result = calculate_goal(profile)
+    except (ImportError, KeyError, TypeError, ValueError):
+        return None
+    value = result.get("calorie_target") if isinstance(result, Mapping) else None
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else None
+
+
+def _daily_summary(records: list[dict[str, Any]], target: float | None,
+                   day: str) -> dict[str, Any]:
+    """调用计算模块，集中处理报告层的日期参数。"""
+    from .wellness_calc import daily_summary
+    return daily_summary(records, target, date_value=day)
+
+
+def _record_number(record: Mapping[str, Any], *names: str) -> float:
+    for name in names:
+        value = record.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return 0.0
+
+
+def _food_list(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """提取报告中人和模型都容易阅读的每日食物清单。"""
+    foods: list[dict[str, Any]] = []
+    for record in records:
+        if str(record.get("type", record.get("kind", "meal"))).lower() not in {"meal", "food", "饮食", "餐"}:
+            continue
+        name = record.get("name", record.get("text", "未命名食物"))
+        item: dict[str, Any] = {"name": str(name)}
+        for key in ("portion", "unit", "calories", "calories_kcal", "protein_g", "carbs_g", "fat_g"):
+            if key in record and record[key] is not None:
+                item[key] = record[key]
+        if "calories" not in item and "calories_kcal" in item:
+            item["calories"] = item["calories_kcal"]
+        foods.append(item)
+    return foods
+
+
+def _moving_weight(records_by_day: Mapping[str, list[dict[str, Any]]], day: calendar_date) -> float | None:
+    """计算当天及之前六个自然日内每天最新体重的等权平均值。"""
+    values: list[float] = []
+    for offset in range(7):
+        records = records_by_day.get((day - timedelta(days=offset)).isoformat(), [])
+        weights = []
+        for record in records:
+            kind = str(record.get("type", record.get("kind", "meal"))).lower()
+            if kind in {"weight", "体重"}:
+                value = _record_number(record, "weight_kg", "weight")
+                if value > 0:
+                    stamp = str(record.get("recorded_at", record.get("created_at", record.get("timestamp", ""))))
+                    weights.append((stamp, value))
+        if weights:
+            values.append(max(weights, key=lambda item: item[0])[1])
+    return round(sum(values) / len(values), 1) if values else None
+
+
+def _markdown_report(result: Mapping[str, Any]) -> str:
+    """把范围汇总渲染为稳定、无需额外解析器的 Markdown。"""
+    start, finish = result["from"], result["to"]
+    lines = [f"# 健康记录报告（{start} 至 {finish}）", "", "## 每日汇总", "",
+             "| 日期 | 摄入 | 运动 | 净值 | 目标 | 体重 | 记录数 |",
+             "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    for day in result.get("days", []):
+        weight = "-" if day.get("weight_kg") is None else f"{day['weight_kg']:.1f}"
+        target = "-" if day.get("calorie_target") is None else f"{day['calorie_target']:.1f}"
+        lines.append(
+            f"| {day['date']} | {day['calories_in']:.1f} | {day['calories_out']:.1f} | "
+            f"{day['net_calories']:.1f} | {target} | {weight} | {day['record_count']} |"
+        )
+    lines.extend(["", "## 每日食物", ""])
+    for day in result.get("days", []):
+        foods = day.get("foods", [])
+        if foods:
+            details = "；".join(
+                f"{str(item.get('name', '未命名'))}"
+                + (f"（{item['portion']}）" if item.get("portion") else "")
+                + (f" {item['calories']} 千卡" if item.get("calories") is not None else "")
+                for item in foods
+            )
+        else:
+            details = "无饮食记录"
+        lines.append(f"- {day['date']}：{details}")
+    totals = result.get("totals", {})
+    averages = result.get("averages", {})
+    lines.extend(["", "## 小结", "", f"- 区间合计摄入：{totals.get('calories_in', 0):.1f} 千卡",
+                  f"- 区间合计运动：{totals.get('calories_out', 0):.1f} 千卡",
+                  f"- 每日平均摄入：{averages.get('calories_in', 0):.1f} 千卡",
+                  f"- 每日平均净值：{averages.get('net_calories', 0):.1f} 千卡"])
+    if averages.get("weight_7d_average") is not None:
+        lines.append(f"- 体重七日移动平均（区间均值）：{averages['weight_7d_average']:.1f} 千克")
+    return "\n".join(lines) + "\n"
+
 
 def get_store(root: str | os.PathLike[str] | None = None) -> WellnessStore:
     """构造使用当前 NIGHTSHIFT_HOME 的仓库。"""
@@ -506,3 +710,17 @@ def save_plan(day: str, plan: Mapping[str, Any]) -> dict[str, Any]:
 
 def update_plan(day: str, patch: Mapping[str, Any]) -> dict[str, Any]:
     return get_store().update_plan(day, patch)
+
+
+def range_summary(from_day: str, to_day: str, *, target: float | None = None,
+                  profile: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    return get_store().range_summary(from_day, to_day, target=target, profile=profile)
+
+
+def report(period: str = "week", end: str | None = None, format: str = "json",
+           *, target: float | None = None,
+           profile: Mapping[str, Any] | None = None) -> dict[str, Any] | str:
+    return get_store().report(period, end, format, target=target, profile=profile)
+
+
+range_report = report

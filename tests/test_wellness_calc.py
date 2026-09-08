@@ -92,7 +92,7 @@ def test_custom_deficit_is_capped_and_floor_is_preserved():
 def test_local_plan_has_three_meals_and_respects_preferences():
     plan = generate_plan(
         "2026-09-07",
-        {"target_calories": 1800},
+        {"calorie_target": 1800},
         preferences={"items": {"general": {"鸡蛋": "avoid", "豆腐": "love"}}, "allergies": ["虾"]},
     )
     assert [meal["meal"] for meal in plan["meals"]] == ["早餐", "午餐", "晚餐"]
@@ -105,7 +105,7 @@ def test_local_plan_has_three_meals_and_respects_preferences():
 
 def test_plan_avoid_matches_ingredient_category_and_default_budget_is_visible():
     seafood_blocked = generate_plan(
-        "2026-09-07", {"target_calories": 1800},
+        "2026-09-07", {"calorie_target": 1800},
         preferences={"items": {"general": {"海鲜": "avoid"}}},
     )
     assert all(
@@ -114,6 +114,6 @@ def test_plan_avoid_matches_ingredient_category_and_default_budget_is_visible():
         for ingredient in meal["ingredients"]
     )
     fallback = generate_plan("2026-09-07", {}, {})
-    assert fallback["target_calories"] == 1800
+    assert fallback["calorie_target"] == 1800
     assert fallback["warnings"]
     assert "默认 1800" in fallback["notice"]

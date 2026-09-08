@@ -181,12 +181,12 @@ def safety_warnings(profile: Mapping[str, Any], goal: Mapping[str, Any] | None =
     if target_bmi < 18.5:
         warnings.append("目标 BMI 偏低，不自动生成减重热量缺口")
     if goal:
-        target_calories = goal.get("calorie_target", goal.get("target_calories"))
+        calorie_target = goal.get("calorie_target")
         tdee = goal.get("tdee")
-        if isinstance(target_calories, Real) and isinstance(tdee, Real) and tdee > 0:
-            if target_calories < (1500 if normalized["sex"] == "male" else 1200):
+        if isinstance(calorie_target, Real) and isinstance(tdee, Real) and tdee > 0:
+            if calorie_target < (1500 if normalized["sex"] == "male" else 1200):
                 warnings.append("建议摄入低于保守下限，请咨询专业人士")
-            if (tdee - target_calories) / tdee > 0.20:
+            if (tdee - calorie_target) / tdee > 0.20:
                 warnings.append("热量缺口超过 TDEE 的 20%，不建议自行执行")
     if normalized.get("pregnant_or_breastfeeding") or normalized.get("eating_disorder_risk") or normalized.get("medical_condition"):
         warnings.append("孕哺、疾病或进食风险标记存在，不自动计算减重预算")
@@ -241,7 +241,7 @@ def calculate_goal(profile: Mapping[str, Any], *, today: date | None = None,
         proposed = maintenance
     result = {
         "bmr": round(bmr), "tdee": maintenance, "maintenance_calories": maintenance,
-        "calorie_target": proposed, "target_calories": proposed,
+        "calorie_target": proposed,
         "deficit_calories": max(0, maintenance - proposed),
         "deficit_percent": round(max(0, maintenance - proposed) / maintenance, 3),
         "target_bmi": target_bmi, "safe_to_cut": not bool(warnings),
@@ -367,9 +367,9 @@ def generate_plan(day: str, payload: Mapping[str, Any] | None = None,
     profile = profile if isinstance(profile, Mapping) else {}
     preferences = preferences if isinstance(preferences, Mapping) else {}
     used_default_budget = False
-    target_value = payload.get("calorie_target", payload.get("target_calories", payload.get("target_kcal", payload.get("budget_kcal", payload.get("daily_target_kcal")))))
+    target_value = payload.get("calorie_target")
     if not isinstance(target_value, Real) or isinstance(target_value, bool) or not math.isfinite(float(target_value)) or float(target_value) <= 0:
-        target_value = profile.get("daily_target_kcal", profile.get("calorie_budget"))
+        target_value = profile.get("calorie_target")
     if not isinstance(target_value, Real) or isinstance(target_value, bool) or not math.isfinite(float(target_value)) or float(target_value) <= 0:
         try:
             target_value = calculate_goal(profile)["calorie_target"]
@@ -416,7 +416,7 @@ def generate_plan(day: str, payload: Mapping[str, Any] | None = None,
     if meals:
         meals[-1]["calories_kcal"] += difference
     result = {
-        "version": 1, "date": day, "target_calories": round(target),
+        "version": 1, "date": day, "calorie_target": round(target),
         "total_calories": sum(int(item["calories_kcal"]) for item in meals),
         "meals": meals, "warnings": [], "source": "local_template",
     }
@@ -454,7 +454,7 @@ def daily_summary(entries: Mapping[str, Any] | Iterable[Mapping[str, Any]] | str
         target = None
         if compat and isinstance(compat[0], Mapping):
             profile = compat[0]
-            target = profile.get("daily_target_kcal", profile.get("calorie_budget"))
+            target = profile.get("calorie_target")
     records: list[Mapping[str, Any]] = []
     if isinstance(entries, Mapping):
         if isinstance(entries.get("records"), list):
@@ -492,32 +492,27 @@ def daily_summary(entries: Mapping[str, Any] | Iterable[Mapping[str, Any]] | str
             fiber += _value(record, "fiber_g", "fiber")
             meals += 1
     if isinstance(target, Mapping):
-        target_value = target.get("calorie_target", target.get("target_calories", target.get("calories")))
+        target_value = target.get("calorie_target", target.get("calories"))
     else:
         target_value = target
     budget = float(target_value) if isinstance(target_value, Real) and not isinstance(target_value, bool) else None
     result: dict[str, Any] = {
         "date": date_value if date_value is not None else date,
-        "calories_in": round(intake, 1), "intake_kcal": round(intake, 1),
+        "calories_in": round(intake, 1),
         "calories_out": round(burned, 1), "exercise_kcal": round(burned, 1),
         "net_calories": round(intake - burned, 1),
         "meals_count": meals, "exercise_count": exercises,
         "macros": {"protein_g": round(protein, 1), "carbs_g": round(carbs, 1), "fat_g": round(fat, 1), "fiber_g": round(fiber, 1)},
+        "protein_g": round(protein, 1), "carbs_g": round(carbs, 1),
+        "fat_g": round(fat, 1), "fiber_g": round(fiber, 1),
         "weight_kg": latest_weight,
-        "record_count": len(records), "target_calories": round(budget, 1) if budget is not None else None,
+        "record_count": len(records), "calorie_target": round(budget, 1) if budget is not None else None,
         "remaining_calories": round(budget - intake, 1) if budget is not None else None,
     }
     if budget and budget > 0:
         result["progress_percent"] = round(intake / budget * 100, 1)
     else:
         result["progress_percent"] = None
-    # API 的旧字段名保留为别名，便于网页和导出数据平滑升级。
-    result.update({
-        "consumed_kcal": result["calories_in"],
-        "net_kcal": result["net_calories"],
-        "budget_kcal": result["target_calories"],
-        "entry_count": result["record_count"],
-    })
     return result
 
 

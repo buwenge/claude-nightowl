@@ -69,6 +69,28 @@
       </form>
     </section>
 
+    <section class="card estimate-card" aria-labelledby="estimate-heading">
+      <div class="section-heading"><div><p class="eyebrow">SMART LOG</p><h2 id="estimate-heading">拍照 / 文字估算</h2></div><span id="estimate-status" class="muted"></span></div>
+      <p class="hint">可以写一句话，也可以拍下餐盘。确认前都能修改，照片默认不会长期保存。</p>
+      <form id="estimate-form" novalidate>
+        <label for="estimate-text">吃了什么</label>
+        <textarea id="estimate-text" rows="3" maxlength="2000" placeholder="例如：午饭一碗米饭、番茄炒蛋、半杯奶茶"></textarea>
+        <label for="estimate-photo">拍照或选择图片</label>
+        <input id="estimate-photo" type="file" accept="image/*" capture="environment">
+        <p id="estimate-error" class="error" role="alert"></p>
+        <button type="submit" class="primary" id="estimate-button">开始估算</button>
+      </form>
+      <div id="estimate-result" class="estimate-result" hidden>
+        <p class="hint">请确认候选并调整份量或热量：</p>
+        <div id="estimate-items"></div>
+        <label for="estimate-add-name">手动添加一条</label>
+        <input id="estimate-add-name" type="text" maxlength="200" placeholder="食物名称">
+        <button type="button" class="outline" id="estimate-add">添加</button>
+        <p id="estimate-questions" class="hint"></p>
+        <button type="button" class="primary" id="estimate-save">确认并记账</button>
+      </div>
+    </section>
+
     <section class="card" aria-labelledby="entries-heading">
       <div class="section-heading"><div><p class="eyebrow">TODAY</p><h2 id="entries-heading">今天的记录</h2></div><span id="entry-count" class="muted"></span></div>
       <div id="entries-list" class="entries-list"><p class="muted">正在读取记录…</p></div>
@@ -110,6 +132,23 @@
       <button type="button" id="plan-button" class="primary">生成今天的餐单</button>
       <div id="plan-result" class="plan-result" hidden></div>
       <p id="plan-error" class="error" role="alert"></p>
+    </section>
+    <section class="card archive-card" aria-labelledby="archive-heading">
+      <div class="section-heading"><div><p class="eyebrow">ARCHIVE</p><h2 id="archive-heading">周 / 月存档</h2></div>
+        <div class="period-toggle" role="group" aria-label="存档范围"><button type="button" class="outline period-button active" data-period="7">近 7 天</button><button type="button" class="outline period-button" data-period="30">近 30 天</button></div>
+      </div>
+      <div id="archive-result" class="archive-result"><p class="muted">正在读取存档…</p></div>
+    </section>
+    <section class="card settings-card" aria-labelledby="settings-heading">
+      <div class="section-heading"><div><p class="eyebrow">ESTIMATOR</p><h2 id="settings-heading">估算设置</h2></div><span id="settings-status" class="muted"></span></div>
+      <form id="settings-form" novalidate>
+        <label for="settings-provider">估算服务</label>
+        <select id="settings-provider"><option value="mock">Mock（测试）</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="openai_compatible">OpenAI 兼容 API</option></select>
+        <div id="provider-settings"></div>
+        <label class="settings-check"><input id="settings-retain-photos" type="checkbox"> 保留压缩后的照片，方便事后核对</label>
+        <p id="settings-error" class="error" role="alert"></p>
+        <button type="submit" class="secondary">保存估算设置</button>
+      </form>
     </section>
     <p class="disclaimer">日日有益提供生活记录和粗略估算，不替代医生或营养师。若处于孕哺期、未成年、患有慢性病或有进食障碍风险，请先咨询专业人士。</p>
   </main>

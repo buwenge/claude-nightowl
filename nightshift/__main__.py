@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import auth, launcher, quota, scheduler, server, store, wellness
+from . import auth, launcher, quota, scheduler, server, store, wellness, wellness_store
 
 __all__ = ["main"]
 
@@ -229,6 +229,26 @@ def cmd_wellness_serve(args) -> int:
     return 0
 
 
+def cmd_wellness_report(args) -> int:
+    """输出近七日或近三十日健康报告，供人和模型直接查看。"""
+    health_store = wellness_store.WellnessStore()
+    try:
+        result = health_store.report(
+            "week" if args.days == 7 else "month",
+            args.end,
+            args.format,
+            profile=health_store.load_profile() or {},
+        )
+    except (OSError, ValueError, wellness_store.WellnessStoreError) as exc:
+        print(f"健康报告生成失败：{exc}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(result, end="" if str(result).endswith("\n") else "\n")
+    return 0
+
+
 def cmd_passwd(args) -> int:
     """交互式设置/覆盖登录口令（覆盖后旧的登录 cookie 全部失效）。"""
     store.ensure_dirs()
@@ -320,6 +340,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="起独立健康记录网页/API（默认只监听 127.0.0.1）",
     )
     p.set_defaults(func=cmd_wellness_serve)
+
+    p = sub.add_parser("wellness-report", help="输出近 7 天或近 30 天健康报告")
+    p.add_argument("--days", type=int, choices=(7, 30), required=True,
+                   help="报告天数：7 或 30")
+    p.add_argument("--end", default=None, help="结束日期（YYYY-MM-DD，默认今天）")
+    p.add_argument("--format", choices=("md", "json"), default="md",
+                   help="输出格式（默认 md）")
+    p.set_defaults(func=cmd_wellness_report)
 
     p = sub.add_parser("passwd", help="设置/覆盖网页登录口令（覆盖后旧登录全部失效）")
     p.set_defaults(func=cmd_passwd)

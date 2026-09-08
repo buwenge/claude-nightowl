@@ -36,9 +36,9 @@ def test_fallback_entry_storage_and_summary(tmp_path, monkeypatch):
     wellness._save_entries(day, entries)
     assert wellness._entries(day) == entries
     summary = wellness._summary(day, entries)
-    assert summary["consumed_kcal"] == 600
+    assert summary["calories_in"] == 600
     assert summary["exercise_kcal"] == 120
-    assert summary["net_kcal"] == 480
+    assert summary["net_calories"] == 480
     raw = json.loads((tmp_path / "wellness" / "entries" / f"{day}.json").read_text())
     assert raw.get("entries", raw.get("records")) == entries
 
@@ -79,7 +79,7 @@ def test_api_routes_return_stable_envelope_without_socket(tmp_path, monkeypatch)
     response = call("GET", "/health/api/days/2026-09-07/entries")
     assert response["body"]["data"]["entries"][0]["id"] == entry_id
     response = call("GET", "/health/api/days/2026-09-07/summary")
-    assert response["body"]["data"]["consumed_kcal"] == 600
+    assert response["body"]["data"]["calories_in"] == 600
     response = call("DELETE", f"/health/api/days/2026-09-07/entries/{entry_id}")
     assert response["body"] == {"ok": True, "data": {"deleted": entry_id}}
 
@@ -117,10 +117,10 @@ def test_unsafe_manual_budget_does_not_become_summary_budget(tmp_path, monkeypat
     wellness._save_profile({
         "birth_year": 1990, "height_cm": 170, "weight_kg": 80,
         "target_weight_kg": 70, "sex": "female", "activity_level": "light",
-        "daily_target_kcal": 500, "deficit_kcal": 5000,
+        "calorie_target": 500, "deficit_kcal": 5000,
     })
     summary = wellness._summary("2026-09-07", [])
-    assert summary["budget_kcal"] >= 1200
+    assert summary["calorie_target"] >= 1200
 
 
 def test_deficit_only_profile_uses_calc_goal_for_summary(tmp_path, monkeypatch):
@@ -132,7 +132,7 @@ def test_deficit_only_profile_uses_calc_goal_for_summary(tmp_path, monkeypatch):
     }
     wellness._save_profile(profile)
     from nightshift import wellness_calc
-    expected = wellness_calc.calculate_goal(profile)["target_calories"]
+    expected = wellness_calc.calculate_goal(profile)["calorie_target"]
     summary = wellness._summary("2026-09-07", [{"type": "meal", "calories": 500}])
-    assert summary["budget_kcal"] == expected
-    assert summary["remaining_kcal"] == expected - 500
+    assert summary["calorie_target"] == expected
+    assert summary["remaining_calories"] == expected - 500
