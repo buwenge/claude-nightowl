@@ -2363,6 +2363,24 @@ def _start_review_round(task: dict, config: dict, now: datetime) -> list[str]:
     return [f"{task_id} 起第 {round_} 轮审稿 → {review_id}"]
 
 
+def _close_review_window(task: dict, config: dict, note: str) -> None:
+    """审稿结论落盘并分流之后关掉审稿窗口（9/8）：意见全文已在 review-N.md
+    与网页详情里，窗口留着只会堆（2344 链六轮攒了六扇没人看的审稿窗）。
+    幂等：status 记 review_window_closed；关不掉/本来不在都不算错，如实写
+    events。pending（意见没写完等额度）不走这里，窗口要留着续写。"""
+    task_id = task["id"]
+    status = store.read_status(task_id)
+    if status.get("review_window_closed"):
+        return
+    window_id = status.get("window_id")
+    closed = launcher.close_windows([window_id], config) if window_id else []
+    store.update_status(task_id, review_window_closed=True)
+    store.append_event(
+        task_id,
+        f"{note}，审稿窗口 {window_id or '-'} {'已关' if closed else '本来就不在或关不掉'}",
+    )
+
+
 def _check_review_idle(
     task: dict, status: dict, config: dict, now: datetime
 ) -> list[str] | None:
@@ -2394,6 +2412,7 @@ def _check_review_idle(
                     [reason, "网页上点“继续”可以再放一轮，不会自动无限返工"],
                     config,
                 )
+                _close_review_window(task, config, "返工到线等工头")
                 return [f"{task_id} 返工轮数到线 → needs_attention"]
             return []  # 已经告过警，安静等工头点"继续"
 
@@ -2411,10 +2430,13 @@ def _check_review_idle(
     store.update_status(task_id, review_routed_round=round_)
 
     if verdict == "done":
-        return _review_done(task, config, now)
+        actions = _review_done(task, config, now)
+        _close_review_window(task, config, "审稿通过已分流")
+        return actions
     if verdict == "pending":
         return _review_pending(task, config, now)
     actions, _ok = _review_fix(task, config, now)  # fix，或 hook 已经归一过的非法值
+    _close_review_window(task, config, "审稿退回已分流")
     return actions
 
 

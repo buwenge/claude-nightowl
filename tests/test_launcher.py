@@ -817,6 +817,26 @@ def test_tmux_targets_use_session_colon(tmp_path, monkeypatch):
     assert len(targets) == 3 and all(x == "claude:" for x in targets), targets
 
 
+def test_close_notice_windows_kills_registered_ids_and_clears(tmp_path, monkeypatch):
+    """9/8：通知窗口登记在 status.notice_window_ids，close_notice_windows 只关
+    登记过且还活着的 @N，关完清空登记；没登记时不碰 tmux。"""
+    task_id, config = make_task()
+    calls = []
+    monkeypatch.setattr(
+        launcher, "_tmux",
+        lambda *a: calls.append(a) or subprocess.CompletedProcess(a, 0, "", ""),
+    )
+    assert launcher.close_notice_windows(task_id, config) == []
+    assert calls == []
+    store.update_status(task_id, notice_window_ids=["@5", "@6"])
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, cfg: wid == "@5")
+    assert launcher.close_notice_windows(task_id, config) == ["@5"]
+    assert [a for a in calls if a[0] == "kill-window"] == [("kill-window", "-t", "@5")]
+    assert store.read_status(task_id)["notice_window_ids"] == []
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "已关通知窗口 @5" in events
+
+
 def test_notice_window_suffix_and_send_keys(tmp_path, monkeypatch):
     """通用通知窗口：窗口名带 suffix、正文逐行落脚本；send-keys 带 Enter。"""
     task_id, config = make_task()
@@ -833,6 +853,8 @@ def test_notice_window_suffix_and_send_keys(tmp_path, monkeypatch):
     )
     new_window = next(a for a in calls if a[0] == "new-window")
     assert "(推迟)" in new_window[new_window.index("-n") + 1]
+    assert "-P" in new_window and "#{window_id}" in new_window  # 9/8：要拿回 id 登记
+    assert store.read_status(task_id)["notice_window_ids"] == ["@2"]
     script = store.task_dir(task_id) / "notice.sh"
     text = script.read_text(encoding="utf-8")
     assert "原因：额度 90% 超线 80%" in text

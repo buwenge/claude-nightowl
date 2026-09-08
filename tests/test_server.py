@@ -2436,7 +2436,7 @@ def test_pipeline_continue_without_hold_or_round_limit_409(authed):
     assert status == 409 and "继续" in body["error"]
 
 
-def test_pipeline_continue_round_limit_sets_override_and_reevaluates(authed):
+def test_pipeline_continue_round_limit_sets_override_and_reevaluates(authed, monkeypatch):
     build_id, review_id = make_review_pipeline(authed, review_state="idle")
     store.update_status(
         build_id, pipeline_phase="round_limit", fix_count=1,
@@ -2444,11 +2444,18 @@ def test_pipeline_continue_round_limit_sets_override_and_reevaluates(authed):
     store.update_status(
         review_id, state="needs_attention",
         error="返工轮数已到线（1/1），继续需要工头确认",
+        notice_window_ids=["@41"],  # 9/8：到线时开的"(需要人工)"窗，点继续要收掉
+    )
+    closed = []
+    monkeypatch.setattr(
+        launcher, "close_windows", lambda ids, cfg: closed.append(list(ids)) or list(ids)
     )
     status, _, body = authed.request("POST", f"/api/tasks/{build_id}/continue")
     assert status == 200 and body["resumed"] is True
     assert store.read_status(build_id)["round_limit_override"] is True
     assert store.read_status(review_id)["state"] == "idle"
+    assert closed == [["@41"]]
+    assert store.read_status(review_id)["notice_window_ids"] == []
 
 
 def test_pipeline_keepalive_pause_and_resume(authed):

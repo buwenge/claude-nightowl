@@ -3771,6 +3771,67 @@ def test_review_pipeline_codex_build_codex_review_full_cycle(tmp_path, monkeypat
     assert store.read_status(tid)["state"] == "chained"  # build 被正常敲停、标 chained（不是 needs_attention）
 
 
+def _codex_pipeline_to_first_review(tmp_path, monkeypatch):
+    """起一条 Codex×Codex 审稿流水线走到"第 1 轮审稿窗 @2 已 idle、verdict=fix
+    已落盘"这一步，供 9/8 审稿窗口关闭的两条测试共用。"""
+    fakes = Fakes(monkeypatch)
+    monkeypatch.setattr(
+        quota, "fetch_usage_codex", lambda config, timeout=15.0: dict(fakes.usage),
+    )
+    proj = _make_repo(tmp_path)
+    cfg = dict(REVIEW_CODEX_CONFIG)
+    cfg["projects"] = {"demo": str(proj)}
+    tid = store.create_task({
+        "title": "codex 流水线", "project": "demo", "runner": "codex",
+        "model": "gpt-5.6-luna", "effort": "high", "run_at": scheduler.to_iso(NOW),
+        "task_text": "正文", "prompt_final": "提示词",
+        "review": {"enabled": True, "runner": "codex", "model": "gpt-5.6-luna", "effort": "high"},
+    }, cfg)
+    wt = _register_tree(proj, tid, "codex 流水线")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "写完了。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    review_id = store.read_status(tid)["successor_id"]
+    review_task = store.load_task(review_id)
+    review_task["run_at"] = scheduler.to_iso(NOW)
+    store.atomic_write_json(store.task_dir(review_id) / "task.json", review_task)
+    scheduler.tick(cfg, NOW)
+    _go_idle(review_id, window_id="@2")
+    review_file = store.task_dir(review_id) / "review-1.md"
+    review_file.write_text("退回。\n\nNEXT: fix", encoding="utf-8")
+    store.update_status(review_id, review_verdict="fix", review_file=str(review_file),
+                        review_recorded_round=1)
+    return fakes, cfg, tid, review_id
+
+
+def test_review_fix_routed_then_review_window_closed_once(tmp_path, monkeypatch):
+    """9/8：审稿退回分流完（意见已敲进施工窗）就关审稿窗口，status 记
+    review_window_closed；再 tick 不重复关。"""
+    fakes, cfg, tid, review_id = _codex_pipeline_to_first_review(tmp_path, monkeypatch)
+    scheduler.tick(cfg, NOW)
+    assert store.read_status(tid)["state"] == "working"  # 返工已捎进施工窗
+    assert ["@2"] in fakes.close_calls
+    assert store.read_status(review_id)["review_window_closed"] is True
+    events = (store.task_dir(review_id) / "events.log").read_text(encoding="utf-8")
+    assert "审稿退回已分流，审稿窗口 @2 已关" in events
+    n = len(fakes.close_calls)
+    scheduler.tick(cfg, NOW + timedelta(seconds=scheduler.IDLE_SETTLE_SECONDS))
+    assert len(fakes.close_calls) == n
+
+
+def test_review_fix_at_round_limit_closes_review_window_too(tmp_path, monkeypatch):
+    """9/8：返工到线转 needs_attention 时同样关审稿窗口——verdict 已落盘，
+    工头点"继续"后走的是 _review_fix，不再需要这扇窗。"""
+    fakes, cfg, tid, review_id = _codex_pipeline_to_first_review(tmp_path, monkeypatch)
+    store.update_status(tid, fix_count=5)  # 缺省 max_rounds=5 → 到线
+    scheduler.tick(cfg, NOW)
+    assert store.read_status(review_id)["state"] == "needs_attention"
+    assert fakes.notice_calls and "到线" in fakes.notice_calls[-1][2][0]
+    assert ["@2"] in fakes.close_calls
+    assert store.read_status(review_id)["review_window_closed"] is True
+
+
 def test_held_keepalive_paused_skips_and_interval_by_runner(tmp_path, monkeypatch):
     """held 状态也走保活；keepalive_paused 时不戳；按 runner 的间隔（claude
     50 分钟）判断是否到点，不是一律戳。"""

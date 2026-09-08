@@ -1115,6 +1115,7 @@ class _Handler(BaseHTTPRequestHandler):
         cfg = store.load_config()
         window_id = status.get("window_id")
         closed = launcher.close_windows([window_id], cfg) if window_id else []
+        launcher.close_notice_windows(task_id, cfg)
         store.update_status(
             task_id, state="cancelled", exit_reason="force_stop", stuck=False,
             error=None, postpone_reason=None, last_event_at=store.utc_now_iso(),
@@ -1691,6 +1692,10 @@ class _Handler(BaseHTTPRequestHandler):
             store.update_status(pipeline_id, round_limit_override=True)
             store.update_status(t["id"], state="idle")
             store.append_event(t["id"], "继续：放行一轮返工上限（不永久取消上限）")
+            # 9/8：工头已经看到并点了继续，整条链攒下的"(需要人工)"通知窗一并收掉
+            cfg = store.load_config()
+            for item in self._pipeline_members(pipeline_id):
+                launcher.close_notice_windows(item["task"]["id"], cfg)
             logger.info("网页继续（返工上限）：%s → %s", pipeline_id, t["id"])
             return self._send_json(200, {"ok": True, "resumed": True, "task_id": t["id"]})
 

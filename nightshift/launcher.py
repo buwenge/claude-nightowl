@@ -23,6 +23,7 @@ __all__ = [
     "REVIEW_TOOLS",
     "capture_pane",
     "claude_bin",
+    "close_notice_windows",
     "close_windows",
     "codex_bin",
     "codex_config_path",
@@ -833,13 +834,34 @@ def open_notice_window(
         store.append_event(task_id, f"通知窗口开不了（会话起不来）：{proc.stderr.strip()}")
         return
     proc = _tmux(
-        "new-window", "-d", "-t", f"{session}:",
+        "new-window", "-d", "-P", "-F", "#{window_id}", "-t", f"{session}:",
         "-n", f"{config['window_prefix']}{title}{suffix}", *_new_window_env_args(), str(script),
     )
     if proc.returncode != 0:
         store.append_event(task_id, f"通知窗口开不了：{proc.stderr.strip()}")
-    else:
-        store.append_event(task_id, f"已开通知窗口（{suffix}）")
+        return
+    # 9/8：登记通知窗口 id，好让「继续」/「强制结束」把它们一并收掉——
+    # 以前开了就不管，2344 链三次返工到线攒了三扇"(需要人工)"没人关
+    window_id = proc.stdout.strip()
+    if _WINDOW_ID_RE.match(window_id):
+        ids = list(store.read_status(task_id).get("notice_window_ids") or [])
+        ids.append(window_id)
+        store.update_status(task_id, notice_window_ids=ids)
+    store.append_event(task_id, f"已开通知窗口（{suffix}）")
+
+
+def close_notice_windows(task_id: str, config: dict) -> list[str]:
+    """关掉这一班登记过的通知窗口（open_notice_window 记在
+    status.notice_window_ids），清空登记；返回真正关掉的 id。只走
+    close_windows（只关本会话里确认还活着、形状为 @N 的窗口）。"""
+    ids = list(store.read_status(task_id).get("notice_window_ids") or [])
+    if not ids:
+        return []
+    closed = close_windows(ids, config)
+    store.update_status(task_id, notice_window_ids=[])
+    if closed:
+        store.append_event(task_id, f"已关通知窗口 {' '.join(closed)}")
+    return closed
 
 
 def open_failure_window(task: dict, reason: str, config: dict) -> None:
