@@ -3161,7 +3161,8 @@ def test_review_pipeline_fix_then_done_reuses_held_session(tmp_path, monkeypatch
     coordinator = store.read_status(tid)  # tid == pipeline_id（根任务）
     assert coordinator["fix_count"] == 1
     assert any("有个边界条件" in text for _, text in fakes.send_keys_calls)
-    assert fakes.close_calls == []  # 没新开窗口，不该关任何窗口
+    # 9/8：没新开窗口，施工窗 @1 不动；审稿窗 @2 在意见分流完之后被关掉（审完即关）
+    assert fakes.close_calls == [["@2"]]
     assert store.read_status(review_id)["state"] == "chained"
 
     # 第 2 轮返工完成
