@@ -3833,6 +3833,34 @@ def test_review_fix_at_round_limit_closes_review_window_too(tmp_path, monkeypatc
     assert store.read_status(review_id)["review_window_closed"] is True
 
 
+def test_review_window_gone_with_unrouted_verdict_still_routes(tmp_path, monkeypatch):
+    """9/8 真机：审稿窗审完即关，工头按「继续」把审稿班拨回 idle，下一 tick
+    通用 window_gone 分支抢先判成 exited，结论永远没分流。结论在盘上就
+    照样分流，不按退场处理。"""
+    fakes, cfg, tid, review_id = _codex_pipeline_to_first_review(tmp_path, monkeypatch)
+    # 只有审稿窗 @2 不在了，施工窗 @1 还活着（Fakes 的 window_alive 是全局开关，这里按 id 分）
+    monkeypatch.setattr(scheduler.launcher, "window_alive", lambda wid, cfg: wid != "@2")
+    scheduler.tick(cfg, NOW)
+    assert store.read_status(tid)["state"] == "working"  # 返工已捎进施工窗
+    assert store.read_status(review_id)["state"] == "chained"
+    events = (store.task_dir(review_id) / "events.log").read_text(encoding="utf-8")
+    assert "不按退场处理，直接分流" in events
+    assert "exited(window_gone)" not in events
+
+
+def test_review_exited_with_unrouted_verdict_is_restored_and_routed(tmp_path, monkeypatch):
+    """9/8 真机 fbc3：已经被判成 exited(window_gone) 的审稿班，结论还在盘上
+    没分流——下一 tick 摁回 idle 并分流，不用人工改状态。"""
+    fakes, cfg, tid, review_id = _codex_pipeline_to_first_review(tmp_path, monkeypatch)
+    store.update_status(review_id, state="exited", exit_reason="window_gone")
+    monkeypatch.setattr(scheduler.launcher, "window_alive", lambda wid, cfg: wid != "@2")
+    scheduler.tick(cfg, NOW)
+    assert store.read_status(tid)["state"] == "working"
+    assert store.read_status(review_id)["state"] == "chained"
+    events = (store.task_dir(review_id) / "events.log").read_text(encoding="utf-8")
+    assert "摁回 idle 重新分流" in events
+
+
 def test_held_keepalive_paused_skips_and_interval_by_runner(tmp_path, monkeypatch):
     """held 状态也走保活；keepalive_paused 时不戳；按 runner 的间隔（claude
     50 分钟）判断是否到点，不是一律戳。"""

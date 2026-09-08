@@ -1328,6 +1328,16 @@ def _check_running(
                 return bg_result
 
     if not alive:
+        # 9/8：审稿结论已落盘（done/fix）但这一轮还没分流——窗口在这期间没了
+        # （审完即关 + 工头按「继续」之间；或人工关窗）不算退场：verdict 在
+        # 盘上不需要窗口，直接分流。真机 fbc3：点「继续」9 秒后被下面那条判成
+        # exited(window_gone)，结论永远没分流，流水线卡死。
+        if _review_verdict_unrouted(task, status):
+            result = _check_review_idle(task, status, config, now)
+            if result is not None:
+                store.append_event(task_id, "审稿窗口不在了，但结论已落盘且未分流：不按退场处理，直接分流")
+                return result
+            return []
         # 窗口没了又没等到 SessionEnd → 按退场处理（F12 有话说的情形已经在
         # 上面被拦下，走不到这里；这里只处理"确实没有未处理的后台完成/丢失"
         # 的普通窗口消失）
@@ -1972,11 +1982,25 @@ def _chain_continue(
     return [f"{task_id} 续班 → {successor_id}（第 {shift + 1} 班）{note}"]
 
 
+def _review_verdict_unrouted(task: dict, status: dict) -> bool:
+    """审稿班 verdict 已落盘（done/fix）但这一轮还没分流（9/8）。pending 不算
+    ——那是意见没写完、要留窗续写的。"""
+    return (
+        store.role_of(task) == "review"
+        and status.get("review_verdict") in ("done", "fix")
+        and status.get("review_routed_round") != store.round_of(task)
+    )
+
+
 def _check_exited_chain(
     task: dict, status: dict, config: dict, now: datetime
 ) -> list[str]:
     """exited 也评估一次换班（会话被关/崩了但交接已写完的情形）：
     只认交接文件——有交接先打存档点再按 NEXT 判，没交接不动。
+
+    9/8：审稿班 verdict 已落盘却被判成 exited（窗口先没了、或会话自己退了）
+    的，摁回 idle 重新分流——结论在盘上，不需要窗口；不然流水线停在
+    exited，网页「继续」也找不到它（真机 fbc3）。
 
     F4：chain_checked=True 之后的所有逻辑包了一层 try/except，评估中途
     异常转 needs_attention 并留人话（见 `_chain_eval_failed`），不再悄悄
@@ -1987,6 +2011,14 @@ def _check_exited_chain(
     一次；落盘统一交给 `_mark_chain_evaluated`（H6.1，跟 `_check_idle_chain`
     共用）。
     """
+    if _review_verdict_unrouted(task, status):
+        task_id = task["id"]
+        store.update_status(task_id, state="idle", last_event_at=to_iso(now))
+        store.append_event(
+            task_id, f"审稿结论已落盘却被判成 exited({status.get('exit_reason') or '-'})：摁回 idle 重新分流"
+        )
+        result = _check_review_idle(task, store.read_status(task_id), config, now)
+        return result if result is not None else []
     if not _handover_needs_eval(task, status):
         return []
     status = _mark_chain_evaluated(task, status)
