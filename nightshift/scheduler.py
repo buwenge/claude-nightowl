@@ -3,7 +3,8 @@
 时间约定：一律 UTC；所有"现在"都从参数 now（aware，UTC）进来，便于测试注入。
 ISO 字符串与 datetime 互转用 parse_iso / to_iso（与 store.utc_now_iso 同格式）。
 
-预检顺序（设计稿 §5.1，按本仓库开工令定为：信任 → 同目录 → 额度 → 起跑）。
+预检顺序（设计稿 §5.1，按本仓库开工令定为：信任 → 额度 → 起跑；同目录锁
+9/8 起拆除——同目录另有任务在跑只记一条事件提示，不再推迟，见 _try_launch c 段）。
 崩溃恢复四条（设计稿 §3）：PID 复用三条件、宽限期、先落盘再碰 tmux、重试上限。
 """
 
@@ -30,7 +31,7 @@ logger = logging.getLogger("nightshift.scheduler")
 
 # retry_max 的兜底值（task.json 里没写时按 3）
 DEFAULT_RETRY_MAX = 3
-# 视为"活跃"的状态：额度刷新看它们，同目录不并跑也拦它们。S7：held 加入
+# 视为"活跃"的状态：额度刷新看它们，同目录并跑提示也看它们。S7：held 加入
 # 活跃态（会话还活着，只是明确不施工）；worktree=true 的同项目并跑豁免
 # （_try_launch 里已有）天然覆盖"同一流水线一个 held 一个 working"的例外，
 # 不需要给 held 单独开一条豁免规则。
@@ -375,10 +376,11 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
         # 其余情况（对方是对侧角色的 held，或对方是终态）不拦，交给下面
         # c 段按项目目录做跨 pipeline 判断。
 
-    # c. 同目录不并跑：开第二个窗口两边抢文件系统，纯坏事。
-    # S5 起：两个 worktree=true 的流水线各在各的树里施工，互不相干，允许并跑；
-    # 只要候选或正在跑的一方是 worktree=false（一期老路径，直接在项目目录），
-    # 仍按一期同目录锁推迟
+    # c. 同目录并跑：9/8 起不再互斥（工头拍板）。一期的锁是怕两个窗口在同一个
+    # 目录里抢文件系统，但真机上它挡住的是"一个班卡死、同目录再开一个班去救"
+    # ——救援班被推迟半小时，人只能爬起来开电脑。两个班改同一批文件的风险
+    # 交给任务说明自己约束；这里只记一条事件提示，照常起跑。worktree=true
+    # 的双方各在各的树里，本来就不相干，连提示都不记。
     for other in store.list_tasks():
         if other["task"]["id"] == task_id:
             continue
@@ -388,8 +390,11 @@ def _try_launch(task: dict, status: dict, config: dict, now: datetime) -> list[s
         ):
             if worktree.wants_worktree(task) and worktree.wants_worktree(other["task"]):
                 continue
-            reason = f"同目录任务 {other['task']['id']} 还在跑"
-            return _postpone(task, status, config, now, reason, notify=False)
+            store.append_event(
+                task_id,
+                f"同目录任务 {other['task']['id']} 还在跑（9/8 起不再互斥），照常起跑",
+            )
+            break
 
     # d. 额度：只查这一班自己的 runner，查不到一律不放行（fail-closed）；
     # Claude 额度坏了不能拦 Codex 起跑，反之亦然

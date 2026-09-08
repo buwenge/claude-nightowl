@@ -245,10 +245,11 @@ def test_postpone_past_deadline_fails_with_window(monkeypatch):
 # ---------- 同目录不并跑 / 目录信任 ----------
 
 
-def test_same_project_worktree_parallel_matrix(monkeypatch):
-    """S5 同项目并跑矩阵：true/true 不互挡；只要一方是 false 仍按一期同目录锁推迟。"""
-    for busy_wt, cand_wt, blocked in ((True, True, False), (True, False, True),
-                                      (False, True, True), (False, False, True)):
+def test_same_project_parallel_matrix_never_blocks(monkeypatch):
+    """9/8 拆同目录锁：四种 worktree 组合一律照常起跑；只要有一方不在工作树里
+    就记一条"不再互斥"的事件提示（两边都建树的连提示都不记），不推迟不开窗。
+    起因：一个班卡死、同目录再开一个班去救，救援班被锁推迟半小时。"""
+    for busy_wt, cand_wt in ((True, True), (True, False), (False, True), (False, False)):
         fakes = Fakes(monkeypatch)  # 窗口在、pid 在
         shutil.rmtree(store.home() / "tasks", ignore_errors=True)  # 每格重开一局
         busy = make_task(title="在跑的", worktree=busy_wt)
@@ -259,32 +260,36 @@ def test_same_project_worktree_parallel_matrix(monkeypatch):
         scheduler.tick(CONFIG, NOW)
 
         status = store.read_status(cand)
-        if blocked:
-            assert status["state"] == "postponed", (busy_wt, cand_wt)
-            assert "还在跑" in status["postpone_reason"]
-            assert status["postponed_count"] == 1
-            assert fakes.notice_calls == []  # 同目录推迟不开窗口
-            assert fakes.launch_calls == []
+        assert status["state"] == "launching", (busy_wt, cand_wt)
+        assert fakes.launch_calls == [cand]
+        assert status.get("postpone_reason") is None
+        assert fakes.notice_calls == []
+        events_path = store.task_dir(cand) / "events.log"
+        events = events_path.read_text(encoding="utf-8") if events_path.is_file() else ""
+        if busy_wt and cand_wt:
+            assert "不再互斥" not in events
         else:
-            assert status["state"] == "launching", (busy_wt, cand_wt)
-            assert fakes.launch_calls == [cand]
+            assert f"同目录任务 {busy} 还在跑（9/8 起不再互斥），照常起跑" in events
         assert store.read_status(busy)["state"] == "working"
 
 
-def test_worktree_false_postpones_with_reason(monkeypatch):
-    """老式任务撞上同项目活跃任务：推迟原因照旧，不开窗口。"""
+def test_same_dir_rescue_task_launches_even_when_other_is_stuck(monkeypatch):
+    """9/8 真机：c945 打错模型名卡在 working（疑似卡住），同目录的救援班 973c
+    被推迟到 30 分钟后——现在救援班必须当场起跑。"""
     fakes = Fakes(monkeypatch)
-    busy = make_task(title="在跑的", worktree=False)
-    store.update_status(busy, state="working", window_id="@1", pane_pid=NO_PID)
-    same_dir = make_task(title="老式同目录", worktree=False)
+    stuck = make_task(title="卡住的", worktree=False)
+    store.update_status(
+        stuck, state="working", window_id="@1", pane_pid=NO_PID, stuck=True,
+        stuck_since=scheduler.to_iso(NOW - timedelta(minutes=20)),
+        last_event_at=scheduler.to_iso(NOW - timedelta(minutes=35)),
+    )
+    rescue = make_task(title="救援班", worktree=False)
 
     fakes.now = NOW
     scheduler.tick(CONFIG, NOW)
 
-    status = store.read_status(same_dir)
-    assert status["state"] == "postponed"
-    assert busy in status["postpone_reason"]
-    assert fakes.notice_calls == []
+    assert store.read_status(rescue)["state"] == "launching"
+    assert fakes.launch_calls == [rescue]
 
 
 def test_untrusted_project_fails_without_postpone(monkeypatch):

@@ -142,7 +142,7 @@ def cmd_run_now(args) -> int:
         return 0
     # 审查 D（9/2）：跟网页 run-now 认同一份状态白名单——对正在 working 的任务
     # 再 launch 一次会开第二个窗口，两个会话共用一份 status.json / 工作树。
-    # 仍然直接开窗（不走 tick 的额度预检与同目录锁），这是 CLI 的老语义。
+    # 仍然直接开窗（不走 tick 的额度预检），这是 CLI 的老语义。
     state = store.read_status(args.id).get("state")
     if state not in server._RUN_NOW_STATES:
         print(
@@ -279,7 +279,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id", help="任务 id")
     p.set_defaults(func=cmd_show)
 
-    p = sub.add_parser("run-now", help="不等到点，现在就直接开窗（跳过额度预检与同目录锁；"
+    p = sub.add_parser("run-now", help="不等到点，现在就直接开窗（跳过额度预检；"
                                         "状态白名单与网页相同）")
     p.add_argument("id", help="任务 id")
     p.add_argument("--dry-run", action="store_true",
