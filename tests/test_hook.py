@@ -233,6 +233,61 @@ def test_user_prompt_submit_review_role_does_not_record_rewoken_from():
     assert "rewoken_from" not in status
 
 
+def test_user_prompt_submit_clears_delivery_pending():
+    """投递确认看门狗（开工令）：真的等到 UserPromptSubmit 就是收到了，
+    普通 turn 要清掉调度器留的待确认标记。"""
+    task_id = make_task()
+    store.update_status(
+        task_id, state="working",
+        delivery_pending={
+            "kind": "额度刷新继续", "sent_at": "2026-08-27T18:00:00Z",
+            "nudged": False, "nudged_at": None,
+        },
+    )
+    proc = run_hook(task_id, "UserPromptSubmit", fixture("hook_userpromptsubmit.json"))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert "delivery_pending" not in status
+
+
+def test_user_prompt_submit_control_turn_also_clears_delivery_pending():
+    """调度器自己投递的控制 turn（保活/我来看/停工）一样算"收到了"——不能
+    只清普通 turn，不然控制 turn 场景（比如保活探针）留下的标记永远没人清。"""
+    task_id = make_task()
+    store.update_status(
+        task_id, state="finished", build_control_kind="keepalive",
+        delivery_pending={
+            "kind": "后台完成唤醒", "sent_at": "2026-08-27T18:00:00Z",
+            "nudged": False, "nudged_at": None,
+        },
+    )
+    run_hook(task_id, "UserPromptSubmit", fixture("hook_userpromptsubmit.json"))
+    status = store.read_status(task_id)
+    assert "delivery_pending" not in status
+
+
+def test_user_prompt_submit_clears_relaunched_delivery_pending_and_deletes_pending_file():
+    """阶段二点④：`stage=="relaunched"` 之后真等到了 UserPromptSubmit——
+    delivery_pending 照常清掉，`pending_delivery.txt` 也顺手删掉（阶段二
+    §1：不留着这份原文）。"""
+    task_id = make_task()
+    text_file = store.task_dir(task_id) / "pending_delivery.txt"
+    text_file.write_text("原话", encoding="utf-8")
+    store.update_status(
+        task_id, state="working",
+        delivery_pending={
+            "kind": "额度刷新继续", "sent_at": "2026-08-27T18:00:00Z",
+            "nudged": False, "nudged_at": None, "turns_before": 0,
+            "text_file": str(text_file), "stage": "relaunched",
+        },
+    )
+    proc = run_hook(task_id, "UserPromptSubmit", fixture("hook_userpromptsubmit.json"))
+    assert proc.returncode == 0
+    status = store.read_status(task_id)
+    assert "delivery_pending" not in status
+    assert not text_file.exists()
+
+
 def test_subagents_never_negative():
     task_id = make_task()
     bg = background_lines()

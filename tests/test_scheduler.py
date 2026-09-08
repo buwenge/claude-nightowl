@@ -4334,3 +4334,313 @@ def test_atomic_write_text_concurrent_calls_do_not_collide(tmp_path):
     assert errors == []
     assert target.is_file()
     assert target.read_text(encoding="utf-8").startswith("来自线程 ")
+
+
+# ---------- 投递确认看门狗（夜班-投递确认看门狗-开工令-20260908） ----------
+#
+# 9/8 上午真机事故：调度器把返工意见 send_keys 进 Codex 施工窗口，tmux 返回
+# 码 0，但文字吞在输入框里没提交，之后 50 分钟零 hook 事件，调度器只在 15
+# 分钟后标"疑似卡住"，不通知、不自救。看门狗盯"目标会话应该空闲、期待它
+# 马上起一轮"的那几处 send 成功后 1 秒内该有的 UserPromptSubmit。
+
+
+def test_codex_background_notify_marks_delivery_pending_kind_and_sent_at(monkeypatch):
+    """点 1：后台完成通知 send 成功 → delivery_pending 存在，
+    kind=="后台完成唤醒"，sent_at==to_iso(NOW)，nudged is False。"""
+    import nightshift.scheduler as sched
+    tid, sent = _codex_running_task(monkeypatch, sched)
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "finished", "background_id": "bg-1", "exit_code": 0,
+                 "result_path": "/tmp/x.log", "notification_state": "pending"},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    pending = status["delivery_pending"]
+    assert pending["kind"] == "后台完成唤醒"
+    assert pending["sent_at"] == scheduler.to_iso(NOW)
+    assert pending["nudged"] is False
+    assert pending["nudged_at"] is None
+    assert pending["turns_before"] == 0  # 返工 A：send 之前那份快照没设 turns
+    assert pending["stage"] == "sent"  # 阶段二：起步 stage
+    text_file = Path(pending["text_file"])
+    assert text_file.is_file()
+    assert "bg-1" in text_file.read_text(encoding="utf-8")  # 原文落盘（阶段二）
+
+
+def test_codex_background_notify_send_failure_no_delivery_pending(monkeypatch):
+    """点 1 反例：send 失败（返回码 1）→ 没有 delivery_pending。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    monkeypatch.setattr(
+        sched.launcher, "send_keys",
+        lambda w, t: subprocess.CompletedProcess([], 1, "", "send-keys 失败"),
+    )
+    tid = make_task_codex()
+    store.update_status(tid, state="idle", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW))
+    background_runner.modify_registry(tid, lambda d: d.update({
+        "bg-1": {"state": "finished", "background_id": "bg-1", "exit_code": 0,
+                 "result_path": "/tmp/x.log", "notification_state": "pending"},
+    }))
+    sched.tick(CODEX_CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention"
+    assert not status.get("delivery_pending")
+
+
+def test_review_fix_reuse_success_marks_delivery_pending(tmp_path, monkeypatch):
+    """点 2：原地返工 send 成功 → build 任务的 status 有 delivery_pending，
+    kind=="审稿退回返工意见"，跟 state="working" 落在同一次 update_status。"""
+    fakes = Fakes(monkeypatch)
+    proj = _make_repo(tmp_path)
+    cfg = _review_config_for(proj)
+    tid = make_review_task()
+    wt = _register_tree(proj, tid, "审稿流水线任务")
+    _go_idle(tid, window_id="@1")
+    (wt / "canary.txt").write_text("r1\n", encoding="utf-8")
+    _write_handover(tid, "第一轮。\nNEXT: done")
+    scheduler.tick(cfg, NOW)
+    review_id = store.read_status(tid)["successor_id"]
+
+    _go_idle(review_id, window_id="@2")
+    rf = store.task_dir(review_id) / "review-1.md"
+    rf.write_text("退回。\n\nNEXT: fix", encoding="utf-8")
+    store.update_status(review_id, review_verdict="fix", review_file=str(rf),
+                        review_recorded_round=1)
+    scheduler.tick(cfg, NOW)
+
+    build_status = store.read_status(tid)
+    assert build_status["state"] == "working"
+    pending = build_status["delivery_pending"]
+    assert pending["kind"] == "审稿退回返工意见"
+    assert pending["sent_at"] == scheduler.to_iso(NOW)
+    assert pending["nudged"] is False
+    assert pending["turns_before"] == 0  # 返工 A：_go_idle 没设过 turns
+    assert pending["stage"] == "sent"
+    assert Path(pending["text_file"]).is_file()
+
+
+def test_idle_quota_resume_marks_delivery_pending(monkeypatch):
+    """点 3：额度刷新 idle 分支 send 成功 → 有 delivery_pending，
+    kind=="额度刷新继续"。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    paused_until = NOW - timedelta(minutes=10)
+    store.update_status(
+        tid, state="idle", window_id="@1", pane_pid=NO_PID,
+        quota_paused_until=scheduler.to_iso(paused_until),
+        last_event_at=scheduler.to_iso(NOW - timedelta(hours=1)),
+    )
+    scheduler.tick(CONFIG, NOW)
+    status = store.read_status(tid)
+    assert status["quota_resume_sent"] is True
+    pending = status["delivery_pending"]
+    assert pending["kind"] == "额度刷新继续"
+    assert pending["sent_at"] == scheduler.to_iso(NOW)
+    assert pending["nudged"] is False
+    assert pending["turns_before"] == 0  # 返工 A：make_task 没设过 turns
+    assert pending["stage"] == "sent"
+    assert Path(pending["text_file"]).is_file()
+
+
+def test_delivery_pending_nudges_then_escalates_to_relaunch_attempt(monkeypatch):
+    """点 4：90 秒未确认先补一个回车（text=""）、nudged 落盘、events 有
+    "投递未确认"与"已补一个回车"；阶段二点①：再过 240 秒仍未确认 →
+    `launcher.relaunch_resume` 被调一次，成功时 window_id/pane_pid 换新、
+    state 不动、delivery_pending.stage=="relaunched"、events 有
+    "已关窗续会话"（relaunch_resume 失败时的 needs_attention 分支单独在
+    `test_delivery_pending_relaunch_failure_needs_attention` 测）。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    sent_at = NOW
+    store.update_status(
+        tid, state="working", window_id="@1", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(sent_at), session_id="sess-1",
+        delivery_pending={
+            "kind": "审稿退回返工意见", "sent_at": scheduler.to_iso(sent_at),
+            "nudged": False, "nudged_at": None, "turns_before": 0,
+            "text_file": None, "stage": "sent",
+        },
+    )
+
+    # 还没到 90 秒：不该有动作
+    scheduler.tick(CONFIG, NOW + timedelta(seconds=30))
+    assert fakes.send_keys_calls == []
+    assert store.read_status(tid)["delivery_pending"]["nudged"] is False
+
+    nudge_time = NOW + timedelta(seconds=90)
+    scheduler.tick(CONFIG, nudge_time)
+    assert fakes.send_keys_calls == [("@1", "")]
+    status = store.read_status(tid)
+    pending = status["delivery_pending"]
+    assert pending["nudged"] is True
+    assert pending["nudged_at"] == scheduler.to_iso(nudge_time)
+    assert pending["stage"] == "nudged"
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "投递未确认" in events and "已补一个回车" in events
+
+    # 补回车后再 240 秒仍没确认 → 关窗续会话（阶段二自愈，不是直接 needs_attention）
+    relaunch_calls = []
+
+    def fake_relaunch(task, status, config, text):
+        relaunch_calls.append((task["id"], status.get("window_id"), text))
+        return ("@2", 4242)
+
+    monkeypatch.setattr(scheduler.launcher, "relaunch_resume", fake_relaunch)
+    escalate_time = nudge_time + timedelta(seconds=240)
+    scheduler.tick(CONFIG, escalate_time)
+    assert len(relaunch_calls) == 1
+    status = store.read_status(tid)
+    assert status["state"] == "working"  # state 不动
+    assert status["window_id"] == "@2"
+    assert status["pane_pid"] == 4242
+    pending = status["delivery_pending"]
+    assert pending["stage"] == "relaunched"
+    assert pending["sent_at"] == scheduler.to_iso(escalate_time)
+    assert pending["nudged"] is False
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "已关窗口 @1" in events and "重开 @2" in events
+    assert "pending_delivery.txt" in events
+
+
+def test_delivery_pending_relaunch_failure_needs_attention(monkeypatch):
+    """阶段二点②：relaunch_resume 返回错误串 → needs_attention，error 含
+    "关窗续会话失败"，delivery_pending 清空，open_notice_window 恰好调用
+    一次。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    sent_at = NOW
+    nudged_at = NOW + timedelta(seconds=90)
+    store.update_status(
+        tid, state="working", window_id="@1", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(sent_at), session_id="sess-1",
+        delivery_pending={
+            "kind": "审稿退回返工意见", "sent_at": scheduler.to_iso(sent_at),
+            "nudged": True, "nudged_at": scheduler.to_iso(nudged_at),
+            "turns_before": 0, "text_file": None, "stage": "nudged",
+        },
+    )
+    monkeypatch.setattr(
+        scheduler.launcher, "relaunch_resume",
+        lambda task, status, config, text: "旧窗口 @1 关不掉，拒绝两开同一会话",
+    )
+    escalate_time = nudged_at + timedelta(seconds=240)
+    scheduler.tick(CONFIG, escalate_time)
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention"
+    assert "关窗续会话失败" in status["error"]
+    assert "审稿退回返工意见" in status["error"]
+    assert status["delivery_pending"] is None
+    assert len(fakes.notice_calls) == 1
+
+
+def test_delivery_pending_relaunched_stage_timeout_needs_attention(monkeypatch):
+    """阶段二点③：stage=="relaunched" 且距 sent_at ≥ delivery_nudge_seconds
+    仍无 UserPromptSubmit → 直接 needs_attention（不再补第二次回车、不再
+    续第二次会话——"每个 pending 只续一次，不循环"），reason 含
+    "续会话后仍无"。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    sent_at = NOW
+    store.update_status(
+        tid, state="working", window_id="@2", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(sent_at),
+        delivery_pending={
+            "kind": "后台完成唤醒", "sent_at": scheduler.to_iso(sent_at),
+            "nudged": False, "nudged_at": None, "turns_before": 0,
+            "text_file": None, "stage": "relaunched",
+        },
+    )
+    # 还没到 90 秒：不该有动作，也不该去补回车（只续一次，不是又走一遍阶梯）
+    scheduler.tick(CONFIG, sent_at + timedelta(seconds=30))
+    assert fakes.send_keys_calls == []
+    status = store.read_status(tid)
+    assert status["state"] == "working"
+    assert status["delivery_pending"]["stage"] == "relaunched"
+
+    scheduler.tick(CONFIG, sent_at + timedelta(seconds=90))
+    assert fakes.send_keys_calls == []  # 没有补回车
+    status = store.read_status(tid)
+    assert status["state"] == "needs_attention"
+    assert "续会话后仍无" in status["error"]
+    assert status["delivery_pending"] is None
+    assert len(fakes.notice_calls) == 1
+
+
+def test_delivery_pending_cleared_when_new_event_arrives(monkeypatch):
+    """点 6：last_event_at 晚于 sent_at → tick 后 delivery_pending 被清、
+    send_keys 未调用（hook 正常也会主动清，这里测调度器兜底那条路）。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    sent_at = NOW - timedelta(seconds=10)
+    store.update_status(
+        tid, state="working", window_id="@1", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(NOW),  # 晚于 sent_at
+        delivery_pending={
+            "kind": "额度刷新继续", "sent_at": scheduler.to_iso(sent_at),
+            "nudged": False, "nudged_at": None, "turns_before": 0,
+        },
+    )
+    scheduler.tick(CONFIG, NOW)
+    assert fakes.send_keys_calls == []
+    assert store.read_status(tid)["delivery_pending"] is None
+
+
+def test_delivery_pending_cleared_when_state_held(monkeypatch):
+    """点 7：状态是 held（不在 working/waiting_background/waiting_wakeup/
+    idle 四种里）→ tick 后被清、无动作。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    sent_at = NOW - timedelta(seconds=10)
+    store.update_status(
+        tid, state="held", window_id="@1", pane_pid=NO_PID,
+        last_event_at=scheduler.to_iso(sent_at),
+        delivery_pending={
+            "kind": "额度刷新继续", "sent_at": scheduler.to_iso(sent_at),
+            "nudged": False, "nudged_at": None, "turns_before": 0,
+        },
+    )
+    scheduler.tick(CONFIG, NOW)
+    assert fakes.send_keys_calls == []
+    assert store.read_status(tid)["delivery_pending"] is None
+
+
+def test_delivery_pending_cleared_by_turns_even_when_same_second_as_sent_at(monkeypatch):
+    """返工 A 测试①：sent_at 与 last_event_at 落在同一秒（秒级时间戳规则 2
+    判不出先后），但 turns 已经比 turns_before 涨了（3→4，真的等到过一次
+    UserPromptSubmit）→ 靠规则 2' 清掉，不该再补回车。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    store.update_status(
+        tid, state="working", window_id="@1", pane_pid=NO_PID,
+        turns=4,
+        last_event_at=scheduler.to_iso(NOW),  # 跟 sent_at 同一秒
+        delivery_pending={
+            "kind": "额度刷新继续", "sent_at": scheduler.to_iso(NOW),
+            "nudged": False, "nudged_at": None, "turns_before": 3,
+        },
+    )
+    scheduler.tick(CONFIG, NOW + timedelta(seconds=95))  # 已过 90 秒 nudge 线
+    assert fakes.send_keys_calls == []
+    assert store.read_status(tid)["delivery_pending"] is None
+
+
+def test_delivery_pending_still_nudges_when_turns_unchanged_same_second(monkeypatch):
+    """返工 A 测试②：同一秒、turns 没涨（3/3，真没等到过 UserPromptSubmit）
+    → 规则 2/2' 都不命中，90 秒后照样补回车。"""
+    fakes = Fakes(monkeypatch)
+    tid = make_task()
+    store.update_status(
+        tid, state="working", window_id="@1", pane_pid=NO_PID,
+        turns=3,
+        last_event_at=scheduler.to_iso(NOW),  # 跟 sent_at 同一秒
+        delivery_pending={
+            "kind": "额度刷新继续", "sent_at": scheduler.to_iso(NOW),
+            "nudged": False, "nudged_at": None, "turns_before": 3,
+        },
+    )
+    scheduler.tick(CONFIG, NOW + timedelta(seconds=90))
+    assert fakes.send_keys_calls == [("@1", "")]
+    status = store.read_status(tid)
+    assert status["delivery_pending"]["nudged"] is True

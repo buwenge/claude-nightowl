@@ -933,7 +933,8 @@ def _reconcile_codex_background(
         # 总review F9：send_keys 现在走 paste-buffer -r 保留裸 LF，多条完成
         # 通知拼成的这一块文本对 Codex TUI 是否安全没验证过——改用中文分号
         # 拼成单行，不再指望裸换行块。
-        proc = launcher.send_keys(window_id, "；".join(lines))
+        notify_text = "；".join(lines)
+        proc = launcher.send_keys(window_id, notify_text)
         if proc.returncode != 0:
             if not status.get("background_attention_noted"):
                 reason = f"后台完成但 send-keys 失败（returncode={proc.returncode}），未能通知它继续"
@@ -955,6 +956,9 @@ def _reconcile_codex_background(
                     rec["notified_at"] = to_iso(now)
 
         background_runner.modify_registry(task_id, mark_notified)
+        _mark_delivery_pending(
+            task_id, now, "后台完成唤醒", int(status.get("turns") or 0), notify_text
+        )
         store.append_event(task_id, f"后台完成已通知，已 send-keys 唤醒：{'、'.join(ids)}")
         if status.get("state") != "waiting_background":
             store.update_status(task_id, state="waiting_background", last_event_at=to_iso(now))
@@ -989,13 +993,85 @@ def _reconcile_codex_background(
 # ---------- 运行期巡检：working / waiting_background / idle（设计稿 §5.2） ----------
 
 
-def _send_quota_resume(task_id: str, window_id: str, text: str) -> list[str] | None:
+def _delivery_pending_fields(
+    now: datetime, kind: str, turns_before: int, text_file: str,
+) -> dict:
+    """delivery_pending 的落盘 payload——四处 send 成功后都用它拼同一份
+    字段，不各自手写 dict（返工 B）。`turns_before` 是 send **之前**那份
+    status 快照里的 turns（hook 每次 UserPromptSubmit 都会 +1）：秒级的
+    `sent_at`/`last_event_at` 时间戳在同一秒内到达时分不出先后，也扛不住
+    "hook 先 pop 了标记、调度器随后才把标记写进去"这种写入顺序颠倒（返工
+    A）；turns 是单调计数，不管标记什么时候落盘，只要真实世界里已经多了
+    一轮，之后任何一次 tick 读到的 turns 都会大于 turns_before，判断不受
+    写入时序影响。
+
+    `text_file` 是那条话原文落盘的路径（`<task_dir>/pending_delivery.txt`，
+    见 `_write_pending_delivery_text`）——阶段二自愈要拿这段原文重新当
+    续会话的启动参数带进去；不把正文塞进 status.json 本身（网页列表接口
+    会变胖，开工令阶段二 §1）。`stage` 固定从 `"sent"` 起步，往后由
+    `_check_delivery_pending` 推进到 `"nudged"`/`"relaunched"`。
+    """
+    return {
+        "delivery_pending": {
+            "kind": kind, "sent_at": to_iso(now), "nudged": False,
+            "nudged_at": None, "turns_before": turns_before,
+            "text_file": text_file, "stage": "sent",
+        }
+    }
+
+
+def _write_pending_delivery_text(task_id: str, text: str) -> str:
+    """把这条 send-keys 的原文落盘成 `<task_dir>/pending_delivery.txt`
+    （开工令阶段二 §1：不要把正文塞进 status.json，网页列表接口会变胖）。
+    返回文件路径字符串，记进 `delivery_pending.text_file`。"""
+    path = store.task_dir(task_id) / "pending_delivery.txt"
+    store.atomic_write_text(path, text)
+    return str(path)
+
+
+def _read_pending_delivery_text(pending: dict) -> str:
+    """自愈重开窗口时把原文读回来当启动参数——字段缺失/文件被误删时退回
+    空串，不阻断自愈流程（`resume_prompt.txt` 好歹还有前言，模型能看出
+    "续上了"，比直接放弃转 needs_attention 更有用）。
+    """
+    text_file = pending.get("text_file")
+    if not text_file:
+        return ""
+    try:
+        return Path(text_file).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _mark_delivery_pending(
+    task_id: str, now: datetime, kind: str, turns_before: int, text: str,
+) -> None:
+    """看门狗起点（开工令 §1/§2）：目标会话预期从空闲状态起跑的 send-keys
+    成功后，记一笔待确认——`_check_delivery_pending` 每 tick 核对是否等到
+    了 UserPromptSubmit，没等到就补回车/转人工/关窗续会话。`_review_fix`
+    原地返工那处要求跟 state="working" 落在同一次 update_status 里（避免
+    中途留一道"state 已改、delivery_pending 还没落"的窗口），不走这个
+    助手，自己写 `pending_delivery.txt`、用 `_delivery_pending_fields`
+    拼好字段直接塞进那次 update_status。
+    """
+    text_file = _write_pending_delivery_text(task_id, text)
+    store.update_status(task_id, **_delivery_pending_fields(now, kind, turns_before, text_file))
+
+
+def _send_quota_resume(
+    task_id: str, window_id: str, text: str, now: datetime, turns_before: int
+) -> list[str] | None:
     """F3：额度刷新时间到了、叫它继续这一步的 send-keys + 失败处理——idle
     分支（闹钟已响完但没等到事件）与 Claude waiting_wakeup 静默超过 55 分钟
     宽限期两处共用，不许各自复制一份（S6.1 B2：send-keys 真失败不能假装
     已经叫醒了它）。失败只记事件、返回给调用方的 action 提示；成功返回
     None，落盘 quota_resume_sent/清 quota_paused_until 与记事件的措辞由
     调用方决定（两种场景说法不同）。
+
+    看门狗：send 成功也顺手标一笔 delivery_pending（kind="额度刷新继续"）
+    ——这正是"目标会话应该空闲、期待它马上起一轮"的场景，两个调用方共用
+    这一处就不用各自复制标记逻辑；`turns_before` 由两个调用方各自从
+    send 之前那份 status 传进来。
     """
     proc = launcher.send_keys(window_id, text)
     if proc.returncode != 0:
@@ -1005,7 +1081,159 @@ def _send_quota_resume(task_id: str, window_id: str, text: str) -> list[str] | N
             "未能让它继续",
         )
         return [f"{task_id} 额度刷新但叫醒失败"]
+    _mark_delivery_pending(task_id, now, "额度刷新继续", turns_before, text)
     return None
+
+
+def _delivery_needs_attention(
+    task: dict, config: dict, now: datetime, reason: str,
+) -> list[str]:
+    """看门狗自愈耗尽（补回车没用、关窗续会话也没用/失败/续完还是没确认）
+    ——转 needs_attention 并开提醒窗口。阶段一的最终失败分支与阶段二"续过
+    一次仍未确认"分支共用这一份，不各自重写状态字段/事件/通知窗口。"""
+    task_id = task["id"]
+    store.update_status(
+        task_id, state="needs_attention", error=reason,
+        delivery_pending=None, last_event_at=to_iso(now),
+    )
+    store.append_event(task_id, reason)
+    launcher.open_notice_window(task, "(需要人工)", [reason], config)
+    return [f"{task_id} 投递未确认 → needs_attention"]
+
+
+def _check_delivery_pending(
+    task: dict, status: dict, config: dict, now: datetime
+) -> list[str] | None:
+    """投递确认看门狗（开工令阶段一+阶段二）：核对此前 `_mark_delivery_pending`
+    打的标记是否等到了目标会话的 UserPromptSubmit（hook.py 收到就会主动
+    `status.pop("delivery_pending", None)`，这里是没等到时的兜底）。补回车
+    还是没确认就关窗、拿 codex resume/claude --resume 当启动参数重开一个
+    窗口续上同一个会话（自愈第二级）；续完还是没确认——只续这一次，不循环
+    ——直接转人工（开工令阶段二 §0：再敲一遍怕拼重复，开个 AI 去修不确定性
+    比原问题更大，两条都不如关窗续会话可靠）。
+
+    返回 list[str] 表示这一 tick 已经在这里处理完，调用方（`_check_running`）
+    要直接 return；返回 None 表示没有需要上报的动作，调用方按原逻辑继续
+    往下走（这也是没有 delivery_pending、以及规则 1/2/2' 那种"清掉但不
+    动作"的情形——清没清都不该拦下面 stuck/keepalive 等其它判断）。
+    """
+    task_id = task["id"]
+    pending = status.get("delivery_pending")
+    if not pending:
+        return None
+
+    # 规则 1：状态已经不是"应该空闲、期待它马上起一轮"的那四种——多半是
+    # 被别的分支接管了（转 held/needs_attention 之类），不用再盯。
+    if status.get("state") not in ("working", "waiting_background", "waiting_wakeup", "idle"):
+        store.update_status(task_id, delivery_pending=None)
+        return None
+
+    # 规则 2：last_event_at 已经晚于 sent_at——hook 那边正常会主动清，这里
+    # 只是兜底（比如 hook 那次清标记的写盘跟这次 tick 撞上了时序）。
+    sent_at = parse_iso(pending["sent_at"])
+    last_event_at = status.get("last_event_at")
+    if last_event_at and parse_iso(last_event_at) > sent_at:
+        store.update_status(task_id, delivery_pending=None)
+        return None
+
+    # 规则 2'（返工 A）：turns 已经比 send 之前那份快照涨了——hook 每次
+    # UserPromptSubmit 都会 turns+1，这比秒级时间戳可靠：sent_at 与
+    # last_event_at 落在同一秒时规则 2 判不出先后，且 send_keys 返回后才
+    # 写标记，真要是 hook 子进程几十毫秒内就跑完，会变成"hook 先 pop 了
+    # （标记还不存在，pop 是空操作）、调度器随后才把标记写上"——时间戳
+    # 那条规则 2 对这种颠倒顺序完全无效，turns 是单调计数，不受写入顺序
+    # 影响。turns_before 缺失（旧数据/其它路径遗留）时不比较，交给规则
+    # 2/3/4 按原样处理。
+    turns_before = pending.get("turns_before")
+    if turns_before is not None and int(status.get("turns") or 0) > int(turns_before):
+        store.update_status(task_id, delivery_pending=None)
+        return None
+
+    sch = config.get("scheduler") or {}
+    nudge_seconds = sch.get("delivery_nudge_seconds")
+    if nudge_seconds is None:
+        nudge_seconds = 90  # 兜底（与 config.example.json 一致）
+    escalate_seconds = sch.get("delivery_escalate_seconds")
+    if escalate_seconds is None:
+        escalate_seconds = 240  # 兜底（与 config.example.json 一致）
+    window_id = status.get("window_id")
+    kind = pending.get("kind", "")
+
+    stage = pending.get("stage") or "sent"
+
+    if stage == "relaunched":
+        # 阶梯第三步（开工令阶段二 §1 点 3）：已经关窗续过一次会话——不再
+        # 补第二次回车、不再续第二次会话（"每个 pending 只续一次，不循环"，
+        # 否则一个真出了问题的会话会被反复关窗重开，越搞越乱）。只给一次
+        # 跟 nudge 同长度的宽限（比原始的 escalate 宽限更短：都已经关窗
+        # 重开过了，这时候还没等到 UserPromptSubmit，多半是模型本身不肯
+        # 继续或者环境坏了，没必要再等 240 秒，转人工更靠谱）。
+        if now - sent_at < timedelta(seconds=nudge_seconds):
+            return None
+        reason = f"{kind}续会话后仍无 UserPromptSubmit：请到窗口 {window_id} 看输入框"
+        return _delivery_needs_attention(task, config, now, reason)
+
+    if not pending.get("nudged"):
+        # 规则 3：发出去够久了还没确认，先补一个回车——万一只是敲进去的
+        # 文本被吞在输入框里没提交（9/8 事故的原始触发场景）。
+        if now - sent_at < timedelta(seconds=nudge_seconds):
+            return None
+        result = launcher.send_keys(str(window_id), "")
+        store.update_status(
+            task_id,
+            delivery_pending={
+                **pending, "nudged": True, "nudged_at": to_iso(now), "stage": "nudged",
+            },
+        )
+        store.append_event(
+            task_id,
+            f"投递未确认：{kind} 发出 {nudge_seconds} 秒仍无 UserPromptSubmit，"
+            f"已补一个回车（send_keys 返回码 {result.returncode}）",
+        )
+        return [f"{task_id} 投递未确认，已补回车"]
+
+    # 规则 4：补了回车还是没确认——不能再敲一遍（输入框里可能已经躺着上
+    # 一份没提交的文字，再敲就是两份拼在一起，模型会读串；Codex 连按两次
+    # Ctrl+C 会直接退出，清输入框的按键两家还不一样），也不能开个新 AI
+    # 窗口去修（修的那个也可能卡、花额度，不确定性比问题本身大）。改成
+    # 关窗口、用 codex resume/claude --resume 当**启动参数**重开一个窗口
+    # 续上同一个会话——这条路不经过输入框，不会被吞，原上下文也保留。
+    nudged_at = parse_iso(pending["nudged_at"])
+    if now - nudged_at < timedelta(seconds=escalate_seconds):
+        return None
+    original_reason = (
+        f"{kind}没有被会话接收：补回车后 {escalate_seconds} 秒仍无 "
+        f"UserPromptSubmit，请到窗口 {window_id} 看输入框"
+    )
+    text = _read_pending_delivery_text(pending)
+    result = launcher.relaunch_resume(task, status, config, text)
+    if isinstance(result, str):
+        reason = f"关窗续会话失败：{result}；{original_reason}"
+        return _delivery_needs_attention(task, config, now, reason)
+
+    new_window_id, new_pane_pid = result
+    runner = store.effective_runner(task)
+    session_id = status.get("thread_id") if runner == "codex" else status.get("session_id")
+    resume_desc = (
+        f"codex resume 线程{session_id}" if runner == "codex"
+        else f"claude --resume 会话{session_id}"
+    )
+    store.update_status(
+        task_id,
+        window_id=new_window_id, pane_pid=new_pane_pid,
+        relaunched_at=to_iso(now), last_event_at=to_iso(now),
+        delivery_pending={
+            "kind": kind, "sent_at": to_iso(now), "nudged": False, "nudged_at": None,
+            "turns_before": int(status.get("turns") or 0),
+            "text_file": pending.get("text_file"), "stage": "relaunched",
+        },
+    )
+    store.append_event(
+        task_id,
+        f"投递未确认：已关窗口 {window_id}，{resume_desc}…重开 {new_window_id}，"
+        "那条话已作为启动参数带入（原文 pending_delivery.txt）",
+    )
+    return [f"{task_id} 投递未确认 → 已关窗续会话"]
 
 
 def _check_running(
@@ -1109,6 +1337,13 @@ def _check_running(
         )
         store.append_event(task_id, "窗口不在了且没等到 SessionEnd → exited(window_gone)")
         return [f"{task_id} 窗口消失 → exited(window_gone)"]
+
+    # 投递确认看门狗（开工令）：窗口还活着，先核对有没有一笔没确认的
+    # delivery_pending——放在其它 working/idle 专属判断之前，免得卡住/
+    # 权限/换班这些逻辑拿着"其实没送到"的状态往下走。
+    delivery_result = _check_delivery_pending(task, status, config, now)
+    if delivery_result is not None:
+        return delivery_result
 
     # 9/8：模型名不存在/无权限——CC 只在屏幕打一句错就回到提示符，没有任何
     # hook 会来；趁还没调过工具时抓一眼屏幕认出来，直接判 failed。
@@ -1280,7 +1515,9 @@ def _check_running(
             )
             # S6.1 B2：send-keys 真失败不能假装已经叫醒了它——不写
             # quota_resume_sent/清 quota_paused_until，留在原状态下 tick 重试
-            failure = _send_quota_resume(task_id, str(window_id), text)
+            failure = _send_quota_resume(
+                task_id, str(window_id), text, now, int(status.get("turns") or 0)
+            )
             if failure is not None:
                 return failure
             store.update_status(task_id, quota_resume_sent=True, quota_paused_until=None)
@@ -1301,7 +1538,10 @@ def _check_running(
                 and not status.get("quota_resume_sent")
                 and now - silent_since >= timedelta(minutes=CLAUDE_WAKEUP_GRACE_MINUTES)
             ):
-                failure = _send_quota_resume(task_id, str(window_id), DEFAULT_CLAUDE_RESUME_TEXT)
+                failure = _send_quota_resume(
+                    task_id, str(window_id), DEFAULT_CLAUDE_RESUME_TEXT, now,
+                    int(status.get("turns") or 0),
+                )
                 if failure is not None:
                     return failure
                 store.update_status(task_id, quota_resume_sent=True, quota_paused_until=None)
@@ -1343,6 +1583,9 @@ def _check_running(
         )
         if not sent:
             return [f"{task_id} 审稿额度刷新但叫醒失败"]
+        _mark_delivery_pending(
+            task_id, now, "审稿额度刷新继续", int(status.get("turns") or 0), text
+        )
         store.append_event(task_id, "审稿额度刷新时间已到，已 send-keys 让它继续（等待新一轮 verdict）")
         return [f"{task_id} 审稿额度刷新，敲它继续"]
 
@@ -2485,6 +2728,11 @@ def _review_fix(review_task: dict, config: dict, now: datetime) -> tuple[list[st
             parent_task["round"] = next_round
             parent_task["shift"] = new_shift
             store.atomic_write_json(store.task_dir(parent_id) / "task.json", parent_task)
+            # 看门狗（阶段二）：delivery_pending.text_file 落盘要赶在下面
+            # 那次 update_status 之前——同样是"字段已经落了、文件还没写"
+            # 会留窗口的理由，跟 delivery_pending 本身要跟 state="working"
+            # 同一次落盘一样。
+            fix_text_file = _write_pending_delivery_text(parent_id, fix_text)
             store.update_status(
                 parent_id, state="working", round=next_round, shift=new_shift,
                 last_event_at=to_iso(now), chain_checked=False, checkpoint_done=False,
@@ -2504,6 +2752,17 @@ def _review_fix(review_task: dict, config: dict, now: datetime) -> tuple[list[st
                 # 的话，新一轮开工后调度器会拿着上一轮的旧水位数字立刻投递一句
                 # 过期提醒。同一批清空，理由跟其余几个提醒标记一致。
                 context_warn_pending=None,
+                # 看门狗（开工令 §2）：跟 state="working" 同一次 update_status
+                # 落盘，不走 _mark_delivery_pending——分两次写会留一道"state
+                # 已经改了、delivery_pending 还没落"的窗口，恰好撞上 held
+                # 会话极快响应，hook 的 UserPromptSubmit 会清不到还没写出来
+                # 的标记，delivery_pending 从此再也没人清。字段形状仍走
+                # `_delivery_pending_fields`（返工 B），不再手写第二份 dict；
+                # turns_before 取 send 之前那份 parent_status 快照。
+                **_delivery_pending_fields(
+                    now, "审稿退回返工意见", int(parent_status.get("turns") or 0),
+                    fix_text_file,
+                ),
             )
             store.update_status(
                 task_id, state="chained", reactivated_task_id=parent_id,

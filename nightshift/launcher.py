@@ -281,7 +281,10 @@ def workdir_for(task: dict, config: dict) -> str:
     return str(config["projects"][task["project"]])
 
 
-def _claude_command(task: dict, config: dict, session_id: str) -> str:
+def _claude_command(
+    task: dict, config: dict, session_id: str,
+    *, prompt_file: Path | None = None, claude_resume: bool = False,
+) -> str:
     """Claude Code 的命令行。build 角色字节级保持一期以来的样子（S6 不许
     动，effective_model/effective_effort 对 build 等价于 task['model']/
     task['effort']，不改变输出）；review 角色额外插入只读工具面三件套
@@ -294,6 +297,13 @@ def _claude_command(task: dict, config: dict, session_id: str) -> str:
     之外的也无需询问直接放行"，不是"列表外一律拒绝"；`dontAsk` 才是"列表
     外一律拒绝、且不询问"的无人值守语义，配合 --allowedTools/--tools/
     --disallowedTools 三件套才是真正的权限层只读，不能只靠提示词自觉。
+
+    阶段二（关窗续会话）：`prompt_file` 不给时仍是 `task_dir/prompt.txt`
+    （默认参数下输出字节级不变，现有测试锁着）；`claude_resume=True` 时
+    把 `--session-id <id>` 换成 `--resume <id>`（`claude --help` 确认
+    `-r, --resume [sessionId]`，其余参数一个不动）——`relaunch_resume`
+    续的是同一个会话，不能再传 `--session-id`（那是"新建一个用这个 id
+    的会话"，CC 会因为这个 id 已经存在而报错/表现未定义）。
     """
     d = store.task_dir(task["id"])
     parts = [
@@ -309,24 +319,37 @@ def _claude_command(task: dict, config: dict, session_id: str) -> str:
             f"--disallowedTools {_sq(REVIEW_DISALLOWED_TOOLS)}",
         ]
     permission_mode = "dontAsk" if is_review else "auto"
+    session_flag = (
+        f"--resume {_sq(session_id)}" if claude_resume
+        else f"--session-id {_sq(session_id)}"
+    )
+    prompt_path = prompt_file or (d / "prompt.txt")
     parts += [
         f"--permission-mode {permission_mode}",
         f"--name {_sq(config['window_prefix'] + task['title'])}",
-        f"--session-id {_sq(session_id)}",
+        session_flag,
         f"--settings {_sq(d / 'settings.json')}",
         # 提示词必须整体包在双引号里：裸 $(cat …) 会被 shell 按空白切词、
         # 展开 $ 与通配符，多行任务内容会打散成一堆参数。
-        f"\"$(cat {_sq(d / 'prompt.txt')})\"",
+        f"\"$(cat {_sq(prompt_path)})\"",
     ]
     return " ".join(parts)
 
 
-def _codex_command(task: dict, config: dict, workdir: str, resume_thread_id: str | None) -> str:
+def _codex_command(
+    task: dict, config: dict, workdir: str, resume_thread_id: str | None,
+    *, prompt_file: Path | None = None,
+) -> str:
     """Codex 的命令行（开工令 S6②样例）：resume_thread_id 给了就 resume
     同一个 thread（同角色续班），否则起一个全新会话。build 角色沙箱固定
     workspace-write（字节级不变）；review 角色固定 --sandbox read-only——
     不用 --add-dir（会给额外目录写权限，不是只读挂载），也不靠它交审稿
     文件（Stop hook 在沙箱外原子落盘，见 hook.py）。
+
+    阶段二：`prompt_file` 不给时仍是 `task_dir/prompt.txt`（默认参数下
+    输出字节级不变）——`relaunch_resume` 用它指向 `resume_prompt.txt`
+    （前言 + 原文），Codex 续同一个 thread 走的还是现成的
+    `resume_thread_id`，不需要额外的续会话开关。
 
     S7.6：命令行 trust 覆盖（`-c projects."<wt>".trust_level="trusted"`）已
     删除——监理实测坐实 Codex 的信任闸门根本不认这个覆盖，留着只会误导人
@@ -365,14 +388,15 @@ def _codex_command(task: dict, config: dict, workdir: str, resume_thread_id: str
         parts.append(f"-c {_sq(writable_roots_override)}")
     parts += [
         f"--profile {_sq(profile)}",
-        f"\"$(cat {_sq(d / 'prompt.txt')})\"",
+        f"\"$(cat {_sq(prompt_file or (d / 'prompt.txt'))})\"",
     ]
     return " ".join(parts)
 
 
 def run_sh_text(
     task: dict, config: dict, session_id: str | None,
-    *, resume_thread_id: str | None = None,
+    *, resume_thread_id: str | None = None, prompt_file: Path | None = None,
+    claude_resume: bool = False, cgroup_join_existing: bool = False,
 ) -> str:
     """run.sh 的内容（模板见开工令）：环境、cgroup 内存围栏、起工人、留窗。
 
@@ -380,6 +404,19 @@ def run_sh_text(
     - claude：launcher 起跑前预先分配的 UUID，透传 --session-id（不变）；
     - codex：还不知道（要等 SessionStart hook 报），这里恒定不用它，
       resume 与否单独由 resume_thread_id 决定。
+
+    阶段二：`prompt_file`/`claude_resume` 原样透传给 `_codex_command`/
+    `_claude_command`，默认参数下（都不给）输出字节级不变——`relaunch_resume`
+    用它们生成 `run-resume.sh`，正常起跑走 `write_task_files` 仍是默认值。
+
+    返工 C：`cgroup_join_existing=True` 时 cgroup 目录换成"建不出来也没关系，
+    只要它在就加入"（`mkdir 2>/dev/null` 后 `[ -d "$CGROUP" ]` 判断），不是
+    `mkdir` 成功才写 `memory.max`/`cgroup.procs`——首次起跑时 cgroup 目录
+    早建好了，`relaunch_resume` 重开窗口时原来那种 `if mkdir; then …` 必然
+    因为目录已存在而失败，新工人进程就漏在 cgroup 外、没有内存围栏（7/12
+    VPS OOM 就是这个围栏要防的事，夜班无人值守时更不能丢）。默认
+    （`cgroup_join_existing=False`）输出字节级不变，`write_task_files`
+    正常起跑不传这个参数。
     """
     d = store.task_dir(task["id"])
     workdir = workdir_for(task, config)
@@ -387,6 +424,21 @@ def run_sh_text(
     # S7：审稿班可能跟施工班用不同的 runner（task.review.runner），命令行/
     # 环境导出一律按这一班自己的有效工人，不能只看顶层 build runner。
     runner = store.effective_runner(task)
+    if cgroup_join_existing:
+        cgroup_lines = [
+            'mkdir "$CGROUP" 2>/dev/null',
+            'if [ -d "$CGROUP" ]; then',
+            f"    echo {config['memory_max_bytes']} > \"$CGROUP/memory.max\" 2>/dev/null",
+            '    echo $$ > "$CGROUP/cgroup.procs" 2>/dev/null',
+            "fi",
+        ]
+    else:
+        cgroup_lines = [
+            'if mkdir "$CGROUP" 2>/dev/null; then',
+            f"    echo {config['memory_max_bytes']} > \"$CGROUP/memory.max\" 2>/dev/null",
+            '    echo $$ > "$CGROUP/cgroup.procs" 2>/dev/null',
+            "fi",
+        ]
     lines = [
         "#!/bin/bash",
         f"# nightshift 任务 {task['id']}：{task['title']}",
@@ -397,16 +449,20 @@ def run_sh_text(
         "unset CLAUDECODE",
         f"cd {_sq(workdir)} || {{ echo \"[nightshift] 进不了施工目录\"; read; exit 1; }}",
         f"CGROUP=\"/sys/fs/cgroup/nightshift-{task['id']}\"",
-        'if mkdir "$CGROUP" 2>/dev/null; then',
-        f"    echo {config['memory_max_bytes']} > \"$CGROUP/memory.max\" 2>/dev/null",
-        '    echo $$ > "$CGROUP/cgroup.procs" 2>/dev/null',
-        "fi",
+        *cgroup_lines,
     ]
     if runner == "codex":
-        lines.append(_codex_command(task, config, workdir, resume_thread_id))
+        lines.append(
+            _codex_command(task, config, workdir, resume_thread_id, prompt_file=prompt_file)
+        )
         exit_label = "codex"
     else:
-        lines.append(_claude_command(task, config, str(session_id)))
+        lines.append(
+            _claude_command(
+                task, config, str(session_id),
+                prompt_file=prompt_file, claude_resume=claude_resume,
+            )
+        )
         exit_label = "claude"
     lines += [
         "code=$?",
@@ -715,6 +771,89 @@ def launch(task_id: str, config: dict) -> dict:
         task_id, f"已开窗口 {window_id}（pane {pane_pid}）session={session_id}"
     )
     return status
+
+
+# 返工 D：kill-window 之后，pane 里的 codex/claude 进程收到 SIGHUP 通常几十
+# 毫秒内退出，但"通常"不是保证——没确认真死就去 resume 同一个
+# thread/session，理论上会出现两个进程同时写同一份 rollout/session 文件。
+# 测试可以把这个常量改成 0（跳过等待，桩死 pid_alive 直接判定）。
+_RELAUNCH_PID_WAIT_SECONDS = 5.0
+
+
+def relaunch_resume(
+    task: dict, status: dict, config: dict, text: str,
+) -> tuple[str, int] | str:
+    """投递确认看门狗自愈的第二级（阶段二 §0）：补了一个回车还是没等到
+    UserPromptSubmit，多半是输入框里当时就躺着别的没提交完的东西——再敲
+    一遍只会把两份话拼在一起、模型读串；开一个新 AI 窗口去修，那个也可能
+    卡、要花额度、还得给它按键权限，不确定性比原问题更大。改用"关窗口、
+    拿 codex resume <thread_id> "<话>" / claude --resume <session_id>
+    "<话>" 当**启动参数**重开一个窗口续上同一个会话"——启动参数这条路不
+    经过输入框，今晚靶测过不会被吞（生产 run.sh 一直这么起班），原上下文
+    也保留，且只是让调度器主动触发 launcher 本来就有的 resume_thread_id
+    那套（S6 同角色续班），不是新写一套自愈机制。
+
+    只做"关窗 + 重开"，不做 launch() 里的额度检查/工作树准备/trust
+    写入——会话本来就在跑，这些起跑时都已经办过，重新走一遍只会浪费时间
+    甚至因为额度这时刚好到线而把正常续班的会话也拦下来。
+
+    返回 (window_id, pane_pid) 表示成功；返回错误串表示失败。status/events
+    由调用方（scheduler）写，这里跟 `_open_window` 一样只管开窗、只返回
+    结果——delivery_pending 要不要转 needs_attention、reason 怎么措辞，
+    是调度器看完这次投递确认的上下文才能决定的事，不该散落进 launcher。
+    """
+    task_id = task["id"]
+    runner = store.effective_runner(task)
+    session_id = status.get("thread_id") if runner == "codex" else status.get("session_id")
+    if not session_id:
+        return "没有可续的会话 id"
+
+    # S6.1 A7 同款理由：宁可这一次自愈失败也不能两个窗口同时持有同一个
+    # 会话/thread——关不掉旧窗口就必须拒绝重开，不能悄悄两开。
+    window_id = status.get("window_id")
+    if window_id:
+        close_windows([str(window_id)], config)
+        if window_alive(str(window_id), config):
+            return f"旧窗口 {window_id} 关不掉，拒绝两开同一会话"
+
+        # 返工 D：kill-window 只是杀窗口，pane 里的进程收到 SIGHUP 后退出
+        # 通常几十毫秒内完成，但没确认真死就去 resume 同一个 thread/
+        # session，理论上会撞上两个进程同时写同一份 rollout/session
+        # 文件——轮询确认它真的退出了再继续，超时仍活着就拒绝两开。
+        pane_pid = status.get("pane_pid")
+        if pane_pid:
+            deadline = time.time() + _RELAUNCH_PID_WAIT_SECONDS
+            while pid_alive(int(pane_pid)) and time.time() < deadline:
+                time.sleep(0.2)
+            if pid_alive(int(pane_pid)):
+                return f"旧窗口进程 {pane_pid} 还没退出，拒绝两开同一会话"
+
+    d = store.task_dir(task_id)
+    # 旧工人的死讯不能拿来误判新窗口（write_task_files 那句注释同样的理由）。
+    (d / "exit_code").unlink(missing_ok=True)
+
+    prompt_path = d / "resume_prompt.txt"
+    store.atomic_write_text(
+        prompt_path,
+        "来自nightshift：调度器发现上一条话没有进到你的输入框，"
+        "已重开窗口续上这个会话，原话如下——\n\n" + text,
+    )
+
+    run_sh = d / "run-resume.sh"
+    store.atomic_write_text(
+        run_sh,
+        run_sh_text(
+            task, config, session_id,
+            resume_thread_id=session_id if runner == "codex" else None,
+            prompt_file=prompt_path,
+            claude_resume=(runner != "codex"),
+            cgroup_join_existing=True,
+        ),
+    )
+    os.chmod(run_sh, 0o700)
+
+    window_name = f"{config['window_prefix']}{task['title']}"
+    return _open_window(config, window_name, str(run_sh))
 
 
 def open_notice_window(

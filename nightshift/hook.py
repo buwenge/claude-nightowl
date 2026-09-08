@@ -1139,9 +1139,17 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             status["stuck"] = False
             status.pop("auto_interrupted", None)
             status.pop("stuck_since", None)
+            # 投递确认看门狗（开工令）：不管这轮是控制 turn 还是普通 turn，
+            # 只要真的等到了 UserPromptSubmit 就是收到了，清掉待确认标记。
+            status.pop("delivery_pending", None)
             status["last_event_at"] = now
 
         store.modify_status(task_id, bump_turns)
+        # 阶段二：待确认原文那份文件也顺手删掉，不留着（`_write_pending_
+        # delivery_text` 固定写在这个路径下，删的时候不用先读 delivery_pending
+        # 字段确认路径——没有这份 pending 时文件本来就不存在，unlink
+        # missing_ok 是安全的空操作）。
+        (store.task_dir(task_id) / "pending_delivery.txt").unlink(missing_ok=True)
         store.append_event(task_id, "hook UserPromptSubmit → working")
 
     elif event in ("SubagentStart", "SubagentStop"):

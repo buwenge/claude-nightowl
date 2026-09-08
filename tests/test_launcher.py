@@ -249,6 +249,229 @@ def test_run_sh_text_codex_resume_command():
     assert cmd_line.startswith("'codex' resume 'thread-xyz' -C ")
 
 
+# ---------- 阶段二：关窗续会话（--resume / prompt_file / relaunch_resume） ----------
+
+
+def test_claude_command_resume_uses_resume_flag_not_session_id():
+    """`claude_resume=True` 把 `--session-id <id>` 换成 `--resume <id>`，
+    其余参数不动；默认（不给）字节级不变——`relaunch_resume` 续同一个
+    会话不能再传 `--session-id`（那是"新建一个用这个 id 的会话"）。"""
+    task_id, config = make_task(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    cmd_resume = launcher._claude_command(task, config, "sess-xyz", claude_resume=True)
+    assert "--resume 'sess-xyz'" in cmd_resume
+    assert "--session-id" not in cmd_resume
+
+    cmd_default = launcher._claude_command(task, config, "sess-xyz")
+    assert "--session-id 'sess-xyz'" in cmd_default
+    assert "--resume" not in cmd_default
+
+
+def test_run_sh_text_prompt_file_override_claude():
+    """`prompt_file` 给了就用它替代 `task_dir/prompt.txt`；默认仍是
+    `prompt.txt`（现有测试锁着的字节级不变）。"""
+    task_id, config = make_task(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    custom = store.task_dir(task_id) / "resume_prompt.txt"
+    run_sh = launcher.run_sh_text(
+        task, config, "sess-xyz", prompt_file=custom, claude_resume=True,
+    )
+    assert f"$(cat '{custom}')" in run_sh
+    assert "--resume 'sess-xyz'" in run_sh
+
+    default_run_sh = launcher.run_sh_text(task, config, "sess-xyz")
+    assert f"$(cat '{store.task_dir(task_id) / 'prompt.txt'}')" in default_run_sh
+
+
+def test_run_sh_text_prompt_file_override_codex():
+    task_id, config = make_task_codex(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    custom = store.task_dir(task_id) / "resume_prompt.txt"
+    run_sh = launcher.run_sh_text(
+        task, config, None, resume_thread_id="thread-1", prompt_file=custom,
+    )
+    assert f"$(cat '{custom}')" in run_sh
+
+
+def test_run_sh_text_cgroup_join_existing_flag():
+    """返工 C：`cgroup_join_existing=True` 换成"目录已存在也照样加入"
+    （`mkdir 2>/dev/null` 后 `[ -d "$CGROUP" ]` 判断，不是"mkdir 成功才
+    加入"）——`relaunch_resume` 重开窗口时 cgroup 目录早在首次起跑时就建
+    好了，原来那种 `if mkdir; then …` 必然因为目录已存在而失败，新工人
+    进程就漏在 cgroup 外、没有内存围栏。默认（不给）字节级不变。"""
+    task_id, config = make_task(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    joined = launcher.run_sh_text(task, config, "sess-1", cgroup_join_existing=True)
+    assert 'mkdir "$CGROUP" 2>/dev/null\n' in joined
+    assert '[ -d "$CGROUP" ]' in joined
+    assert "cgroup.procs" in joined
+    assert "if mkdir" not in joined  # 不再是"mkdir 成功才加入"那种写法
+
+    default = launcher.run_sh_text(task, config, "sess-1")
+    assert 'if mkdir "$CGROUP" 2>/dev/null; then' in default
+    assert "[ -d " not in default
+
+
+def test_relaunch_resume_no_session_id_returns_error():
+    task_id, config = make_task(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    status = {"window_id": "@1"}  # 没有 session_id/thread_id
+    assert launcher.relaunch_resume(task, status, config, "话") == "没有可续的会话 id"
+
+
+def test_relaunch_resume_codex_no_thread_id_returns_error():
+    task_id, config = make_task_codex(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    status = {"window_id": "@1", "session_id": "不该看这个字段"}  # codex 该看 thread_id
+    assert launcher.relaunch_resume(task, status, config, "话") == "没有可续的会话 id"
+
+
+def test_relaunch_resume_old_window_wont_close_returns_error_and_no_new_window(monkeypatch):
+    """S6.1 A7 同款理由：关不掉旧窗口就必须拒绝重开，不能两开同一个会话。"""
+    task_id, config = make_task(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    status = {"window_id": "@1", "session_id": "sess-1"}
+    closed = []
+    monkeypatch.setattr(
+        launcher, "close_windows", lambda ids, cfg: closed.append(list(ids)) or list(ids)
+    )
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, cfg: True)  # 还活着，关不掉
+    tmux_calls = []
+    monkeypatch.setattr(
+        launcher, "_tmux",
+        lambda *a: tmux_calls.append(a) or subprocess.CompletedProcess(a, 0, "@99", ""),
+    )
+    result = launcher.relaunch_resume(task, status, config, "原话")
+    assert isinstance(result, str)
+    assert "关不掉" in result
+    assert closed == [["@1"]]
+    assert tmux_calls == []  # 没开新窗口
+
+
+def test_relaunch_resume_success_writes_files_and_returns_new_window(monkeypatch):
+    task_id, config = make_task(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    d = store.task_dir(task_id)
+    (d / "exit_code").write_text("1\n", encoding="utf-8")
+    status = {"window_id": "@1", "session_id": "sess-1", "pane_pid": 9001}
+    monkeypatch.setattr(launcher, "close_windows", lambda ids, cfg: list(ids))
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, cfg: False)  # 已关掉
+    # 返工 D：旧 pane 进程已经真的退出了（正常路径）。
+    monkeypatch.setattr(launcher, "pid_alive", lambda pid: False)
+
+    def fake_tmux(*args):
+        if args[0] == "new-window":
+            return subprocess.CompletedProcess(args, 0, "@42", "")
+        if args[0] == "list-panes":
+            return subprocess.CompletedProcess(args, 0, "12345", "")
+        raise AssertionError(f"没预期到这个 tmux 调用：{args}")
+
+    monkeypatch.setattr(launcher, "_tmux", fake_tmux)
+    result = launcher.relaunch_resume(task, status, config, "原话内容")
+    assert result == ("@42", 12345)
+    assert not (d / "exit_code").exists()
+
+    prompt = (d / "resume_prompt.txt").read_text(encoding="utf-8")
+    assert prompt.startswith(
+        "来自nightshift：调度器发现上一条话没有进到你的输入框，"
+        "已重开窗口续上这个会话，原话如下——"
+    )
+    assert prompt.endswith("原话内容")
+
+    run_resume = (d / "run-resume.sh").read_text(encoding="utf-8")
+    assert "--resume 'sess-1'" in run_resume
+    assert "resume_prompt.txt" in run_resume
+    # 返工 C：重开窗口的 run-resume.sh 走"目录已存在也加入" cgroup 写法。
+    assert '[ -d "$CGROUP" ]' in run_resume
+    assert "cgroup.procs" in run_resume
+    assert oct(os.stat(d / "run-resume.sh").st_mode & 0o777) == oct(0o700)
+
+
+def test_relaunch_resume_codex_uses_resume_thread_id(monkeypatch):
+    task_id, config = make_task_codex(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    status = {"window_id": "@1", "thread_id": "thread-abc", "pane_pid": 9002}
+    monkeypatch.setattr(launcher, "close_windows", lambda ids, cfg: list(ids))
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, cfg: False)
+    monkeypatch.setattr(launcher, "pid_alive", lambda pid: False)
+
+    def fake_tmux(*args):
+        if args[0] == "new-window":
+            return subprocess.CompletedProcess(args, 0, "@7", "")
+        if args[0] == "list-panes":
+            return subprocess.CompletedProcess(args, 0, "555", "")
+        raise AssertionError(f"没预期到这个 tmux 调用：{args}")
+
+    monkeypatch.setattr(launcher, "_tmux", fake_tmux)
+    result = launcher.relaunch_resume(task, status, config, "codex 原话")
+    assert result == ("@7", 555)
+    run_resume = (store.task_dir(task_id) / "run-resume.sh").read_text(encoding="utf-8")
+    assert "resume 'thread-abc'" in run_resume
+    assert "resume_prompt.txt" in run_resume
+    assert '[ -d "$CGROUP" ]' in run_resume
+
+
+def test_relaunch_resume_waits_for_old_pane_process_and_gives_up(monkeypatch):
+    """返工 D①：pid_alive 桩恒 True（`_RELAUNCH_PID_WAIT_SECONDS` 改 0，
+    跳过真等待）→ 返回错误、不开新窗口。"""
+    task_id, config = make_task(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    status = {"window_id": "@1", "session_id": "sess-1", "pane_pid": 4242}
+    monkeypatch.setattr(launcher, "close_windows", lambda ids, cfg: list(ids))
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, cfg: False)
+    monkeypatch.setattr(launcher, "pid_alive", lambda pid: True)  # 死活不退出
+    monkeypatch.setattr(launcher, "_RELAUNCH_PID_WAIT_SECONDS", 0)
+    tmux_calls = []
+    monkeypatch.setattr(
+        launcher, "_tmux",
+        lambda *a: tmux_calls.append(a) or subprocess.CompletedProcess(a, 0, "@99", ""),
+    )
+    result = launcher.relaunch_resume(task, status, config, "原话")
+    assert isinstance(result, str)
+    assert "4242" in result and "还没退出" in result
+    assert tmux_calls == []  # 没开新窗口
+
+
+def test_relaunch_resume_missing_pane_pid_skips_wait(monkeypatch):
+    """`pane_pid` 缺失（旧数据/字段还没坐实）就跳过这一步，不阻断自愈。"""
+    task_id, config = make_task(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    status = {"window_id": "@1", "session_id": "sess-1"}  # 没有 pane_pid
+    monkeypatch.setattr(launcher, "close_windows", lambda ids, cfg: list(ids))
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, cfg: False)
+
+    def boom(pid):
+        raise AssertionError("没有 pane_pid 时不该调用 pid_alive")
+
+    monkeypatch.setattr(launcher, "pid_alive", boom)
+
+    def fake_tmux(*args):
+        if args[0] == "new-window":
+            return subprocess.CompletedProcess(args, 0, "@8", "")
+        if args[0] == "list-panes":
+            return subprocess.CompletedProcess(args, 0, "666", "")
+        raise AssertionError(f"没预期到这个 tmux 调用：{args}")
+
+    monkeypatch.setattr(launcher, "_tmux", fake_tmux)
+    result = launcher.relaunch_resume(task, status, config, "原话")
+    assert result == ("@8", 666)
+
+
+def test_relaunch_resume_new_window_failure_returns_error(monkeypatch):
+    task_id, config = make_task(project_path="/home/user/projects/demo")
+    task = store.load_task(task_id)
+    status = {"window_id": "@1", "session_id": "sess-1"}
+    monkeypatch.setattr(launcher, "close_windows", lambda ids, cfg: list(ids))
+    monkeypatch.setattr(launcher, "window_alive", lambda wid, cfg: False)
+    monkeypatch.setattr(
+        launcher, "_tmux",
+        lambda *a: subprocess.CompletedProcess(a, 1, "", "new-window 炸了"),
+    )
+    result = launcher.relaunch_resume(task, status, config, "原话")
+    assert isinstance(result, str)
+    assert "new-window" in result
+
+
 def test_write_task_files_codex_skips_settings_json(tmp_path):
     task_id, config = make_task_codex(project_path="/home/user/projects/demo")
     task = store.load_task(task_id)
