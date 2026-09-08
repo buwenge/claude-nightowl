@@ -22,6 +22,7 @@ from typing import Any, Mapping
 
 __all__ = [
     "DEFAULT_SETTINGS", "EstimatorError", "SettingsError", "MAX_IMAGE_BYTES",
+    "ESTIMATE_JSON_SCHEMA", "ESTIMATION_RESULT_SCHEMA",
     "settings_path", "load_settings", "save_settings", "update_settings",
     "public_settings", "validate_result", "build_prompt", "estimate",
     "estimate_food", "ClaudeEstimator", "CodexEstimator",
@@ -56,6 +57,44 @@ _ITEM_FIELDS = (
     "name", "portion", "unit", "kcal_low", "kcal_high", "kcal_best",
     "protein_g", "carbs_g", "fat_g", "confidence", "note",
 )
+
+# Claude CLI 的结构化输出契约。provider、model 和 elapsed_ms 由本地适配器
+# 补齐，模型只需生成 items/questions；这样 CLI 不会把说明文字包装成结果。
+ESTIMATE_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "portion": {"type": "string"},
+                    "unit": {"type": "string"},
+                    "kcal_low": {"type": "number", "minimum": 0},
+                    "kcal_high": {"type": "number", "minimum": 0},
+                    "kcal_best": {"type": "number", "minimum": 0},
+                    "protein_g": {"type": "number", "minimum": 0},
+                    "carbs_g": {"type": "number", "minimum": 0},
+                    "fat_g": {"type": "number", "minimum": 0},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "note": {"type": "string"},
+                },
+                "required": list(_ITEM_FIELDS),
+            },
+        },
+        "questions": {"type": "array", "items": {"type": "string"}},
+        "provider": {"type": "string"},
+        "model": {"type": "string"},
+        "elapsed_ms": {"type": "integer", "minimum": 0},
+    },
+    "required": ["items", "questions"],
+}
+
+# 便于调用方按“结果 schema”语义发现同一份不可变契约。
+ESTIMATION_RESULT_SCHEMA = ESTIMATE_JSON_SCHEMA
 
 
 class EstimatorError(Exception):
@@ -446,6 +485,7 @@ class ClaudeEstimator:
             "--permission-prompts", "none", "--safe-mode",
             "--restricted", "--no-session-persistence", "--no-chrome",
             "--strict-mcp-config", "--input-format", "text",
+            "--json-schema", json.dumps(ESTIMATE_JSON_SCHEMA, ensure_ascii=False, separators=(",", ":")),
         ]
         if model:
             command.extend(["--model", model])

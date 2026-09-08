@@ -95,6 +95,8 @@ def test_claude_driver_command_and_fenced_json(monkeypatch, tmp_path):
     assert "--output-format" in seen["command"]
     assert seen["command"][seen["command"].index("--add-dir") + 1] == str(image.parent)
     assert "--tools" in seen["command"] and seen["command"][seen["command"].index("--tools") + 1] == "Read"
+    schema = json.loads(seen["command"][seen["command"].index("--json-schema") + 1])
+    assert set(estimator._ITEM_FIELDS) <= set(schema["properties"]["items"]["items"]["required"])
     assert "--safe-mode" in seen["command"] and "--permission-prompts" in seen["command"]
     assert "--restricted" in seen["command"]
     assert seen["input"].startswith("识别") and str(image) in seen["input"]
@@ -233,3 +235,155 @@ def test_mock_bad_output_becomes_unified_readable_error(monkeypatch):
     failed = estimator.estimate("午饭", settings={"provider": "mock"})
     assert failed["items"] == []
     assert "error" in failed and "items" in failed["error"]
+
+
+def _assert_unified_failure(value, provider, model):
+    """四种后端的错误都必须经过统一入口收敛成同一种返回。"""
+    assert value["items"] == []
+    assert value["provider"] == provider
+    assert value["model"] == model
+    assert isinstance(value.get("error"), str) and value["error"].strip()
+
+
+def _completed(stdout):
+    class Completed:
+        returncode = 0
+        stderr = ""
+        # subprocess.run(text=True) 时 stdout 是字符串。
+        pass
+    result = Completed()
+    result.stdout = stdout
+    return result
+
+
+@pytest.mark.parametrize("bad_output", ["不是 JSON", "[]"], ids=["非JSON", "非对象"])
+def test_claude_bad_outputs_through_unified_entry(monkeypatch, bad_output):
+    """Claude 的非 JSON 与非对象输出不能绕过统一错误 envelope。"""
+    monkeypatch.setattr(estimator.subprocess, "run", lambda *args, **kwargs: _completed(bad_output))
+    settings = {"provider": "claude", "providers": {"claude": {"model": "claude-test"}}}
+    value = estimator.estimate("午饭", settings=settings)
+    _assert_unified_failure(value, "claude", "claude-test")
+
+
+def test_claude_timeout_through_unified_entry(monkeypatch):
+    def timeout(*args, **kwargs):
+        raise estimator.subprocess.TimeoutExpired(kwargs["timeout"], "离线超时")
+    monkeypatch.setattr(estimator.subprocess, "run", timeout)
+    settings = {"provider": "claude", "providers": {"claude": {"model": "claude-test"}}}
+    value = estimator.estimate("午饭", settings=settings)
+    _assert_unified_failure(value, "claude", "claude-test")
+    assert "超时" in value["error"]
+
+
+def test_claude_missing_item_field_through_unified_entry(monkeypatch):
+    output = json.dumps({"items": [{"name": "米饭"}], "questions": []})
+    monkeypatch.setattr(estimator.subprocess, "run", lambda *args, **kwargs: _completed(output))
+    settings = {"provider": "claude", "providers": {"claude": {"model": "claude-test"}}}
+    value = estimator.estimate("午饭", settings=settings)
+    _assert_unified_failure(value, "claude", "claude-test")
+    assert "缺少字段" in value["error"]
+
+
+@pytest.mark.parametrize("bad_output", ["不是 JSON", "[]"], ids=["非JSON", "非对象"])
+def test_codex_bad_outputs_through_unified_entry(monkeypatch, bad_output):
+    """Codex 的命令输出异常同样由 estimate 统一处理。"""
+    monkeypatch.setattr(estimator.subprocess, "run", lambda *args, **kwargs: _completed(bad_output))
+    settings = {"provider": "codex", "providers": {"codex": {"model": "codex-test"}}}
+    value = estimator.estimate("午饭", settings=settings)
+    _assert_unified_failure(value, "codex", "codex-test")
+
+
+def test_codex_timeout_through_unified_entry(monkeypatch):
+    def timeout(*args, **kwargs):
+        raise estimator.subprocess.TimeoutExpired(kwargs["timeout"], "离线超时")
+    monkeypatch.setattr(estimator.subprocess, "run", timeout)
+    settings = {"provider": "codex", "providers": {"codex": {"model": "codex-test"}}}
+    value = estimator.estimate("午饭", settings=settings)
+    _assert_unified_failure(value, "codex", "codex-test")
+    assert "超时" in value["error"]
+
+
+def test_codex_missing_item_field_through_unified_entry(monkeypatch):
+    output = json.dumps({"items": [{"name": "米饭"}], "questions": []})
+    monkeypatch.setattr(estimator.subprocess, "run", lambda *args, **kwargs: _completed(output))
+    settings = {"provider": "codex", "providers": {"codex": {"model": "codex-test"}}}
+    value = estimator.estimate("午饭", settings=settings)
+    _assert_unified_failure(value, "codex", "codex-test")
+    assert "缺少字段" in value["error"]
+
+
+class _OfflineResponse:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self.body
+
+
+@pytest.mark.parametrize("body", ["不是 JSON".encode(), b"[]"], ids=["非JSON", "非对象"])
+def test_openai_bad_outer_outputs_through_unified_entry(monkeypatch, body):
+    monkeypatch.setattr(estimator.urllib.request, "urlopen", lambda *args, **kwargs: _OfflineResponse(body))
+    settings = {
+        "provider": "openai_compatible",
+        "providers": {"openai_compatible": {"base_url": "http://localhost:9000", "model": "http-test"}},
+    }
+    value = estimator.estimate("午饭", settings=settings)
+    _assert_unified_failure(value, "openai_compatible", "http-test")
+
+
+def test_openai_timeout_through_unified_entry(monkeypatch):
+    def timeout(*args, **kwargs):
+        raise TimeoutError("离线超时")
+    monkeypatch.setattr(estimator.urllib.request, "urlopen", timeout)
+    settings = {
+        "provider": "openai_compatible",
+        "providers": {"openai_compatible": {"base_url": "http://localhost:9000", "model": "http-test"}},
+    }
+    value = estimator.estimate("午饭", settings=settings)
+    _assert_unified_failure(value, "openai_compatible", "http-test")
+    assert "连接失败" in value["error"]
+
+
+def test_openai_missing_item_field_through_unified_entry(monkeypatch):
+    content = json.dumps({"items": [{"name": "米饭"}], "questions": []})
+    body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+    monkeypatch.setattr(estimator.urllib.request, "urlopen", lambda *args, **kwargs: _OfflineResponse(body))
+    settings = {
+        "provider": "openai_compatible",
+        "providers": {"openai_compatible": {"base_url": "http://localhost:9000", "model": "http-test"}},
+    }
+    value = estimator.estimate("午饭", settings=settings)
+    _assert_unified_failure(value, "openai_compatible", "http-test")
+    assert "缺少字段" in value["error"]
+
+
+@pytest.mark.parametrize("bad_output", ["不是 JSON", []], ids=["非JSON", "非对象"])
+def test_mock_bad_outputs_through_unified_entry(monkeypatch, bad_output):
+    monkeypatch.setattr(estimator.MockEstimator, "run", lambda self, prompt, image_path=None: bad_output)
+    value = estimator.estimate("午饭", settings={"provider": "mock", "providers": {"mock": {"model": "mock-test"}}})
+    _assert_unified_failure(value, "mock", "mock-test")
+
+
+def test_mock_timeout_through_unified_entry(monkeypatch):
+    def timeout(*args, **kwargs):
+        raise estimator.EstimatorError("mock 超时")
+    monkeypatch.setattr(estimator.MockEstimator, "run", timeout)
+    value = estimator.estimate("午饭", settings={"provider": "mock", "providers": {"mock": {"model": "mock-test"}}})
+    _assert_unified_failure(value, "mock", "mock-test")
+    assert "超时" in value["error"]
+
+
+def test_mock_missing_item_field_through_unified_entry(monkeypatch):
+    monkeypatch.setattr(
+        estimator.MockEstimator, "run",
+        lambda self, prompt, image_path=None: {"items": [{"name": "米饭"}], "questions": []},
+    )
+    value = estimator.estimate("午饭", settings={"provider": "mock", "providers": {"mock": {"model": "mock-test"}}})
+    _assert_unified_failure(value, "mock", "mock-test")
+    assert "缺少字段" in value["error"]
