@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import store
+from . import background_runner, store
 from .context import context_limit_for, read_codex_context, read_context_tokens
 
 __all__ = [
@@ -165,8 +165,17 @@ def commit_step(task: dict) -> str:
 
 
 def handover_path(task: dict) -> Path:
-    """交接文件路径：task_dir/handover-<shift>.md（shift 从 task.json 取，默认 1）。"""
+    """交接文件路径：task_dir/handover-<shift>.md（shift 从 task.json 取，默认 1）。
+
+    9/8：Codex 班改落 task_dir/background/handover-<shift>.md——Codex 的
+    workspace-write 沙箱对 task_dir 本身只读（F12 只放开了 background/），
+    写根目录被拒后模型把交接写进 background/ 兜底，而调度器只读根目录，
+    当成"没留交接"走兜底文案续班（2344 链第 9/12 班的交接就是这么丢的）。
+    这里是唯一权威：提醒文案告诉模型写哪，scheduler._handover_file 就读哪。
+    """
     shift = int(task.get("shift") or 1)
+    if store.effective_runner(task) == "codex":
+        return background_runner.background_dir(task["id"]) / f"handover-{shift}.md"
     return store.task_dir(task["id"]) / f"handover-{shift}.md"
 
 

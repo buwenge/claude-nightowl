@@ -114,7 +114,7 @@ python3 -m nightshift passwd                    # 设置/覆盖网页口令
 
 ## 交接协议
 
-一个班被要求收尾时，往 `~/.nightshift/tasks/<id>/handover-<班次>.md` 写一份普通的 markdown——做完了什么、没做完什么、下一步做什么——**最后一个非空行**必须是二选一：
+一个班被要求收尾时，往 `~/.nightshift/tasks/<id>/handover-<班次>.md`（Codex 班：`…/<id>/background/handover-<班次>.md`，沙箱只放开了这个子目录）写一份普通的 markdown——做完了什么、没做完什么、下一步做什么——**最后一个非空行**必须是二选一：
 
 ```
 NEXT: continue      # 没干完：拿着这份交接开下一班

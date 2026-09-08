@@ -337,21 +337,23 @@ def _member_handovers(
     """
     out: list[dict] = []
     d = store.task_dir(task_id)
-    if not d.is_dir():
-        return out
-    for entry in d.iterdir():
-        m = _RE_HANDOVER_FILE.match(entry.name)
-        if not m:
+    # 9/8：Codex 班的交接落在 background/（hook.handover_path），两处都枚举
+    for base in (d, background_runner.background_dir(task_id)):
+        if not base.is_dir():
             continue
-        text = _read_capped(entry)
-        if text is None:
-            continue
-        shift = int(m.group(1))
-        out.append({
-            "shift": shift,
-            "round": _round_for_shift(shift, boundaries, fallback_round),
-            "text": text,
-        })
+        for entry in base.iterdir():
+            m = _RE_HANDOVER_FILE.match(entry.name)
+            if not m:
+                continue
+            text = _read_capped(entry)
+            if text is None:
+                continue
+            shift = int(m.group(1))
+            out.append({
+                "shift": shift,
+                "round": _round_for_shift(shift, boundaries, fallback_round),
+                "text": text,
+            })
     out.sort(key=lambda item: item["shift"])
     return out
 

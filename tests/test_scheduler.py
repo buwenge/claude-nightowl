@@ -989,9 +989,13 @@ def _go_idle(tid: str, **extra) -> None:
 
 
 def _write_handover(tid: str, text: str, shift: int = 1) -> None:
-    (store.task_dir(tid) / f"handover-{shift}.md").write_text(
-        text + "\n", encoding="utf-8"
-    )
+    # 9/8：路径以 hook.handover_path 为准（Codex 班在 background/），测试
+    # 不自己拼文件名，免得跟生产读法分叉
+    task = dict(store.load_task(tid))
+    task["shift"] = shift
+    path = scheduler.hook.handover_path(task)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n", encoding="utf-8")
 
 
 def test_idle_settle_debounces_freshly_idled_build_but_evaluates_after_20s(monkeypatch):

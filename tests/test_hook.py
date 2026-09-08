@@ -2143,3 +2143,18 @@ def test_post_tool_use_subagent_call_no_notice_when_quota_not_hit(tmp_path):
     status = store.read_status(task_id)
     assert status.get("subagent_quota_noted") is None
     assert status["context_refresh_pending"] is True  # 欠账仍要记
+
+
+def test_handover_path_codex_lands_in_background_dir_claude_in_task_root():
+    """9/8：Codex 沙箱写不了 task_dir 根，交接改落 background/（F12 放开的唯一
+    可写目录）；Claude 不变。scheduler._handover_file 直接用同一个函数。"""
+    from nightshift import background_runner, hook, scheduler
+    claude_id = make_task()
+    codex_id = make_task_codex()
+    claude_task = store.load_task(claude_id)
+    codex_task = dict(store.load_task(codex_id))
+    codex_task["shift"] = 3
+    assert hook.handover_path(claude_task) == store.task_dir(claude_id) / "handover-1.md"
+    assert hook.handover_path(codex_task) == background_runner.background_dir(codex_id) / "handover-3.md"
+    assert scheduler._handover_file(codex_task) == hook.handover_path(codex_task)
+

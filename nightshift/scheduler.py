@@ -1736,14 +1736,16 @@ def _check_running(
 
 
 def _handover_file(task: dict) -> Path:
-    """交接文件路径：task_dir/handover-<shift>.md。
+    """交接文件路径——直接用 hook.handover_path 算（Claude 在 task_dir 根，
+    Codex 在 task_dir/background/，9/8 起）。提醒文案里叫模型写哪、这里就读
+    哪，同一个函数，不会再分叉。
 
     总review二 G15（A④-3）：以前优先读 status.handover_path，但 hook 写
     进去的值就是这同一个路径（两边都现读 task.json 算 shift），纯属多一个
     要跟着同步清的状态字段（`_review_fix` 曾经手动清它，S7.2 阻断三的
     根源）。直接算，少一份要保持一致的状态。
     """
-    return store.task_dir(task["id"]) / f"handover-{int(task.get('shift') or 1)}.md"
+    return hook.handover_path(task)
 
 
 def _read_handover(path: Path) -> str | None:
