@@ -1290,6 +1290,10 @@ def test_list_omits_big_text_fields_but_detail_keeps_them(authed):
     item = next(i for i in items if i["task"]["id"] == task_id)
     assert "task_text" not in item["task"] and "prompt_final" not in item["task"]
     assert item["task"]["title"] == "瘦身" and item["task"]["runner"] == "claude"
+    store.update_status(task_id, subagents_retired=["a", "b"], last_message="留着")
+    _, _, items = authed.request("GET", "/api/tasks")
+    item = next(i for i in items if i["task"]["id"] == task_id)
+    assert "subagents_retired" not in item["status"] and item["status"]["last_message"] == "留着"
     assert store.load_task(task_id)["task_text"] == "正文"  # 盘上没被改
     status, _, detail = authed.request("GET", f"/api/tasks/{task_id}")
     assert status == 200

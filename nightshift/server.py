@@ -142,6 +142,9 @@ DEFAULT_CODEX_STOP_BACKGROUND_TEXT = (
 
 # 列表接口不带的大字段（编辑页按需走 /api/tasks/<id> 详情拿全量）
 _LIST_OMIT_TASK_KEYS = frozenset({"task_text", "prompt_final"})
+# status 里同样只有调度器自己在读、卡片不画的大字段（Codex 班退役子代理 id 表，
+# 一条老任务就 8 KB）
+_LIST_OMIT_STATUS_KEYS = frozenset({"subagents_retired"})
 # 9/8「强制结束」认的状态：会话还活着（或调度器以为活着）的都能急停
 _FORCE_STOP_STATES = ("launching", "working", "waiting_background", "waiting_wakeup", "idle", "held")
 
@@ -893,6 +896,10 @@ class _Handler(BaseHTTPRequestHandler):
             item["task"] = {
                 key: value for key, value in item["task"].items()
                 if key not in _LIST_OMIT_TASK_KEYS
+            }
+            item["status"] = {
+                key: value for key, value in (item["status"] or {}).items()
+                if key not in _LIST_OMIT_STATUS_KEYS
             }
             item["task"].setdefault("runner", "claude")  # 仅展示；不回写 task.json
             item["events_tail"] = _tail_lines(store.task_dir(task_id) / "events.log", 5)
