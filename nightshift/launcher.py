@@ -513,6 +513,34 @@ def ensure_tmux_session(name: str) -> subprocess.CompletedProcess:
     return _tmux("new-session", "-d", "-s", name)
 
 
+def _open_window(config: dict, window_name: str, run_sh: str) -> tuple[str, int] | str:
+    """开窗口拿 window_id，再拿这个窗口的 pane_pid——纯搬运自 `launch()`
+    原来的 ⑥⑦ 两步（tmux 调用序列/参数字节级不变），`launch()` 与阶段二
+    的 `relaunch_resume` 共用。成功返回 (window_id, pane_pid)；失败返回
+    错误串——不在这里写状态/事件，`launch()` 拿到错误串走 `_fail`，
+    `relaunch_resume` 把错误串原样交回调用方（scheduler）决定怎么报。
+    """
+    session = config["tmux_session"]
+    # -t 必须写成 "会话名:"（带冒号）：不带冒号时 tmux 会先按窗口名解析，
+    # 会话里恰好有个同名窗口就会落到那个 index 上报 "index N in use"（8/27 真机踩到）。
+    proc = _tmux(
+        "new-window", "-d", "-P", "-F", "#{window_id}", "-t", f"{session}:",
+        "-n", window_name, *_new_window_env_args(), run_sh,
+    )
+    if proc.returncode != 0:
+        return f"tmux new-window 失败：{proc.stderr.strip()}"
+    window_id = proc.stdout.strip()
+
+    proc = _tmux("list-panes", "-t", window_id, "-F", "#{pane_pid}")
+    if proc.returncode != 0:
+        return f"tmux list-panes 失败：{proc.stderr.strip()}"
+    try:
+        pane_pid = int(proc.stdout.strip())
+    except ValueError:
+        return f"pane_pid 认不出来：{proc.stdout!r}"
+    return window_id, pane_pid
+
+
 def _fail(task: dict, config: dict, error: str) -> dict:
     status = store.update_status(
         task["id"], state="failed", error=error, last_event_at=store.utc_now_iso()
@@ -667,27 +695,14 @@ def launch(task_id: str, config: dict) -> dict:
     if proc.returncode != 0:
         return _fail(task, config, f"tmux 会话 {session} 起不来：{proc.stderr.strip()}")
 
-    # ⑥ 开窗口拿 window_id
+    # ⑥⑦ 开窗口拿 window_id/pane_pid（纯搬运抽成 _open_window，
+    # launch()/relaunch_resume 共用，tmux 调用序列不变）
     run_sh = str(store.task_dir(task_id) / "run.sh")
     window_name = f"{config['window_prefix']}{task['title']}"
-    # -t 必须写成 "会话名:"（带冒号）：不带冒号时 tmux 会先按窗口名解析，
-    # 会话里恰好有个同名窗口就会落到那个 index 上报 "index N in use"（8/27 真机踩到）。
-    proc = _tmux(
-        "new-window", "-d", "-P", "-F", "#{window_id}", "-t", f"{session}:",
-        "-n", window_name, *_new_window_env_args(), run_sh,
-    )
-    if proc.returncode != 0:
-        return _fail(task, config, f"tmux new-window 失败：{proc.stderr.strip()}")
-    window_id = proc.stdout.strip()
-
-    # ⑦ 拿 pane_pid
-    proc = _tmux("list-panes", "-t", window_id, "-F", "#{pane_pid}")
-    if proc.returncode != 0:
-        return _fail(task, config, f"tmux list-panes 失败：{proc.stderr.strip()}")
-    try:
-        pane_pid = int(proc.stdout.strip())
-    except ValueError:
-        return _fail(task, config, f"pane_pid 认不出来：{proc.stdout!r}")
+    opened = _open_window(config, window_name, run_sh)
+    if isinstance(opened, str):
+        return _fail(task, config, opened)
+    window_id, pane_pid = opened
 
     # ⑧ 记账
     status = store.update_status(
