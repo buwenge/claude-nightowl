@@ -821,8 +821,8 @@ def _copy_worktree_meta(parent_id: str, successor_id: str) -> None:
 def create_same_role_successor(
     parent_task: dict, handover_text: str | None, config: dict,
 ) -> str:
-    """同角色续班：上下文/额度到线 → 下一班接着干（Codex 同角色允许
-    `codex resume`）。role/round 不变，shift 与 role_shift 各自 +1，
+    """同角色续班：上下文/额度到线 → 下一班接着干（两家 runner 都是新会话
+    + 交接单冷启动，9/8 起 Codex 也不再 resume）。role/round 不变，shift 与 role_shift 各自 +1，
     pipeline_id 沿用；父任务状态改 chained 并记 successor_id（本班结束，
     后继进 scheduled）。
 

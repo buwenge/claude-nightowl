@@ -26,7 +26,6 @@ __all__ = [
     "close_windows",
     "codex_bin",
     "codex_config_path",
-    "codex_resume_thread_id",
     "ensure_codex_trusted",
     "ensure_tmux_session",
     "hook_settings",
@@ -92,35 +91,12 @@ def codex_bin(config: dict) -> str:
     return os.environ.get("NIGHTSHIFT_CODEX_BIN") or rc.get("bin", "codex")
 
 
-def _requires_codex_resume(task: dict) -> bool:
-    """这一班是否要求 resume 父班的 Codex thread（S7：跨角色永远新会话，
-    只有同角色续班才 resume）。
-
-    role_shift 字段存在（S7 起新建的任务）时按"role_shift > 1"判断——
-    只有 create_same_role_successor 会把这个数字往上推，角色轮转
-    （create_cross_role_successor）永远从 1 起，天然不要求 resume。
-    旧任务（S7 之前落盘，没有这个字段）退回 S6 的老规则：只要有
-    parent_id 就必须 resume，不能因为新字段缺失被误判成"角色轮转第一班"
-    从而悄悄开一个没有上下文的新会话。
-    """
-    if "role_shift" in task:
-        return int(task.get("role_shift") or 1) > 1
-    return bool(task.get("parent_id"))
-
-
-def codex_resume_thread_id(task: dict) -> str | None:
-    """同角色续班要不要 resume 同一个 Codex thread：`_requires_codex_resume`
-    判否就直接返回 None（这一班天然该起新会话，不是异常——role_shift 只有
-    create_same_role_successor 会推进，天然保证父班同角色，不需要额外
-    再查一次父班 task.json 的 role）；判是但父班没登记 thread_id（没起过、
-    Claude 父班、或还没等到 SessionStart）一律返回 None，调用方据此
-    fail-closed，不能悄悄开一个没有上下文的新会话。"""
-    if not _requires_codex_resume(task):
-        return None
-    parent_id = task.get("parent_id")
-    if not parent_id:
-        return None
-    return store.read_status(parent_id).get("thread_id") or None
+# 9/8 工头拍板：Codex 同角色续班不再 `codex resume` 父班 thread。resume 会把
+# 父班整段上下文原样带回，"上下文到线换班"的新班一出生就过线（2344 链第
+# 10/13 班各只跑了 8/3 次工具调用就被敲收尾，events 全是"无改动"）。改成跟
+# Claude 一样：新会话 + 交接单冷启动。`_requires_codex_resume`/
+# `codex_resume_thread_id` 两个名字已删，不留兼容别名；`codex resume` 只剩
+# `relaunch_resume`（看门狗关窗后续同一班的同一会话）一条路在用。
 
 
 def trust_check(project_path: str) -> str:
@@ -645,41 +621,9 @@ def launch(task_id: str, config: dict) -> dict:
             return status
         store.update_status(task_id, **meta)
 
-    # ①'' S6：Codex 同角色续班要 resume 父班的 thread；父班没留下 thread_id
-    # 就 fail-closed（不能悄悄开一个没有上下文的新会话）。
+    # ①'' 9/8：同角色续班一律新会话（见文件顶部 _requires_codex_resume 删除
+    # 说明）；resume_thread_id 只由 relaunch_resume 传给 run_sh_text，这里恒 None。
     resume_thread_id = None
-    if runner == "codex" and _requires_codex_resume(task):
-        resume_thread_id = codex_resume_thread_id(task)
-        if not resume_thread_id:
-            reason = (
-                "Codex 续班找不到父班登记的 thread_id，"
-                "拒绝悄悄开一个没有上下文的新会话"
-            )
-            store.append_event(task_id, f"启动被拦：{reason}")
-            status = store.update_status(
-                task_id, state="failed", error=reason,
-                last_event_at=store.utc_now_iso(),
-            )
-            open_failure_window(task, reason, config)
-            return status
-        # S6.1 A7：父班窗口必须先确认不在了才能 resume 同一个 thread——
-        # _chain_continue 续班时已经尝试关过父窗，但关闭可能失败（tmux 抽风/
-        # 窗口刚好在被别的东西占用）；这里是最后一道防线，宁可这一班启动
-        # 失败也不让父窗和这个新窗口同时持有同一个 Codex thread（两开）。
-        parent_status = store.read_status(task["parent_id"])
-        parent_window_id = parent_status.get("window_id")
-        if parent_window_id and window_alive(str(parent_window_id), config):
-            reason = (
-                f"父班窗口 {parent_window_id} 仍然存活，"
-                "拒绝在新窗口 resume 同一个 Codex thread（防止两开）"
-            )
-            store.append_event(task_id, f"启动被拦：{reason}")
-            status = store.update_status(
-                task_id, state="failed", error=reason,
-                last_event_at=store.utc_now_iso(),
-            )
-            open_failure_window(task, reason, config)
-            return status
 
     # ①''' S7.6：Codex 会话开始前，把这一班的工作目录持久化写进
     # ~/.codex/config.toml 的信任表——命令行 -c projects...trust_level 覆盖
@@ -727,8 +671,8 @@ def launch(task_id: str, config: dict) -> dict:
     # ④ 先落盘 launching（含预订的 session/transcript），再去碰 tmux
     extra_fields = {}
     if runner == "codex":
-        # resume 时提前把 thread_id 坐实（SessionStart 不会重新触发，见靶测
-        # 记录第 6 项）；新会话先置 None，等 SessionStart hook 报了再补
+        # 新会话先置 None，等 SessionStart hook 报了再补（session_id 对 codex
+        # 恒 None，见 run_sh_text 的说明）
         extra_fields["thread_id"] = session_id
         extra_fields["quota_source"] = "codex"
     store.update_status(

@@ -1921,13 +1921,11 @@ def _chain_continue(
     """续班：班次没到上限就造后继任务（父任务转 chained）；到上限标
     chain_exhausted 并开提醒窗。后继下一 tick 走完整预检（额度不够就推迟）。
 
-    S6.1 A7：Codex 续班在造完后继后，最好把父班窗口关掉——下一班要
-    `codex resume` 同一个 thread，父窗口还开着的话会跟后继窗口同时持有
-    同一个会话（两开）。这里是 best-effort（tmux 抽风/窗口已经不在都不算
-    错误，`close_windows` 本来就只关它确认还活着的窗口）；真正兜底的是
-    `launcher.launch()` 里那道"父窗还活着就拒绝 resume"的硬检查——就算这里
-    关闭失败，后继下一 tick 也不会悄悄两开，而是 fail-closed。Claude 换班
-    原样保留旧窗口（一期行为不变，Claude 没有"同一个会话"这个概念）。
+    S6.1 A7：Codex 续班在造完后继后把父班窗口关掉。9/8 起后继不再
+    `codex resume` 父班 thread（新会话 + 交接单冷启动，跟 Claude 一样），
+    关父窗只剩"别让审完/换完的窗口堆着"这一个理由，仍是 best-effort
+    （tmux 抽风/窗口已经不在都不算错误，`close_windows` 本来就只关它确认
+    还活着的窗口）。Claude 换班原样保留旧窗口（一期行为不变）。
     """
     task_id = task["id"]
     shift = int(task.get("shift") or 1)

@@ -171,26 +171,13 @@ def test_codex_bin_env_override(tmp_path, monkeypatch):
     assert launcher.codex_bin(CODEX_CONFIG) == str(tmp_path / "fake.sh")
 
 
-def test_codex_resume_thread_id_cases(tmp_path):
-    task_id, config = make_task_codex(project_path=str(tmp_path / "proj"))
-    task = store.load_task(task_id)
-    assert launcher.codex_resume_thread_id(task) is None  # 首班没有 parent_id
-
-    # S7：role_shift == 1（缺省，或角色轮转的第一班）天然不要求 resume——
-    # 即便手滑给了 parent_id，也不该去查它
-    task["parent_id"] = "nonexistent-parent"
-    assert launcher.codex_resume_thread_id(task) is None
-
-    # role_shift > 1 才是"同角色续班"，这时才要求 resume 父班的 thread_id
-    task["role_shift"] = 2
-    assert launcher.codex_resume_thread_id(task) is None  # 父班没登记 thread_id
-
-    store.update_status("nonexistent-parent", thread_id="thread-abc")
-    assert launcher.codex_resume_thread_id(task) == "thread-abc"
-
-    # 旧任务（没有 role_shift 字段）退回 S6 老规则：有 parent_id 就必须 resume
-    legacy = {k: v for k, v in task.items() if k != "role_shift"}
-    assert launcher.codex_resume_thread_id(legacy) == "thread-abc"
+def test_codex_resume_helpers_removed():
+    """9/8 工头拍板：Codex 同角色续班不再 resume 父班 thread（新会话 + 交接单
+    冷启动，跟 Claude 一样）。两个 resume 判定函数整个删掉、不留兼容名，
+    旧写法当场 AttributeError。"""
+    assert not hasattr(launcher, "_requires_codex_resume")
+    assert not hasattr(launcher, "codex_resume_thread_id")
+    assert "codex_resume_thread_id" not in launcher.__all__
 
 
 def make_task_codex(project_path: str | None = None, **over):
@@ -570,23 +557,27 @@ def test_write_task_files_claude_prompt_not_padded_with_codex_instruction(tmp_pa
     assert prompt_txt == task["prompt_final"]
 
 
-def test_launch_codex_resume_fail_closed_without_parent_thread_id(tmp_path, monkeypatch):
-    """S6：Codex 续班找不到父班 thread_id，宁可判失败也不悄悄开新会话。"""
+def test_launch_codex_same_role_successor_starts_fresh_session(tmp_path, monkeypatch):
+    """9/8：同角色续班（role_shift > 1）不再要求父班 thread_id、不再 resume——
+    父班没登记 thread_id 也照样起一个新会话，run.sh 里不出现 resume。
+    （以前这里是"找不到父班 thread_id 就 fail-closed"。）"""
     proj = tmp_path / "proj"
     init_git_repo(proj)
     task_id, config = make_task_codex(project_path=str(proj))
     task = store.load_task(task_id)
     task["parent_id"] = "some-parent-without-thread"
-    task["role_shift"] = 2  # S7：role_shift > 1 才代表"同角色续班"，要求 resume
+    task["role_shift"] = 2
     store.atomic_write_json(store.task_dir(task_id) / "task.json", task)
-    # 判失败仍会走既有的失败提醒窗口流程（碰 tmux 开个通知窗），这里只假它
-    monkeypatch.setattr(
-        launcher, "_tmux",
-        lambda *a: subprocess.CompletedProcess(a, 0, "", ""),
-    )
+    def fake_tmux(*a):
+        out = "4242\n" if a[0] == "list-panes" else "@9\n"
+        return subprocess.CompletedProcess(a, 0, out, "")
+
+    monkeypatch.setattr(launcher, "_tmux", fake_tmux)
     status = launcher.launch(task_id, config)
-    assert status["state"] == "failed"
-    assert "thread_id" in status["error"]
+    assert status["state"] == "launching", status.get("error")
+    assert status["thread_id"] is None  # 等 SessionStart 坐实
+    run_sh = (store.task_dir(task_id) / "run.sh").read_text(encoding="utf-8")
+    assert " resume " not in run_sh
 
 
 def test_is_trusted_three_cases(tmp_path, monkeypatch):
@@ -1013,49 +1004,32 @@ def test_launch_codex_full_cycle_new_session(tmux_session, codex_env, tmp_path):
     assert "--session-id" not in fake_log
 
 
-def test_launch_codex_resume_uses_parent_thread_id(tmux_session, codex_env):
+def test_launch_codex_same_role_successor_fresh_session_live(tmux_session, codex_env):
+    """9/8：真 tmux + 假 codex——同角色续班起的是新会话：launch 时 thread_id
+    为 None，SessionStart 报了才坐实；假 codex 的日志里没有 resume。"""
     parent_id, config = make_task_codex(project_path=str(codex_env["proj"]))
     launcher.launch(parent_id, config)
     wait_for_state(parent_id)  # 等首班坐实 thread_id
 
     parent_task = store.load_task(parent_id)
-    # S6.1 A7：生产链路里 _chain_continue 续班时会先关掉父班窗口再造后继；
-    # 这里手动做同一步，否则 launch() 的新守卫会因为父窗还活着而 fail-closed
-    # （父窗跑完只是"留窗"等回车，tmux 里仍然算活着，见 run.sh 的 read）
+    # 生产链路里 _chain_continue 续班时会先关掉父班窗口（窗口卫生），这里照做
     parent_window_id = store.read_status(parent_id)["window_id"]
     launcher.close_windows([parent_window_id], config)
 
     succ_id = store.create_same_role_successor(parent_task, "交接", config)
     succ_status = launcher.launch(succ_id, config)
     assert succ_status["state"] == "launching"
-    assert succ_status["session_id"] == "01a05206-e86e-7c80-8540-1b92468c92a1"
-    assert succ_status["thread_id"] == "01a05206-e86e-7c80-8540-1b92468c92a1"
+    assert succ_status["session_id"] is None
+    assert succ_status["thread_id"] is None
 
     status, seen = wait_for_state(succ_id)
     assert status["state"] == "exited", f"没等到 exited，见过 {seen}"
-    # resume 场景假 codex 跳过 SessionStart，thread_id 是 launch() 提前坐实的，
-    # 后续事件不该把它改掉
     assert status["thread_id"] == "01a05206-e86e-7c80-8540-1b92468c92a1"
 
     fake_log = (codex_env["fake_log"]).read_text(encoding="utf-8")
-    assert "resume" in fake_log
-    assert "01a05206-e86e-7c80-8540-1b92468c92a1" in fake_log
-
-
-def test_launch_codex_resume_fails_closed_when_parent_window_still_alive(tmux_session, codex_env):
-    """S6.1 A7：父班窗口没被关掉（比如 close_windows 失败/没人调用）时，
-    绝不允许后继在新窗口 resume 同一个 thread——两开比开不了更糟，宁可这
-    一班启动失败。"""
-    parent_id, config = make_task_codex(project_path=str(codex_env["proj"]))
-    launcher.launch(parent_id, config)
-    wait_for_state(parent_id)  # 等首班坐实 thread_id；父窗故意不关
-
-    parent_task = store.load_task(parent_id)
-    succ_id = store.create_same_role_successor(parent_task, "交接", config)
-    succ_status = launcher.launch(succ_id, config)
-    assert succ_status["state"] == "failed"
-    assert "仍然存活" in succ_status["error"]
-    assert "两开" in succ_status["error"]
+    assert "resume" not in fake_log
+    run_sh = (store.task_dir(succ_id) / "run.sh").read_text(encoding="utf-8")
+    assert " resume " not in run_sh
 
 
 def test_launch_codex_untrusted_claude_json_does_not_block(tmux_session, codex_env, monkeypatch):
@@ -1298,17 +1272,6 @@ def test_write_task_files_review_codex_skips_settings_json(tmp_path):
     launcher.write_task_files(review_task, config, None)
     d = store.task_dir(task_id)
     assert not (d / "settings.json").exists()
-
-
-def test_codex_resume_thread_id_cross_role_never_resumes():
-    """S7：跨角色（build round2 的父班是 review round1）永远不 resume，
-    即便父班（角色不同）真的登记过一个 Codex thread_id。"""
-    store_home_task = {
-        "id": "child", "parent_id": "review-parent",
-        "role": "build", "round": 2, "role_shift": 1,  # 角色轮转：role_shift 恒为 1
-    }
-    store.update_status("review-parent", thread_id="review-thread-xyz")
-    assert launcher.codex_resume_thread_id(store_home_task) is None
 
 
 # ---------- S8 审查 B：send_keys 通道（文本走 stdin 缓冲，Enter 单独发） ----------
