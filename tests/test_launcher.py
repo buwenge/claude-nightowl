@@ -1111,7 +1111,7 @@ def _stub_tmux(monkeypatch, calls, stdin_calls, *, fail_step=None):
 def test_send_keys_text_goes_by_stdin_buffer_then_separate_enter(monkeypatch):
     """9/1 靶测：文本与 Enter 放同一条 tmux 命令时 CC 按粘贴处理、回车变换行，永远不提交。
     文本必须走 load-buffer 的 stdin（不经命令行解析：-开头/尾分号/键名/16KB 上限四个坑
-    一起绕开），paste-buffer 写进 pane，Enter 单独一条 send-keys。"""
+    一起绕开），paste-buffer -p 写进 pane（括号粘贴），Enter 单独一条 send-keys。"""
     calls, stdin_calls = [], []
     _stub_tmux(monkeypatch, calls, stdin_calls)
     text = "-foo; 来自nightshift：" + "长" * 20000 + "\nreturn x;"
@@ -1122,7 +1122,9 @@ def test_send_keys_text_goes_by_stdin_buffer_then_separate_enter(monkeypatch):
     assert load_args[0] == "load-buffer" and load_args[-1] == "-"
     buf = load_args[load_args.index("-b") + 1]
     assert [a[0] for a in calls] == ["paste-buffer", "send-keys"]
-    assert calls[0] == ("paste-buffer", "-d", "-r", "-b", buf, "-t", "@7")
+    # 9/8：-p 括号粘贴——Codex TUI 的 paste-burst 启发式会把裸多行文本的尾巴留在缓冲里、
+    # 吞掉后面的 Enter（第 2 轮返工意见在输入框里躺了 50 分钟）；CC 2.1.263 同样验过能提交。
+    assert calls[0] == ("paste-buffer", "-d", "-p", "-r", "-b", buf, "-t", "@7")
     assert calls[1] == ("send-keys", "-t", "@7", "Enter")
     assert all(text not in " ".join(a) for a in calls)  # 文本绝不进 tmux 命令行
 

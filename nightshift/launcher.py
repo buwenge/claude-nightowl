@@ -767,9 +767,10 @@ def _tmux_stdin(text: str, *args) -> subprocess.CompletedProcess:
 # 文本落进 pane 之后、单独发 Enter 之前的间隔。CC 的输入解析器把一次读到的多字符
 # 块当粘贴处理，块里的回车变成换行（9/1 靶测坐实：文本与 Enter 放同一条 tmux
 # 命令永远提交不了）；分开发之后，Enter 只要落在解析器的 NORMAL_TIMEOUT
-# （CC 2.1.257 二进制里 NORMAL_TIMEOUT=50 ms）之外就是一次独立按键。这里不用
-# paste-buffer 的 -p（不带括号粘贴序列），所以 PASTE_TIMEOUT=2000 ms 那个
-# IN_PASTE 模式不会进。0.3 秒留足余量，测试可把它改成 0。
+# （CC 2.1.257 二进制里 NORMAL_TIMEOUT=50 ms）之外就是一次独立按键。
+# 9/8 起 paste-buffer 加了 -p（括号粘贴序列，见 send_keys 第 2 步）：CC 收到
+# \e[200~…\e[201~ 后整块当一次粘贴，紧接着的独立 Enter 照样提交（CC 2.1.263
+# 死端点靶测：7912 字多行文本一字不差进 session）。0.3 秒留足余量，测试可把它改成 0。
 _SEND_ENTER_DELAY_SECONDS = 0.3
 # 调度器线程与 HTTP 线程同进程：文本与 Enter 之间不许被别的按键插队
 # （捎话/中止/停后台都走这一个入口或 send_escape）。
@@ -788,8 +789,18 @@ def send_keys(window_id: str, text: str) -> subprocess.CompletedProcess:
        开头被当 flag 报 "unknown flag"；尾部 ASCII `;` 被当命令分隔符（静默吞掉，
        后面跟 Enter 时整条报 "unknown command: Enter"）；文本恰好是键名
        （Enter/Space/Tab…）被当按键。stdin 路线四个坑一起绕开。
-    2. `paste-buffer -d -r -b <名字> -t <窗口>`：写进 pane，-d 用完即删，-r 保留
-       换行原样（不换成回车，跟以前 send-keys 送出的字节一致）。
+    2. `paste-buffer -d -p -r -b <名字> -t <窗口>`：写进 pane，-d 用完即删，-r 保留
+       换行原样（不换成回车，跟以前 send-keys 送出的字节一致），-p 在应用开了
+       括号粘贴模式时把整段包成一次粘贴（没开的应用照旧收裸文本，tmux 自己判断）。
+       为什么必须 -p（9/8 事故）：Codex TUI 0.151.0 没有括号粘贴序列时靠"字符来得
+       快就当粘贴"的 paste-burst 启发式（codex-rs/tui/src/bottom_pane/paste_burst.rs），
+       裸 LF 在 raw 模式被 crossterm 认成 Ctrl+J，一段 13.7 KB 的多行审稿意见敲完后
+       最后一行尾巴留在它的 burst 缓冲里没刷出来，之后每个 Enter 都被当成"粘贴里的
+       换行"追加进缓冲，永远不提交——第 2 轮返工意见就这样在施工窗口输入框里躺了
+       50 分钟（死端点探针 100% 复现，只有再敲一个普通字符才会把缓冲刷出来）。
+       开了 -p 之后 Codex 走 Event::Paste 一次性收下（>1000 字折成占位符、提交时展开），
+       独立 Enter 正常提交；CC 同样验过。升级 Codex/CC 后用 tools/probe_paste_submit.py
+       复验，不花额度。
     3. 隔 _SEND_ENTER_DELAY_SECONDS 再单独 `send-keys Enter`（见常量说明）。
     """
     wid = str(window_id)
@@ -799,7 +810,7 @@ def send_keys(window_id: str, text: str) -> subprocess.CompletedProcess:
             proc = _tmux_stdin(text, "load-buffer", "-b", buf, "-")
             if proc.returncode != 0:
                 return proc
-            proc = _tmux("paste-buffer", "-d", "-r", "-b", buf, "-t", wid)
+            proc = _tmux("paste-buffer", "-d", "-p", "-r", "-b", buf, "-t", wid)
             if proc.returncode != 0:
                 _tmux("delete-buffer", "-b", buf)
                 return proc
