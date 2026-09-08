@@ -145,8 +145,50 @@ _LIST_OMIT_TASK_KEYS = frozenset({"task_text", "prompt_final"})
 # status 里同样只有调度器自己在读、卡片不画的大字段（Codex 班退役子代理 id 表，
 # 一条老任务就 8 KB）
 _LIST_OMIT_STATUS_KEYS = frozenset({"subagents_retired"})
+# 9/8 批量清理：整条链的最新一班落在这些状态才算「收尾了、可以扫掉」；
+# failed / needs_attention / chain_exhausted / exited 收尾的链不碰（多半还要看一眼）
+_BULK_DELETE_LATEST_STATES = ("finished", "merged", "discarded", "cancelled")
 # 9/8「强制结束」认的状态：会话还活着（或调度器以为活着）的都能急停
 _FORCE_STOP_STATES = ("launching", "working", "waiting_background", "waiting_wakeup", "idle", "held")
+
+
+def _bulk_delete_candidates(items: list[dict], from_dt, to_dt) -> list[dict]:
+    """批量清理（9/8）的候选：按流水线整条算——每个成员都是终态、没有成员占着
+    工作树、最新一班（shift 最大）状态在 _BULK_DELETE_LATEST_STATES 里；日期按
+    成员 run_at：全部 <= to，from 给了就全部 >= from。返回每条链的
+    {id, title, run_at, state, tasks}，按根任务 run_at 排序。只算不删。"""
+    by_pipeline: dict[str, list[dict]] = {}
+    for item in items:
+        by_pipeline.setdefault(store.pipeline_id_of(item["task"]), []).append(item)
+    out: list[dict] = []
+    for pid, members in sorted(by_pipeline.items()):
+        statuses = [m["status"] or {} for m in members]
+        if any(s.get("state") not in _TERMINAL_STATES for s in statuses):
+            continue
+        if any(s.get("worktree_path") for s in statuses):
+            continue
+        latest = max(members, key=lambda m: (m["task"].get("shift") or 1, m["task"]["id"]))
+        latest_state = (latest["status"] or {}).get("state")
+        if latest_state not in _BULK_DELETE_LATEST_STATES:
+            continue
+        try:
+            run_ats = [scheduler.parse_iso(m["task"]["run_at"]) for m in members]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if max(run_ats) > to_dt:
+            continue
+        if from_dt is not None and min(run_ats) < from_dt:
+            continue
+        root = next((m for m in members if m["task"]["id"] == pid), members[0])
+        out.append({
+            "id": pid,
+            "title": root["task"].get("title") or pid,
+            "run_at": root["task"].get("run_at"),
+            "state": latest_state,
+            "tasks": [m["task"]["id"] for m in members],
+        })
+    out.sort(key=lambda c: (c["run_at"] or "", c["id"]))  # 按开跑时间列，人看着顺
+    return out
 
 
 def _never_launched(status: dict) -> bool:
@@ -599,6 +641,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._api_preview()
         if path == "/api/tasks":
             return self._api_create_task()
+        if path == "/api/tasks/bulk-delete":
+            return self._api_bulk_delete()
         if path == "/api/quota/refresh":
             return self._api_quota_refresh()
         match = _RE_TASK_ACTION.match(path)
@@ -1934,6 +1978,44 @@ class _Handler(BaseHTTPRequestHandler):
         shutil.rmtree(store.task_dir(task_id))
         logger.info("网页删除任务：%s", task_id)
         return self._send_json(200, {"ok": True})
+
+    def _api_bulk_delete(self) -> None:
+        """一键清理（9/8 工头要的）：删两个日期之间已收尾的整条链。
+
+        body：{"to": ISO（必填，含当天，前端按本地时区换成当天 23:59:59），
+        "from": ISO 或 null（留空 = 结束日期之前的全部），"dry_run": bool}。
+        候选规则见 _bulk_delete_candidates；dry_run=true 只列不删，前端先让人
+        看一眼再确认。删法与单条删除一致（整个任务目录 rmtree），不碰窗口。"""
+        data = self._read_json()
+        if data is None:
+            return
+        to_raw = data.get("to")
+        from_raw = data.get("from")
+        if not isinstance(to_raw, str) or not to_raw:
+            return self._send_json(400, {"error": "缺少结束日期 to"})
+        if from_raw is not None and not isinstance(from_raw, str):
+            return self._send_json(400, {"error": "from 要是 ISO 时间或 null"})
+        try:
+            to_dt = scheduler.parse_iso(to_raw)
+            from_dt = scheduler.parse_iso(from_raw) if from_raw else None
+        except ValueError:
+            return self._send_json(400, {"error": "日期认不出来（要 ISO 时间）"})
+        if from_dt is not None and from_dt > to_dt:
+            return self._send_json(400, {"error": "开始日期晚于结束日期"})
+        dry_run = bool(data.get("dry_run"))
+        chains = _bulk_delete_candidates(store.list_tasks(), from_dt, to_dt)
+        task_count = sum(len(c["tasks"]) for c in chains)
+        if not dry_run:
+            for chain in chains:
+                for tid in chain["tasks"]:
+                    shutil.rmtree(store.task_dir(tid), ignore_errors=True)
+            logger.info(
+                "网页批量删除：%d 条链 %d 个任务（%s ～ %s）",
+                len(chains), task_count, from_raw or "-", to_raw,
+            )
+        return self._send_json(
+            200, {"chains": chains, "task_count": task_count, "deleted": not dry_run}
+        )
 
     def _api_screen(self, task_id: str) -> None:
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)

@@ -44,6 +44,16 @@
       <p id="warmup-state" class="hint"></p>
     </div>
     <div id="orphan-box" class="orphan-box" hidden></div>
+    <details class="box" id="bulk-box">
+      <summary>批量清理已收尾的任务</summary>
+      <div class="bulk-row">
+        <label>从 <input type="date" id="bulk-from"></label>
+        <label>到 <input type="date" id="bulk-to"></label>
+        <button type="button" id="bulk-preview" class="ghost">看看会删哪些</button>
+      </div>
+      <p class="hint">按整条链删：链里每一班都已结束、最新一班是已完成/已合并/已丢弃/已取消、且不占工作树的才删；失败、需要人工的不动。日期按开跑时间算，「从」留空 = 结束日期之前的全部。先列出来，确认了才真删。</p>
+      <div id="bulk-result"></div>
+    </details>
     <button type="button" id="cal-toggle" class="cal-toggle">展开日期</button>
     <div id="cal-panel" class="cal-panel" hidden>
       <input type="date" id="cal-jump" class="cal-jump">

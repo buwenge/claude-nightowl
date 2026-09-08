@@ -657,3 +657,10 @@ details.events summary { min-height: 44px; line-height: 44px; }
 .warmup-times .x { min-height: 44px; min-width: 44px; }
 
 html, body { overflow-x: hidden; }
+
+/* 9/8 批量清理 */
+.bulk-row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin: 4px 0 8px; }
+.bulk-row label { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; }
+.bulk-row input[type="date"] { min-height: 44px; }
+.bulk-list { padding-left: 18px; font-size: 14px; margin: 6px 0 10px; }
+.bulk-list li { margin: 2px 0; word-break: break-all; }

@@ -233,6 +233,58 @@ function renderOrphans(orphans) {
   box.appendChild(det);
 }
 
+/* ---------- 9/8 批量清理已收尾的任务 ---------- */
+
+function bulkRange() {
+  var toRaw = $("bulk-to").value, fromRaw = $("bulk-from").value;
+  if (!toRaw) { banner("先选结束日期", { sticky: true }); return null; }
+  // 日期框给的是 YYYY-MM-DD；不带时区的 T 写法按浏览器本地时间解析，
+  // 结束日含当天、开始日从零点起，再换成 UTC 秒级 ISO 给服务器
+  var to = new Date(toRaw + "T23:59:59");
+  var from = fromRaw ? new Date(fromRaw + "T00:00:00") : null;
+  if (isNaN(to) || (from && isNaN(from))) { banner("日期认不出来", { sticky: true }); return null; }
+  var iso = function (d) { return d.toISOString().replace(/\.\d{3}Z$/, "Z"); };
+  return { from: from ? iso(from) : null, to: iso(to) };
+}
+
+function bulkPreview() {
+  var range = bulkRange();
+  if (!range) return;
+  var box = $("bulk-result");
+  box.textContent = "查询中…";
+  api("POST", "./api/tasks/bulk-delete", { from: range.from, to: range.to, dry_run: true })
+    .then(function (data) {
+      box.textContent = "";
+      var chains = data.chains || [];
+      if (!chains.length) {
+        box.appendChild(el("p", { class: "hint", text: "这段时间没有可删的链（要已收尾且不占工作树）。" }));
+        return;
+      }
+      box.appendChild(el("p", { text: "将删除 " + chains.length + " 条链、共 " + data.task_count + " 个任务：" }));
+      var ul = el("ul", { class: "bulk-list" });
+      chains.forEach(function (c) {
+        ul.appendChild(el("li", {
+          text: fmtLocal(c.run_at) + " · " + c.title + "（" + (STATE_TEXT[c.state] || c.state) + "，" + c.tasks.length + " 班）"
+        }));
+      });
+      box.appendChild(ul);
+      box.appendChild(el("button", {
+        type: "button", class: "danger solid", text: "确认删除这 " + data.task_count + " 个任务",
+        onclick: function () {
+          if (!confirm("真的删除这 " + chains.length + " 条链（" + data.task_count + " 个任务）？任务目录含事件日志会一并清掉，不可恢复。")) return;
+          api("POST", "./api/tasks/bulk-delete", { from: range.from, to: range.to, dry_run: false })
+            .then(function (res) {
+              box.textContent = "";
+              banner("已删除 " + res.task_count + " 个任务");
+              refreshTasks();
+            })
+            .catch(function () {});
+        }
+      }));
+    })
+    .catch(function () { box.textContent = ""; });
+}
+
 function refreshQuota(withConfig) {
   api("GET", "./api/quota").then(function (data) {
     renderQuota(data || {});
@@ -1845,6 +1897,7 @@ function start() {
     if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = null; }
   });
   $("tab-tasks").addEventListener("click", function () { showView("tasks"); });
+  $("bulk-preview").addEventListener("click", bulkPreview);
   $("tab-new").addEventListener("click", enterCreate);
   $("tab-tpl").addEventListener("click", function () { showView("tpl"); });
   // 触发方式单选：切显示"按时间/等前置"

@@ -1281,6 +1281,78 @@ def test_force_stop_active_task_closes_window_and_cancels(authed, monkeypatch):
     assert "关不掉" in (store.task_dir(gone) / "events.log").read_text(encoding="utf-8")
 
 
+def _mk_dated(authed, title, run_at, **status):
+    st, _, body = authed.request("POST", "/api/tasks", {
+        "title": title, "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": run_at,
+        "task_text": "正文", "prompt_final": "提示词",
+    })
+    assert st == 201, body
+    if status:
+        store.update_status(body["id"], **status)
+    return body["id"]
+
+
+def _chain_after(parent_id, child_id, shift):
+    t = store.load_task(child_id)
+    t["pipeline_id"] = parent_id
+    t["shift"] = shift
+    store.atomic_write_json(store.task_dir(child_id) / "task.json", t)
+
+
+def test_bulk_delete_whole_chains_in_date_range(authed):
+    """9/8 一键清理：按整条链删两个日期之间已收尾的；dry_run 只列；from 留空 =
+    to 之前全部；失败/占树/未收尾/范围外的不碰。"""
+    # A：两班链 9/1 chained → 9/2 finished（可删，两班一起）
+    a1 = _mk_dated(authed, "A 一班", "2026-09-01T10:00:00Z", state="chained")
+    a2 = _mk_dated(authed, "A 二班", "2026-09-02T10:00:00Z", state="finished")
+    _chain_after(a1, a2, 2)
+    # B：merged 但占着工作树 → 不碰
+    b = _mk_dated(authed, "B 占树", "2026-09-03T10:00:00Z", state="merged", worktree_path="/x/tree")
+    # C：failed → 不碰
+    c = _mk_dated(authed, "C 失败", "2026-09-03T11:00:00Z", state="failed")
+    # D：merged 9/4（可删）
+    d = _mk_dated(authed, "D 合并", "2026-09-04T10:00:00Z", state="merged")
+    # E：finished 但在范围外（9/6）
+    e = _mk_dated(authed, "E 太晚", "2026-09-06T10:00:00Z", state="finished")
+    # F：还没跑（scheduled）→ 不碰
+    f = _mk_dated(authed, "F 排班中", "2026-09-01T12:00:00Z")
+    # G：链最新一班 exited（不是完成/合并）→ 不碰
+    g = _mk_dated(authed, "G 退出", "2026-09-02T12:00:00Z", state="exited")
+
+    # 缺 to → 400；from 晚于 to → 400
+    st, _, body = authed.request("POST", "/api/tasks/bulk-delete", {"dry_run": True})
+    assert st == 400 and "to" in body["error"]
+    st, _, _ = authed.request("POST", "/api/tasks/bulk-delete",
+                              {"from": "2026-09-05T00:00:00Z", "to": "2026-09-01T00:00:00Z"})
+    assert st == 400
+
+    # dry_run：from 留空 = 9/5 之前全部 → A（两班）+ D
+    st, _, body = authed.request("POST", "/api/tasks/bulk-delete",
+                                 {"from": None, "to": "2026-09-05T15:59:59Z", "dry_run": True})
+    assert st == 200 and body["deleted"] is False
+    assert [ch["id"] for ch in body["chains"]] == [a1, d]
+    assert body["task_count"] == 3
+    a_chain = body["chains"][0]
+    assert a_chain["tasks"] == [a1, a2] and a_chain["state"] == "finished" and a_chain["title"] == "A 一班"
+    assert store.task_dir(a1).is_dir() and store.task_dir(d).is_dir()  # 只列没删
+
+    # 给了 from：只剩 D
+    st, _, body = authed.request("POST", "/api/tasks/bulk-delete",
+                                 {"from": "2026-09-03T00:00:00Z", "to": "2026-09-05T00:00:00Z", "dry_run": True})
+    assert [ch["id"] for ch in body["chains"]] == [d]
+
+    # 真删：A 两班 + D 目录没了，其余都在
+    st, _, body = authed.request("POST", "/api/tasks/bulk-delete",
+                                 {"from": None, "to": "2026-09-05T15:59:59Z", "dry_run": False})
+    assert st == 200 and body["deleted"] is True and body["task_count"] == 3
+    for gone in (a1, a2, d):
+        assert not store.task_dir(gone).exists()
+    for kept in (b, c, e, f, g):
+        assert store.task_dir(kept).is_dir()
+    assert sorted(i["task"]["id"] for i in store.list_tasks()) == sorted([b, c, e, f, g])
+
+
 def test_list_omits_big_text_fields_but_detail_keeps_them(authed):
     """9/8 列表瘦身：/api/tasks 不带 task_text / prompt_final（21 条任务 125 KB
     是手机端"卡半天"的元凶），详情接口照旧全量（编辑页按需拉）。"""
