@@ -579,22 +579,29 @@ function pipelineWindowActions(chain) {
     var t = item.task, s = item.status || {};
     var live = s.window_id && !s.session_ended_at;
     if (!live) return;
+    // 9/8：审完（verdict 已落盘、不是 pending）的审稿窗不再出按钮——调度器会把它
+    // 关掉；旧链里还开着的也没什么可看，意见在下面的详情里
+    if (t.role === "review" && s.review_verdict && s.review_verdict !== "pending") return;
     var roleLabel = t.role === "review" ? "审稿" : "施工";
-    add("看" + roleLabel + "屏幕", "", function () {
-      openScreen(t.id, t.title + "（" + roleLabel + "）"); return null;
+    // 9/8：按钮带轮次/班号——六轮审稿六扇窗全叫"看审稿屏幕"，工头分不清哪个是哪个
+    var tag = t.role === "review"
+      ? "第 " + (t.round || 1) + " 轮" + roleLabel
+      : roleLabel + "第 " + (t.shift || 1) + " 班";
+    add("看" + tag + "屏幕", "", function () {
+      openScreen(t.id, t.title + "（" + tag + "）"); return null;
     });
-    add("给" + roleLabel + "捎话", "", function () {
-      openMsg(t.id, t.title + "（" + roleLabel + "）", item.draft); return null;
+    add("给" + tag + "捎话", "", function () {
+      openMsg(t.id, t.title + "（" + tag + "）", item.draft); return null;
     });
     if (ACTIVE_STATES.indexOf(s.state) >= 0) {
-      add("中止" + roleLabel, s.stuck ? "danger solid" : "danger", function () {
-        if (!confirm("往" + roleLabel + "窗口按一下 Esc？它会停下当前这轮，等你看了屏幕再说。")) return null;
+      add("中止" + tag, s.stuck ? "danger solid" : "danger", function () {
+        if (!confirm("往" + tag + "窗口按一下 Esc？它会停下当前这轮，等你看了屏幕再说。")) return null;
         return api("POST", "./api/tasks/" + t.id + "/interrupt")
           .then(function () { banner("已发出，看屏幕确认"); refreshTasks(); })
           .catch(function () {});
       });
-      add("停" + roleLabel + "后台", "", function () {
-        if (!confirm("往" + roleLabel + "窗口敲停后台指令？")) return null;
+      add("停" + tag + "后台", "", function () {
+        if (!confirm("往" + tag + "窗口敲停后台指令？")) return null;
         return api("POST", "./api/tasks/" + t.id + "/stop-background")
           .then(function () { banner("已发出，看屏幕确认"); refreshTasks(); })
           .catch(function () {});
@@ -1028,8 +1035,13 @@ function chainCard(chain, now) {
     var row = el("div", { class: "shifts" });
     chain.shifts.forEach(function (it, i) {
       var st = it.status.state || "-";
+      // 9/8：全局班号混着审稿班与同会话返工，看着像预算被吃光——审稿班标轮次，
+      // 施工班标"施工第几班"（同角色续班计数 role_shift，才是 chain.max_windows 比的数）
+      var label = it.task.role === "review"
+        ? "第 " + (it.task.round || 1) + " 轮审稿"
+        : "施工第 " + (it.task.role_shift || 1) + " 班";
       row.appendChild(el("span", { class: "shift-item" }, [
-        el("span", { text: "第 " + (it.task.shift || i + 1) + " 班 " + (it.task.role === "review" ? "（审）" : "") }),
+        el("span", { text: label + " (#" + (it.task.shift || i + 1) + ") " }),
         el("span", { class: "chip st-" + st, text: STATE_TEXT[st] || st })
       ]));
     });
@@ -1037,6 +1049,20 @@ function chainCard(chain, now) {
     card.insertBefore(row, card.children[1]);
   }
   if (hasReview) {
+    // 9/8：把两条真正在比的数摆出来——施工连开几班（上限 chain.max_windows）、
+    // 返工几轮（上限 review.max_rounds）——"第 14 班"那种全局号不是预算
+    var coordStatus = (pipelineCoordinatorItem(chain).status) || {};
+    var buildShifts = chain.shifts.filter(function (it) { return (it.task.role || "build") === "build"; });
+    var usedBuild = buildShifts.reduce(function (m, it) { return Math.max(m, it.task.role_shift || 1); }, 0);
+    var chainCfg = chain.latest.task.chain || {};
+    var maxBuild = typeof chainCfg.max_windows === "number" ? chainCfg.max_windows
+      : ((CFG.chain && typeof CFG.chain.max_windows === "number") ? CFG.chain.max_windows : "?");
+    var reviewCfg = chain.latest.task.review || {};
+    var maxRounds = typeof reviewCfg.max_rounds === "number" ? reviewCfg.max_rounds
+      : ((CFG.review && typeof CFG.review.max_rounds === "number") ? CFG.review.max_rounds : "?");
+    card.insertBefore(el("div", { class: "task-meta", text:
+      "施工连开 " + usedBuild + "/" + maxBuild + " 班 · 返工 " + (coordStatus.fix_count || 0) + "/" + maxRounds + " 轮"
+    }), card.children[2]);
     var winActions = pipelineWindowActions(chain);
     if (winActions) card.appendChild(winActions);
     var ctrlActions = pipelineControlActions(chain);

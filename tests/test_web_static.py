@@ -355,10 +355,16 @@ def test_app_js_pipeline_window_actions_are_role_aware():
     for piece in (
         "function pipelineWindowActions(chain)",
         'var roleLabel = t.role === "review" ? "审稿" : "施工";',
-        '"看" + roleLabel + "屏幕"',
-        '"给" + roleLabel + "捎话"',
-        '"中止" + roleLabel',
-        '"停" + roleLabel + "后台"',
+        # 9/8：按钮带轮次/班号，审完的审稿窗不出按钮
+        'if (t.role === "review" && s.review_verdict && s.review_verdict !== "pending") return;',
+        '? "第 " + (t.round || 1) + " 轮" + roleLabel',
+        ': roleLabel + "第 " + (t.shift || 1) + " 班";',
+        '"看" + tag + "屏幕"',
+        '"给" + tag + "捎话"',
+        '"中止" + tag',
+        '"停" + tag + "后台"',
+        # 卡片上摆两条真正在比的数
+        '"施工连开 " + usedBuild + "/" + maxBuild + " 班 · 返工 "',
     ):
         assert piece in js, piece
 
