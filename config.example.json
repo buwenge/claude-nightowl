@@ -98,12 +98,6 @@
     "secure_cookie": true,
     "cookie_days": 365
   },
-  "wellness": {
-    "http": {
-      "host": "127.0.0.1",
-      "port": 8191
-    }
-  },
   "scheduler": {
     "interval_seconds": 30,
     "launch_grace_seconds": 180,
