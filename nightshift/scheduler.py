@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
-import re
 import sys
 import time
 import uuid
@@ -110,11 +109,6 @@ DEFAULT_CHAIN_STOP_ALARM_TEXT = (
     "来自nightshift：交接已收到，下一班已经开了。请用 ScheduleWakeup stop "
     "撤掉闹钟，然后停下，不要再干活。"
 )
-# 交接文件末行的换班指令（设计稿 §4.4）
-_RE_NEXT_CONTINUE = re.compile(r"^NEXT:\s*continue\s*$")
-_RE_NEXT_DONE = re.compile(r"^NEXT:\s*done\s*$")
-
-
 def parse_iso(s: str) -> datetime:
     """ISO 字符串 → aware UTC datetime；裸时间按 UTC 处理。"""
     dt = datetime.fromisoformat(s)
@@ -1819,10 +1813,6 @@ def _mark_chain_evaluated(task: dict, status: dict) -> dict:
     return status
 
 
-def _last_nonempty_line(text: str) -> str:
-    return [ln for ln in (ln.strip() for ln in text.splitlines()) if ln][-1]
-
-
 def _chain_eval_failed(
     task: dict, config: dict, now: datetime, exc: Exception
 ) -> list[str]:
@@ -1917,11 +1907,11 @@ def _handover_verdict(
 ) -> list[str]:
     """有交接时的判定（idle 与 exited 共用）：末行 NEXT: done → 完工分流；
     NEXT: continue（或没写 NEXT，按 continue）→ 续班。"""
-    last = _last_nonempty_line(text)
-    if _RE_NEXT_DONE.match(last):
+    verdict = store.next_marker(text)
+    if verdict == "done":
         return _finalize_done(task, config, now)
     note = ""
-    if not _RE_NEXT_CONTINUE.match(last):
+    if verdict != "continue":
         note = "（交接末行没写 NEXT，按 continue）"
     return _chain_continue(task, status, config, now, handover_text=text, note=note)
 

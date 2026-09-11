@@ -980,3 +980,15 @@ def test_create_successor_codex_context_limit_placeholder_is_human_text():
     assert succ["prompt_final"].startswith("上限 暂无稳定水位来源\n")
     assert "None" not in succ["prompt_final"]
     assert "1000000" not in succ["prompt_final"]  # 不能借用 default_context_limit
+
+
+def test_next_marker_reads_last_nonempty_line_only():
+    """交接文件 / 最终回复末行的换班指令：只认最后一个非空行、大小写与空白
+    按原 scheduler 正则口径（`NEXT:` 后任意空白，行尾允许空白）。"""
+    assert store.next_marker("做了一半。\n\nNEXT: continue\n\n") == "continue"
+    assert store.next_marker("全部完成。\nNEXT:done  ") == "done"
+    assert store.next_marker("NEXT: continue\n还有一句在后面") is None
+    assert store.next_marker("NEXT: Continue") is None  # 大小写不放宽
+    assert store.next_marker("NEXT: continue 吧") is None
+    assert store.next_marker("") is None
+    assert store.next_marker("   \n\n") is None

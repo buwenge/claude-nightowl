@@ -136,6 +136,26 @@ CODEX_BACKGROUND_INSTRUCTION = (
     "主动把结果敲给你再继续。禁止裸用 `&`/`nohup`/`setsid`，禁止自己 fork 脱离——"
     "那样起的后台进程在这次工具调用判定完成时会被沙箱一并回收，永远不会跑完。"
 )
+# build 交接协议的末行指令（设计稿 §4.4）——交接文件末行 / 最终回复末行
+# 都用 next_marker 判，scheduler 与 hook 共用一个口径。
+_RE_NEXT_CONTINUE = re.compile(r"^NEXT:\s*continue\s*$")
+_RE_NEXT_DONE = re.compile(r"^NEXT:\s*done\s*$")
+
+
+def next_marker(text: str) -> str | None:
+    """最后一个非空行严格是 `NEXT: continue` / `NEXT: done` → 返回
+    "continue" / "done"；别的（含空文本）→ None。"""
+    lines = [ln for ln in (ln.strip() for ln in text.splitlines()) if ln]
+    if not lines:
+        return None
+    last = lines[-1]
+    if _RE_NEXT_DONE.match(last):
+        return "done"
+    if _RE_NEXT_CONTINUE.match(last):
+        return "continue"
+    return None
+
+
 # review.merge_policy 只认这两个值
 _MERGE_POLICIES = ("manual", "auto")
 # S7：review 对象只认这七个键；旧任务/S5 占位对象（只有 enabled/merge_policy）
