@@ -120,7 +120,7 @@ def parse_usage(text: str) -> dict:
 
 def usage_from_shared_rate_limits(doc: dict, labels: dict | None = None, now: datetime | None = None) -> dict:
     """共享水位文件 → 与 parse_usage 同形的额度 dict。
-    文件格式（/root/.claude/statusline.py 与小予 usage_quota.py 共同维护）：
+    文件格式（由状态栏脚本与别的写方共同维护，见 docs/statusline_rate_limits.py）：
         {"updated_at": epoch, "source": "statusline", "model": "...",
          "windows": {"five_hour": {"utilization": 9.0, "resets_at": "<ISO UTC>", "at": epoch},
                      "seven_day": {...}, "seven_day_overage_included": {...}}}
