@@ -4,3 +4,4 @@ __pycache__/
 /.debt-registry.json
 /data/
 *.bak
+/CLAUDE.md
