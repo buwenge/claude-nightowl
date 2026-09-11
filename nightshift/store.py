@@ -156,6 +156,18 @@ def next_marker(text: str) -> str | None:
     return None
 
 
+# 9/11：开班提示词里的交接协议前言（build 角色）。以前交接文件路径只在
+# 上下文到线提醒里给，一班没撞线就主动收工的模型不知道该往哪写、只会把
+# NEXT: continue 写进最终回复（hook 现在会替它落盘兜底，但交接正文
+# "已完成/未完成/下一步"还是该由模型自己按格式写）。launcher._prompt_text()
+# 运行时追加一次，跟 WORKTREE/CODEX_BACKGROUND 两条同一个模式；
+# {handover_path} 按班次现算，去重按渲染后的整句比对。
+HANDOVER_INSTRUCTION = (
+    "收工或换班时把已完成/未完成/下一步写进交接文件 {handover_path}，"
+    "末行写 NEXT: done（干完了）或 NEXT: continue（没干完，调度器会按交接开下一班接着做），"
+    "然后停下。"
+)
+
 # review.merge_policy 只认这两个值
 _MERGE_POLICIES = ("manual", "auto")
 # S7：review 对象只认这七个键；旧任务/S5 占位对象（只有 enabled/merge_policy）

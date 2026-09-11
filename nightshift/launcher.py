@@ -14,7 +14,7 @@ import tomllib
 import uuid
 from pathlib import Path
 
-from . import background_runner, store, worktree
+from . import background_runner, hook, store, worktree
 
 __all__ = [
     "CodexTrustError",
@@ -483,6 +483,15 @@ def _prompt_text(task: dict) -> str:
         and store.CODEX_BACKGROUND_INSTRUCTION not in text
     ):
         text = store.CODEX_BACKGROUND_INSTRUCTION + "\n\n" + text
+    # 9/11：build 角色末尾追加交接协议（文件路径按本班现算）——以前路径只在
+    # 到线提醒里给，没撞线就收工的班不知道往哪写交接。review 角色有自己的
+    # NEXT 三选一协议，不加。
+    if store.role_of(task) == "build":
+        handover_line = store.render(
+            store.HANDOVER_INSTRUCTION, handover_path=str(hook.handover_path(task))
+        )
+        if handover_line not in text:
+            text = text + "\n\n" + handover_line
     return text
 
 

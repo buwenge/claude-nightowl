@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from nightshift import launcher, store, worktree
+from nightshift import hook, launcher, store, worktree
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -71,6 +71,14 @@ def make_task(project_path: str | None = None, **over):
 # ---------- 纯函数部分 ----------
 
 
+
+def _handover_line(task_id: str) -> str:
+    """9/11：build 角色 prompt.txt 末尾追加的交接协议（路径按本班现算）。"""
+    task = store.load_task(task_id)
+    return store.render(
+        store.HANDOVER_INSTRUCTION, handover_path=str(hook.handover_path(task))
+    )
+
 def test_hook_settings_six_events():
     """总review二 G15（B④-5）：PreCompact 删掉了（只记一行没人读的日志，
     每次 compact 还多起一个 python 进程）。"""
@@ -129,7 +137,10 @@ def test_write_task_files(tmp_path):
     # 且原文仍在；老式任务（显式 false）prompt.txt 与 prompt_final 一字不差
     prompt_txt = (d / "prompt.txt").read_text(encoding="utf-8")
     assert prompt_txt.startswith(store.WORKTREE_INSTRUCTION)
-    assert prompt_txt.endswith(task["prompt_final"])
+    # 9/11：build 角色末尾再追加一条交接协议（带本班交接文件的绝对路径），
+    # 任务原文夹在中间原样不动
+    assert prompt_txt.endswith(task["prompt_final"] + "\n\n" + _handover_line(task_id))
+    assert str(d / "handover-1.md") in prompt_txt
     task_id2, config2 = make_task(
         project_path="/home/user/projects/demo", worktree=False
     )
@@ -138,7 +149,7 @@ def test_write_task_files(tmp_path):
     )
     assert (store.task_dir(task_id2) / "prompt.txt").read_text(
         encoding="utf-8"
-    ) == store.load_task(task_id2)["prompt_final"]
+    ) == store.load_task(task_id2)["prompt_final"] + "\n\n" + _handover_line(task_id2)
 
 
 def test_claude_bin_env_override(tmp_path, monkeypatch):
@@ -480,7 +491,9 @@ def test_write_task_files_codex_includes_f12_instruction_once(tmp_path):
     prompt_txt = (store.task_dir(task_id) / "prompt.txt").read_text(encoding="utf-8")
     assert prompt_txt.count(store.CODEX_BACKGROUND_INSTRUCTION) == 1
     assert store.WORKTREE_INSTRUCTION in prompt_txt  # 新任务缺省建树，两条前言都该在
-    assert prompt_txt.endswith(task["prompt_final"])
+    assert prompt_txt.endswith(task["prompt_final"] + "\n\n" + _handover_line(task_id))
+    # Codex 班的交接文件在 background/（沙箱唯一可写目录），提示词里给的就是它
+    assert str(store.task_dir(task_id) / "background" / "handover-1.md") in prompt_txt
 
 
 def test_write_task_files_codex_resume_also_includes_f12_instruction(tmp_path):
@@ -505,7 +518,7 @@ def test_write_task_files_codex_custom_prompt_file_still_gets_instruction_once(t
     launcher.write_task_files(task, config, None)
     prompt_txt = (store.task_dir(task_id) / "prompt.txt").read_text(encoding="utf-8")
     assert prompt_txt.count(store.CODEX_BACKGROUND_INSTRUCTION) == 1
-    assert prompt_txt.endswith(task["prompt_final"])
+    assert prompt_txt.endswith(task["prompt_final"] + "\n\n" + _handover_line(task_id))
 
     # 用户自己的文本碰巧已经包含这条协议：不能变成两遍
     task2_id, config2 = make_task_codex(project_path="/home/user/projects/demo", worktree=False)
@@ -554,7 +567,36 @@ def test_write_task_files_claude_prompt_not_padded_with_codex_instruction(tmp_pa
     launcher.write_task_files(task, config, "01234567-89ab-cdef-0123-456789abcdef")
     prompt_txt = (store.task_dir(task_id) / "prompt.txt").read_text(encoding="utf-8")
     assert store.CODEX_BACKGROUND_INSTRUCTION not in prompt_txt
+    assert prompt_txt == task["prompt_final"] + "\n\n" + _handover_line(task_id)
+
+
+def test_write_task_files_handover_instruction_once_and_build_only(tmp_path):
+    """9/11：交接协议只对 build 角色追加、只追加一次——用户全文里已经原样
+    带着这句（比如从上一班 prompt.txt 抄来的）不能变两遍；review 角色有自己
+    的 NEXT 三选一协议，一个字都不加。"""
+    task_id, config = make_task(project_path="/home/user/projects/demo", worktree=False)
+    task = store.load_task(task_id)
+    task["prompt_final"] = "自定义全文。\n\n" + _handover_line(task_id)
+    store.atomic_write_json(store.task_dir(task_id) / "task.json", task)
+    launcher.write_task_files(task, config, "01234567-89ab-cdef-0123-456789abcdef")
+    prompt_txt = (store.task_dir(task_id) / "prompt.txt").read_text(encoding="utf-8")
     assert prompt_txt == task["prompt_final"]
+    assert prompt_txt.count("写进交接文件") == 1
+
+    review_id, review_config = make_task(
+        project_path="/home/user/projects/demo",
+        review={"enabled": True, "runner": "claude", "model": "claude-fable-5", "effort": "high"},
+    )
+    review_task = store.load_task(review_id)
+    review_task["role"] = "review"
+    review_task["round"] = 1
+    store.atomic_write_json(store.task_dir(review_id) / "task.json", review_task)
+    review_task = store.load_task(review_id)
+    store.update_status(review_id, worktree_path="/home/user/projects/demo")
+    launcher.write_task_files(review_task, review_config, "01234567-89ab-cdef-0123-456789abcdee")
+    review_prompt = (store.task_dir(review_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert review_prompt == review_task["prompt_final"]
+    assert "写进交接文件" not in review_prompt
 
 
 def test_launch_codex_same_role_successor_starts_fresh_session(tmp_path, monkeypatch):
@@ -763,7 +805,7 @@ def test_launch_full_cycle(tmux_session, trusted_env, tmp_path):
     # S5：新任务缺省建树，prompt.txt 前面多了运行时安全前言，任务原文原样跟在后面
     assert prompt_arg == store.WORKTREE_INSTRUCTION + "\n\n" + (
         "第一行 有空格\n第二行 *.py $HOME it's\n第三行"
-    )
+    ) + "\n\n" + _handover_line(task_id)
 
 
 def test_launch_untrusted_opens_failure_window(tmux_session, trusted_env, tmp_path):
