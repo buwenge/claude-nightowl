@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from nightshift import store
+from nightshift import hook, store
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1049,6 +1049,64 @@ def test_stop_build_role_never_writes_review_file():
     status = store.read_status(task_id)
     assert "review_verdict" not in status
     assert not (store.task_dir(task_id) / "review-1.md").exists()
+
+
+# ---------- 9/11：交接只写在最终回复里、没落文件 → hook 替它落盘 ----------
+
+
+def test_stop_build_reply_with_next_continue_materializes_handover():
+    """一班没撞上下文线就主动收工的模型不知道交接文件在哪（路径只在到线
+    提醒里给），把 NEXT: continue 写在最终回复里——Stop 时替它存成
+    handover-<shift>.md，调度器照常按文件换班。"""
+    task_id = make_task()
+    text = "任务一做完了。\n\n未完成：任务二。\n\nNEXT: continue"
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc.returncode == 0 and proc.stdout == ""
+    status = store.read_status(task_id)
+    assert status["state"] == "idle"
+    path = hook.handover_path(store.load_task(task_id))
+    assert path == store.task_dir(task_id) / "handover-1.md"
+    assert path.read_text(encoding="utf-8") == text + "\n"
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "已替它存为 handover-1.md" in events
+    assert "NEXT: continue" in events
+
+
+def test_stop_codex_build_reply_with_next_materializes_handover_in_background_dir():
+    """Codex 班同一套：文件落在 background/（沙箱唯一可写目录，也是
+    scheduler._handover_file 读的地方），末行 done 也一样落文件。"""
+    task_id = make_task_codex()
+    text = "全部做完并验收。\nNEXT: done"
+    proc = run_codex_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+    assert proc.returncode == 0 and proc.stdout == ""
+    assert store.read_status(task_id)["state"] == "idle"
+    path = hook.handover_path(store.load_task(task_id))
+    assert path == store.task_dir(task_id) / "background" / "handover-1.md"
+    assert path.read_text(encoding="utf-8") == text + "\n"
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "hook Stop(codex) 交接只写在最终回复里（末行 NEXT: done）" in events
+
+
+def test_stop_build_reply_never_overwrites_model_written_handover():
+    """模型自己写过交接（到线提醒那条路）→ 只补不盖，文件原样。"""
+    task_id = make_task()
+    path = hook.handover_path(store.load_task(task_id))
+    path.write_text("模型自己写的交接。\nNEXT: continue\n", encoding="utf-8")
+    proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": "收尾完毕。\nNEXT: done"}))
+    assert proc.returncode == 0
+    assert path.read_text(encoding="utf-8") == "模型自己写的交接。\nNEXT: continue\n"
+    events = (store.task_dir(task_id) / "events.log").read_text(encoding="utf-8")
+    assert "已替它存为" not in events
+
+
+def test_stop_build_reply_without_next_writes_nothing():
+    """末行不是 NEXT 指令的普通回复（含缓存闹钟的"·"）不产生交接文件，
+    "没交接 → 正常干完"的一期语义不变。"""
+    task_id = make_task()
+    for text in ("干完了", "·", "NEXT: continue\n再补一句"):
+        proc = run_hook(task_id, "Stop", json.dumps({"last_assistant_message": text}))
+        assert proc.returncode == 0
+    assert not hook.handover_path(store.load_task(task_id)).exists()
 
 
 # ---------- S7.1 阻断二：并发安全 + pending 可继续 + 控制 turn 隔离 ----------

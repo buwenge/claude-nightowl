@@ -179,6 +179,37 @@ def handover_path(task: dict) -> Path:
     return store.task_dir(task["id"]) / f"handover-{shift}.md"
 
 
+def _materialize_reply_handover(task: dict, text: str) -> str | None:
+    """build 班收工时交接只写在最终回复里、没落交接文件 → 替它落盘。
+
+    9/11 真机：两个 Codex 班各在上下文 23% 处主动收工，最终回复末行都是
+    NEXT: continue，但交接文件路径只在上下文到线提醒里给过（这两班没撞线、
+    根本没被告知要写哪个文件），background/ 下空空如也——调度器只认文件，
+    按"没交接也没被提醒 → 正常干完"判了 finished，两条流水线各自断在第一班。
+
+    这里跟审稿角色的 `_handle_review_stop` 同一个思路（审稿意见就是从最终
+    回复正文落成 review-<round>.md 的）：末行是 NEXT: continue/done 的最终
+    回复就是交接，原样存成 handover-<shift>.md，后面调度器的换班判定、
+    exited 补评、H6 重评一概不用改。只补文件、不覆盖：模型自己写过交接
+    （到线提醒那条路）就不动它。非 build 角色、末行没有 NEXT 指令的一律
+    不动。返回要记进 events 的说明（None = 没动）。
+    """
+    if store.role_of(task) != "build":
+        return None
+    verdict = store.next_marker(text)
+    if verdict is None:
+        return None
+    path = handover_path(task)
+    if path.exists():
+        return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        store.atomic_write_text(path, text.strip() + "\n")
+    except OSError as exc:
+        return f"最终回复末行 NEXT: {verdict} 但交接没落文件，替它存 {path.name} 失败：{exc!r}"
+    return f"交接只写在最终回复里（末行 NEXT: {verdict}）→ 已替它存为 {path.name}"
+
+
 def alarm_plan(resets_in: int | None) -> tuple[str, int]:
     """把"几分钟后刷新"排成闹钟串，返回 (文案, 总分钟)。"""
     if resets_in is None:
@@ -1285,8 +1316,14 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
             # 必须在这里消费掉，不能残留到下一次 Stop 被误判成控制 turn。
             status.pop("build_control_kind", None)
 
+        # 先落交接文件再翻 idle：调度器看到 idle 时文件已经在了
+        handover_note = _materialize_reply_handover(
+            task, payload.get("last_assistant_message") or ""
+        )
         store.modify_status(task_id, clear_stuck_cycle_codex)
         store.append_event(task_id, f"hook Stop(codex) → {fields['state']}")
+        if handover_note:
+            store.append_event(task_id, f"hook Stop(codex) {handover_note}")
         return None
 
     elif event == "Stop":
@@ -1325,8 +1362,14 @@ def handle_event(task_id: str, event: str, payload: dict) -> str | None:
                     task_id, "额度刷新时间已过，会话已自行继续/收工，取消调度器补敲"
                 )
 
+        # 先落交接文件再翻 idle：调度器看到 idle 时文件已经在了
+        handover_note = _materialize_reply_handover(
+            task, payload.get("last_assistant_message") or ""
+        )
         store.modify_status(task_id, clear_stuck_cycle)
         store.append_event(task_id, f"hook Stop → {fields['state']}")
+        if handover_note:
+            store.append_event(task_id, f"hook Stop {handover_note}")
         return None
 
     elif event == "PostToolUse" and runner == "codex":
