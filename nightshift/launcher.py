@@ -491,7 +491,9 @@ def _prompt_text(task: dict) -> str:
             store.HANDOVER_INSTRUCTION, handover_path=str(hook.handover_path(task))
         )
         if handover_line not in text:
-            text = text + "\n\n" + handover_line
+            # 用户全文自带末尾换行（--prompt-file 常见）时只再补一个空行
+            sep = "\n" if text.endswith("\n") else "\n\n"
+            text = text + sep + handover_line
     return text
 
 

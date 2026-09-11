@@ -75,7 +75,14 @@ def test_add_prompt_file_gets_runtime_preamble(tmp_path):
     launcher.write_task_files(task, CONFIG, "01234567-89ab-cdef-0123-456789abcdef")
     written = (store.task_dir(task["id"]) / "prompt.txt").read_text(encoding="utf-8")
     assert written.startswith(store.WORKTREE_INSTRUCTION)
-    assert written.endswith("自定义全文，没有前言。\n")
+    # 9/11：末尾再补一条交接协议（自带末尾换行的全文只隔一个空行），原文夹在中间
+    from nightshift import hook
+    handover_line = store.render(
+        store.HANDOVER_INSTRUCTION, handover_path=str(hook.handover_path(task))
+    )
+    assert written == (
+        store.WORKTREE_INSTRUCTION + "\n\n" + "自定义全文，没有前言。\n" + "\n" + handover_line
+    )
 
 
 def test_add_default_runner_is_claude():
