@@ -10,7 +10,7 @@
 - **不许真的起 `claude`**（花钱）。launcher 通过环境变量 `NIGHTSHIFT_CLAUDE_BIN` 换成 `tests/fake_claude.sh` 做集成测试。
 - 测试：在仓库根目录执行 `python3 -m pytest tests -q`，测试写盘一律指 `tmp_path`，`NIGHTSHIFT_HOME` 在测试里必须指向临时目录。
 - 注释、docstring、验收单用中文；标识符英文。
-- 不许 `git add -A`；不许 push；每个 commit 只包含开工令里说的那一部分。
+- 不许 `git add -A`；每个 commit 只包含开工令里说的那一部分。
 
 ## 文档职责
 - `AGENTS.md` 只保存每次施工都适用的稳定规则，不记录当前待办、运行参数、进度或验收结果。
