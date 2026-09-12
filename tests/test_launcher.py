@@ -530,6 +530,59 @@ def test_write_task_files_codex_custom_prompt_file_still_gets_instruction_once(t
     assert prompt_txt2.count(store.CODEX_BACKGROUND_INSTRUCTION) == 1
 
 
+def test_write_task_files_codex_git_instruction_only_for_non_worktree_build(tmp_path):
+    """9/12：不建工作树的 Codex build 班 prompt.txt 带 git 提交写法前言且只一次，
+    顺序是 F12 协议 → git 写法 → 正文；用户全文已含这句不重复；工作树班
+    （本来不许 commit）、review 角色、Claude 任务都不带。"""
+    task_id, config = make_task_codex(project_path="/home/user/projects/demo", worktree=False)
+    task = store.load_task(task_id)
+    launcher.write_task_files(task, config, None)
+    prompt_txt = (store.task_dir(task_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert prompt_txt.count(store.CODEX_GIT_INSTRUCTION) == 1
+    assert prompt_txt.startswith(
+        store.CODEX_BACKGROUND_INSTRUCTION + "\n\n" + store.CODEX_GIT_INSTRUCTION + "\n\n"
+    )
+    assert prompt_txt.endswith(task["prompt_final"] + "\n\n" + _handover_line(task_id))
+
+    # 用户全文碰巧已含这句：不能变两遍
+    dup_id, dup_config = make_task_codex(project_path="/home/user/projects/demo", worktree=False)
+    dup = store.load_task(dup_id)
+    dup["prompt_final"] = store.CODEX_GIT_INSTRUCTION + "\n\n用户自己的正文。"
+    store.atomic_write_json(store.task_dir(dup_id) / "task.json", dup)
+    launcher.write_task_files(dup, dup_config, None)
+    dup_txt = (store.task_dir(dup_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert dup_txt.count(store.CODEX_GIT_INSTRUCTION) == 1
+
+    # 工作树班：WORKTREE_INSTRUCTION 说不要 commit，不再讲提交写法
+    wt_id, wt_config = make_task_codex(project_path="/home/user/projects/demo")
+    wt_task = store.load_task(wt_id)
+    store.update_status(wt_id, worktree_path="/home/user/projects/demo")
+    launcher.write_task_files(wt_task, wt_config, None)
+    wt_txt = (store.task_dir(wt_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert store.WORKTREE_INSTRUCTION in wt_txt
+    assert store.CODEX_GIT_INSTRUCTION not in wt_txt
+
+    # review 角色不带（联动审稿要求 worktree=true，所以照例登记树）
+    rv_id, rv_config = make_task_codex(
+        project_path="/home/user/projects/demo",
+        review={"enabled": True, "runner": "codex", "model": "gpt-5.6-luna", "effort": "high"},
+    )
+    rv = store.load_task(rv_id)
+    rv["role"] = "review"
+    rv["round"] = 1
+    store.atomic_write_json(store.task_dir(rv_id) / "task.json", rv)
+    store.update_status(rv_id, worktree_path="/home/user/projects/demo")
+    launcher.write_task_files(store.load_task(rv_id), rv_config, None)
+    rv_txt = (store.task_dir(rv_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert store.CODEX_GIT_INSTRUCTION not in rv_txt
+
+    # Claude 任务不带
+    cc_id, cc_config = make_task(project_path="/home/user/projects/demo", worktree=False)
+    launcher.write_task_files(store.load_task(cc_id), cc_config, "01234567-89ab-cdef-0123-456789abcdef")
+    cc_txt = (store.task_dir(cc_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert store.CODEX_GIT_INSTRUCTION not in cc_txt
+
+
 def test_write_task_files_codex_review_role_skips_f12_instruction(tmp_path):
     """S7.1 阻断五：F12 后台协议只适用于可写的 build 角色（起长任务、等
     后台完成）——review 角色只读、不该起后台进程，之前只按

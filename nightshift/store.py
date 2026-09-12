@@ -23,6 +23,7 @@ from .context import context_limit_for
 
 __all__ = [
     "CODEX_BACKGROUND_INSTRUCTION",
+    "CODEX_GIT_INSTRUCTION",
     "ConfigInvalid",
     "ConfigMissing",
     "ENDED_STATES",
@@ -135,6 +136,23 @@ CODEX_BACKGROUND_INSTRUCTION = (
     "返回。拿到 running 的 session/process id 后不要再 poll 它，等 nightshift 调度器"
     "主动把结果敲给你再继续。禁止裸用 `&`/`nohup`/`setsid`，禁止自己 fork 脱离——"
     "那样起的后台进程在这次工具调用判定完成时会被沙箱一并回收，永远不会跑完。"
+)
+# 9/12：Codex 班 git 提交写法前言（治标）。Codex 0.15x 的 workspace-write 沙箱
+# 把工作树里的 .git 挂成只读（bwrap ro-bind，没有配置开关）；夜班 Codex 班
+# 一直能 commit 是因为全局 ~/.codex/rules/default.rules 里有 git add/commit 的
+# allow 规则——allow 的含义是"整条命令在沙箱外跑"，而 `bash -lc "a; b"` 逐段
+# 匹配取最严格：混进 python heredoc / tail 之类没规则的段，整条就回到沙箱，
+# 报 `index.lock: Read-only file system`（9/12 M2 review 第 1 班实录，全文
+# moving/reports/夜班Codex班git只读与Esc后误判完成-20260912.md）。根治（夜班
+# 自己生成 rules 文件）待拍板，这条只告诉模型把 git 命令单独成条。
+# 只对不建工作树的 Codex build 班追加——工作树班本来就不许 commit
+# （WORKTREE_INSTRUCTION），再讲提交写法是自相矛盾。
+CODEX_GIT_INSTRUCTION = (
+    "git add / git commit 这类要写 .git 的命令必须单独成一条命令跑，一条里只放 git "
+    "子命令，不要跟 python/tail/cat/heredoc 等其它命令拼进同一段脚本：沙箱把 .git "
+    "挂成只读，只有整条都是 git 命令才会在沙箱外执行，拼了别的整条就回沙箱、报 "
+    "`index.lock: Read-only file system`。遇到这个报错不是权限坏了，把 git 命令"
+    "拆出来单独再跑一次就行。"
 )
 # build 交接协议的末行指令（设计稿 §4.4）——交接文件末行 / 最终回复末行
 # 都用 next_marker 判，scheduler 与 hook 共用一个口径。

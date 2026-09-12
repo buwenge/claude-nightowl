@@ -477,6 +477,16 @@ def _prompt_text(task: dict) -> str:
     # S7.1 阻断五：F12 后台协议只适用于可写的 build 角色（起长任务、等
     # 后台完成）——review 角色只读、不该起后台进程，硬塞这段协议只会诱导
     # 它去做不该做的事。
+    # 9/12：不建工作树的 Codex build 班再追加 git 提交写法前言（.git 只读、
+    # 只有纯 git 命令才在沙箱外跑），先于 F12 那条拼进去，最终顺序是
+    # F12 协议 → git 写法 → 正文。
+    if (
+        store.effective_runner(task) == "codex"
+        and store.role_of(task) == "build"
+        and not worktree.wants_worktree(task)
+        and store.CODEX_GIT_INSTRUCTION not in text
+    ):
+        text = store.CODEX_GIT_INSTRUCTION + "\n\n" + text
     if (
         store.effective_runner(task) == "codex"
         and store.role_of(task) == "build"
