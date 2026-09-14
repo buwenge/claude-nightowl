@@ -191,8 +191,10 @@ function showView(name) {
   VIEWS.forEach(function (v) {
     $("view-" + v).hidden = v !== name;
     $("tab-" + v).setAttribute("aria-selected", v === name ? "true" : "false");
+    $("tab-" + v).setAttribute("aria-current", v === name ? "page" : "false");
   });
-  if (name === "tasks") { refreshTasks(); refreshQuota(); window.scrollTo(0, 0); }
+  window.scrollTo(0, 0);
+  if (name === "tasks") { refreshTasks(); refreshQuota(); }
   if (name === "new") refreshTriggerChoices();
   if (name === "tpl") loadTemplatesView();
 }
@@ -968,12 +970,18 @@ function renderTasks(items) {
   var shown = SELECTED_DAY
     ? items.filter(function (it) { return dayKeyFromIso(it.task.run_at) === SELECTED_DAY; })
     : items;
+  $("task-count").textContent = groupChains(shown).length + " 条任务" + (SELECTED_DAY ? " · 已筛选" : "");
   if (!items.length) {
-    list.appendChild(el("p", { class: "hint", text: "还没有任务。去「新建」页排一个夜班吧。" }));
+    list.appendChild(el("div", { class: "empty-state" }, [
+      el("span", { class: "empty-mark", text: "☾", "aria-hidden": "true" }),
+      el("h3", { text: "今晚，从一件小事开始" }),
+      el("p", { text: "还没有任务。写下想做的事，让夜班替你照看进展。" }),
+      el("button", { type: "button", class: "primary", text: "安排第一个任务", onclick: enterCreate })
+    ]));
     return;
   }
   if (!shown.length) {
-    list.appendChild(el("p", { class: "hint", text: SELECTED_DAY + " 没有任务。" }));
+    list.appendChild(el("p", { class: "empty-state", text: SELECTED_DAY + " 没有任务，可以换个日期看看。" }));
     return;
   }
   var chains = groupChains(shown);
@@ -1917,6 +1925,8 @@ function saveTemplates() {
 /* ---------- 启动 ---------- */
 
 function start() {
+  // 手机优先露出任务；折叠状态只在首次进入时设定，刷新数据不打扰用户。
+  $("quota-box").open = !window.matchMedia("(max-width: 640px)").matches;
   // G16：sticky 横幅的手动关闭按钮
   $("banner-close").addEventListener("click", function () {
     $("banner").classList.remove("show");
@@ -1925,6 +1935,7 @@ function start() {
   $("tab-tasks").addEventListener("click", function () { showView("tasks"); });
   $("bulk-preview").addEventListener("click", bulkPreview);
   $("tab-new").addEventListener("click", enterCreate);
+  $("btn-create").addEventListener("click", enterCreate);
   $("tab-tpl").addEventListener("click", function () { showView("tpl"); });
   // 触发方式单选：切显示"按时间/等前置"
   Array.prototype.forEach.call(
@@ -1975,6 +1986,7 @@ function start() {
   $("cal-toggle").addEventListener("click", function () {
     CAL_OPEN = !CAL_OPEN;
     $("cal-panel").hidden = !CAL_OPEN;
+    $("cal-toggle").setAttribute("aria-expanded", String(CAL_OPEN));
     $("cal-toggle").textContent = CAL_OPEN ? "收起日期" : "展开日期";
   });
   $("cal-prev").addEventListener("click", function () {

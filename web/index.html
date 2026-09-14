@@ -2,50 +2,68 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>夜猫子 · 任务台</title>
 <link rel="stylesheet" href="./style.css">
 </head>
-<body>
+<body class="workspace">
+<a class="skip-link" href="#main-content">跳到内容</a>
 <div id="banner" role="alert">
   <span id="banner-text"></span>
   <button type="button" id="banner-close" aria-label="关闭提示" hidden>×</button>
 </div>
 
 <header class="topbar">
-  <a id="link-home" class="ghost home-link" hidden></a>
-  <div class="brand">🦉 夜猫子</div>
+  <div class="brand"><span class="brand-mark" aria-hidden="true">☾</span><span>夜猫子<small>NIGHTSHIFT</small></span></div>
+  <p class="nav-label">你的夜班空间</p>
   <nav class="seg" aria-label="页面切换">
-    <button type="button" id="tab-tasks" aria-selected="true">任务</button>
-    <button type="button" id="tab-new" aria-selected="false">新建</button>
-    <button type="button" id="tab-tpl" aria-selected="false">模板</button>
+    <button type="button" id="tab-tasks" aria-selected="true" aria-controls="view-tasks"><span class="nav-icon" aria-hidden="true">▦</span>任务</button>
+    <button type="button" id="tab-new" aria-selected="false" aria-controls="view-new"><span class="nav-icon" aria-hidden="true">＋</span>新建</button>
+    <button type="button" id="tab-tpl" aria-selected="false" aria-controls="view-tpl"><span class="nav-icon" aria-hidden="true">≡</span>模板</button>
   </nav>
-  <button type="button" id="btn-refresh" class="ghost" title="重拉任务列表和额度缓存">刷新</button>
+  <div class="sidebar-note"><span aria-hidden="true">✧</span><p>夜深了，<br>让事情慢慢完成。</p><small>留一点时间给自己。</small></div>
+  <a id="link-home" class="ghost home-link" hidden></a>
+  <button type="button" id="btn-refresh" class="ghost" title="重拉任务列表和额度缓存">刷新数据 <span aria-hidden="true">↻</span></button>
 </header>
 
-<div class="wrap">
+<main class="wrap" id="main-content" tabindex="-1">
 
   <!-- ============ 任务页 ============ -->
-  <section id="view-tasks">
-    <div class="card" id="quota-box">
+  <section id="view-tasks" aria-label="任务工作台">
+    <div class="welcome">
+      <div><p class="eyebrow">留一盏灯，等一份进展</p><h1>夜班工作台<span class="heading-dot">.</span></h1><p class="welcome-copy">安排好接下来的事，剩下的交给夜班。</p>
+        <button type="button" class="primary" id="btn-create">＋ 安排新任务</button>
+      </div>
+      <div class="night-art" aria-hidden="true"><span class="orbit"></span><span class="moon"></span><span class="star star-one">✧</span><span class="star star-two">＋</span><span class="art-caption">TAKE YOUR TIME</span></div>
+    </div>
+    <div class="dashboard-grid">
+    <aside class="dashboard-side" aria-label="额度与预热">
+    <details class="card" id="quota-box" open>
+      <summary class="quota-summary"><span><span class="eyebrow">余量心中有数</span><strong>额度概览</strong></span><span class="quota-chevron" aria-hidden="true">⌄</span></summary>
       <div class="quota-head">
-        <h2 style="margin:0">额度（剩余）</h2>
+        <p class="hint quota-explainer">数字为剩余<br>色条为已用比例</p>
         <span class="quota-btns">
           <button type="button" id="btn-requery" class="ghost">都刷新</button>
         </span>
       </div>
       <div id="quota-body"><p class="hint">加载中…</p></div>
+      <details class="warmup-settings">
+      <summary>预热设置 <span class="hint">Claude Code</span></summary>
       <div class="warmup-row">
         <label class="inline"><input type="checkbox" id="w-enabled"> 每天预热 Claude Code 五小时窗口</label>
-        <span class="hint">（只预热 Claude Code；发一句话给 haiku，让窗口从那一刻起算；每个时刻各触发一次，改了自动保存。Codex 没有预热开关，见下方双额度里的说明）</span>
+        <span class="hint">在指定时刻向 Haiku 发一句话，开启五小时窗口，会消耗少量额度。每个时刻各触发一次，修改后自动保存；Codex 没有预热开关。</span>
       </div>
       <div id="w-times" class="warmup-times"></div>
       <button type="button" id="btn-warmup-add" class="ghost">＋ 再加一个时刻</button>
-      <p id="warmup-state" class="hint"></p>
-    </div>
+      <p id="warmup-state" class="hint" role="status"></p>
+      </details>
+    </details>
+    </aside>
+    <div class="task-column">
+    <div class="section-heading"><h2>任务动态</h2><span id="task-count" class="hint" role="status">正在读取…</span></div>
     <div id="orphan-box" class="orphan-box" hidden></div>
     <details class="box" id="bulk-box">
-      <summary>批量清理已收尾的任务</summary>
+      <summary>整理已结束的任务</summary>
       <div class="bulk-row">
         <label>从 <input type="date" id="bulk-from"></label>
         <label>到 <input type="date" id="bulk-to"></label>
@@ -54,9 +72,9 @@
       <p class="hint">按整条链删：链里每一班都已结束、最新一班是已完成/已合并/已丢弃/已取消、且不占工作树的才删；失败、需要人工的不动。日期按开跑时间算，「从」留空 = 结束日期之前的全部。先列出来，确认了才真删。</p>
       <div id="bulk-result"></div>
     </details>
-    <button type="button" id="cal-toggle" class="cal-toggle">展开日期</button>
+    <button type="button" id="cal-toggle" class="cal-toggle" aria-expanded="false" aria-controls="cal-panel">展开日期</button>
     <div id="cal-panel" class="cal-panel" hidden>
-      <input type="date" id="cal-jump" class="cal-jump">
+      <input type="date" id="cal-jump" class="cal-jump" aria-label="筛选任务日期">
       <div class="cal-head">
         <button type="button" id="cal-prev" class="ghost cal-nav" aria-label="上个月">‹</button>
         <span id="cal-title" class="cal-title"></span>
@@ -65,12 +83,16 @@
       <div id="cal-grid" class="cal-grid"></div>
       <div id="cal-filter-hint" class="cal-filter-hint" hidden></div>
     </div>
-    <div id="task-list"><p class="hint">加载中…</p></div>
+    <div id="task-list"><p class="empty-state">正在为你整理夜班进展…</p></div>
+    </div>
+    </div>
   </section>
 
   <!-- ============ 新建 / 编辑页 ============ -->
   <section id="view-new" hidden>
-    <h2 id="form-title">新建任务</h2>
+    <p class="eyebrow">把下一件事安排好</p>
+    <h1 id="form-title">新建任务</h1>
+    <p class="page-intro">写下想完成的事，选一个合适的时间出发。</p>
     <p id="edit-hint" class="edit-hint" hidden>
       这一班正在跑：改额度线立即生效，改任务内容影响下一班，这一班的提示词不能改。
     </p>
@@ -232,6 +254,8 @@
 
   <!-- ============ 模板页 ============ -->
   <section id="view-tpl" hidden>
+    <p class="eyebrow">每次开工，都有默契</p>
+    <h1>任务模板</h1>
     <p class="hint">下面按用途分了组；每条文案下面写着它的占位符和真实用途，改完统一点最下面「保存模板」。</p>
 
     <h2 class="tpl-group">施工</h2>
@@ -342,8 +366,8 @@
     <button type="button" id="btn-save-tpl" class="primary" style="width:100%">保存模板</button>
   </section>
 
-  <p class="foot"><button type="button" id="btn-logout" class="link-btn">退出登录（之后要重输口令）</button></p>
-</div>
+  <p class="foot"><span>夜猫子 · 把时间留给生活</span><button type="button" id="btn-logout" class="link-btn">退出登录（之后要重输口令）</button></p>
+</main>
 
 <!-- ============ 捎话弹层 ============ -->
 <div id="msg-overlay" class="overlay msg-overlay">
