@@ -659,6 +659,6 @@ def test_fetch_usage_claude_with_oauth_token_default_path_is_home_dot_claude(tmp
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / ".claude").mkdir()
-    (tmp_path / ".claude" / "rate_limits.json").write_text(json.dumps(SHARED_DOC), encoding="utf-8")
+    (tmp_path / ".claude" / "rate_limits.json").write_text(json.dumps(_fresh_shared_doc()), encoding="utf-8")
     usage = quota.fetch_usage_claude({"claude_bin": "/nonexistent/claude", "models": {}})
     assert usage["week_all_pct"] == 15
