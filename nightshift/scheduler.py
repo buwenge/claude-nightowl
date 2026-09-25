@@ -1052,6 +1052,30 @@ def _mark_delivery_pending(
     store.update_status(task_id, **_delivery_pending_fields(now, kind, turns_before, text_file))
 
 
+def _codex_quota_refreshed_early(task: dict, runner: str) -> int | None:
+    """Codex 五小时额度暂停期间，quota.json 里的读数已经回落到线下 → 返回
+    当前读数（调用方按"刷新时间已到"处理）；否则 None。
+
+    9/14 实录：17:09 按 100% 记下 21:53 恢复；17:15 用户用 reset credit
+    把读数拉回 51% 并捎话让它继续，班干了一轮又 Stop 回 waiting_wakeup，
+    此后调度器仍死等 21:53，四个多小时没人管。暂停是按 ≥ 线的新鲜读数记的，
+    之后任何一份 < 线的读数都只可能来自更新的抓取（fetch 失败写的是
+    usage=None，不算数），所以不必再比时间戳。只认 Codex：Claude 的
+    waiting_wakeup 是它自己设的闹钟，归它自己醒。"""
+    if runner != "codex":
+        return None
+    session_max = (task.get("guards") or {}).get("session_pct_max")
+    if session_max is None:
+        return None
+    usage = (quota.load_quota_file().get("codex") or {}).get("usage")
+    if not isinstance(usage, dict):
+        return None
+    pct = usage.get("session_pct")
+    if isinstance(pct, int) and pct < session_max:
+        return pct
+    return None
+
+
 def _send_quota_resume(
     task_id: str, window_id: str, text: str, now: datetime, turns_before: int
 ) -> list[str] | None:
@@ -1505,7 +1529,16 @@ def _check_running(
         and store.role_of(task) != "review"
     ):
         if now < parse_iso(paused_until):
-            return []
+            # 9/14：Codex 的读数已经回落到线下（用户用了 reset credit、或窗口
+            # 比快照说的更早滚动）就不再死等 paused_until，按"刷新时间已到"
+            # 走下面同一条恢复路径。
+            early = _codex_quota_refreshed_early(task, runner)
+            if early is None:
+                return []
+            store.append_event(
+                task_id,
+                f"Codex 五小时额度读数已回落到 {early}%（低于线），不再等 {paused_until}，提前恢复",
+            )
         codex_waiting_wakeup = (
             runner == "codex" and status.get("state") == "waiting_wakeup"
         )

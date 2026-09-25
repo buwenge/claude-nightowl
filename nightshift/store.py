@@ -24,6 +24,8 @@ from .context import context_limit_for
 __all__ = [
     "CODEX_BACKGROUND_INSTRUCTION",
     "CODEX_GIT_INSTRUCTION",
+    "CODEX_WRITABLE_ROOTS_INSTRUCTION",
+    "CODEX_WRITABLE_ROOTS_PREFIX",
     "ConfigInvalid",
     "ConfigMissing",
     "ENDED_STATES",
@@ -153,6 +155,21 @@ CODEX_GIT_INSTRUCTION = (
     "挂成只读，只有整条都是 git 命令才会在沙箱外执行，拼了别的整条就回沙箱、报 "
     "`index.lock: Read-only file system`。遇到这个报错不是权限坏了，把 git 命令"
     "拆出来单独再跑一次就行。"
+)
+# 9/14：Codex 班沙箱额外可写目录前言。workspace-write 沙箱默认只放开仓库目录
+# 与 F12 登记簿目录，写不了仓库之外的生产数据目录（9/14 实录：往
+# 生产数据目录落库报 Read-only file system，班就停下来等人
+# "把目录加进可写范围"，无人值守断在人工这一环）。放开哪些目录由
+# config.runners.codex.extra_writable_roots 按项目声明（launcher 拼进
+# writable_roots），这条前言只是把放开的清单告诉模型——免得它不知道能写、
+# 或往清单之外的路径反复撞墙。{roots} 由 launcher 渲染成顿号分隔的绝对路径；
+# 去重按 PREFIX 判（路径随项目变，整句不定长）。
+CODEX_WRITABLE_ROOTS_PREFIX = "本班沙箱在仓库目录与后台目录之外还放开了这些目录的写权限："
+CODEX_WRITABLE_ROOTS_INSTRUCTION = (
+    CODEX_WRITABLE_ROOTS_PREFIX
+    + "{roots}。要写的生产数据/运行库在这些目录里就直接写（建任务时已经授权），"
+    "不要因为\"沙箱只读\"停下来等人；确实要写这些目录之外的路径，把路径写进交接说明，"
+    "由调度器配置放开后下一班再做。"
 )
 # build 交接协议的末行指令（设计稿 §4.4）——交接文件末行 / 最终回复末行
 # 都用 next_marker 判，scheduler 与 hook 共用一个口径。

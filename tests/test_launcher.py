@@ -1529,3 +1529,88 @@ def test_new_window_env_args_passes_oauth_token_only_when_set(monkeypatch):
     assert launcher._new_window_env_args() == []
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
     assert launcher._new_window_env_args() == ["-e", "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-test"]
+
+
+def test_codex_command_extra_writable_roots_from_config_per_project():
+    """9/14：config.runners.codex.extra_writable_roots 按项目声明的目录要拼进
+    writable_roots（F12 登记簿目录之后，"*" 先于项目专属，去重保序）；
+    别的项目只拿到 "*"；review 角色（read-only）不带；没配时数组只有
+    登记簿一项（字节级不变，由上面的精确断言测试锁着）。"""
+    from nightshift import background_runner
+
+    task_id = "20260914-000000-aaaa"
+    task = {
+        "id": task_id, "title": "T", "project": "demo",
+        "runner": "codex", "model": "gpt-5.6-luna", "effort": "high", "role": "build",
+    }
+    config = {
+        **CODEX_CONFIG,
+        "runners": {
+            **CODEX_CONFIG["runners"],
+            "codex": {
+                **CODEX_CONFIG["runners"]["codex"],
+                "extra_writable_roots": {
+                    "*": ["/data/shared"],
+                    "demo": ["/data/demo/db", "/data/shared", " "],
+                },
+            },
+        },
+    }
+    bg_dir = json.dumps(str(background_runner.background_dir(task_id)))
+    cmd = launcher._codex_command(task, config, "/work/tree", None)
+    assert (
+        f"-c 'sandbox_workspace_write.writable_roots=[{bg_dir}, \"/data/shared\", \"/data/demo/db\"]'"
+        in cmd
+    )
+    other = launcher._codex_command({**task, "project": "moving"}, config, "/work/tree", None)
+    assert f"writable_roots=[{bg_dir}, \"/data/shared\"]'" in other
+    review_task = {
+        **task, "role": "review",
+        "review": {
+            "enabled": True, "runner": "codex", "model": "gpt-5.6-luna",
+            "effort": "high", "max_rounds": 5, "on_no_quota": "release",
+            "merge_policy": "manual", "criteria_text": "",
+        },
+    }
+    assert "writable_roots" not in launcher._codex_command(review_task, config, "/work/tree", None)
+    assert launcher.codex_extra_writable_roots(review_task, config) == []
+    # 配错形状（不是 dict / 不是 list）当没配
+    bad = {**config, "runners": {**config["runners"], "codex": {**config["runners"]["codex"], "extra_writable_roots": ["/x"]}}}
+    assert launcher.codex_extra_writable_roots(task, bad) == []
+
+
+def test_prompt_text_tells_codex_build_about_extra_writable_roots_once():
+    """9/14：额外放开了可写目录的 Codex build 班，prompt.txt 要多一句可写清单
+    （只出现一次；用户正文已带就不重复）；没配/不传 config/review 角色/
+    Claude 班都不出现这句。"""
+    task = {
+        "id": "20260914-000000-bbbb", "title": "T", "project": "demo",
+        "runner": "codex", "model": "gpt-5.6-luna", "effort": "high", "role": "build",
+        "prompt_final": "用户自己的正文。",
+    }
+    config = {
+        **CODEX_CONFIG,
+        "runners": {
+            **CODEX_CONFIG["runners"],
+            "codex": {
+                **CODEX_CONFIG["runners"]["codex"],
+                "extra_writable_roots": {"demo": ["/data/demo/db", "/data/demo/x"]},
+            },
+        },
+    }
+    text = launcher._prompt_text(task, config)
+    assert text.count(store.CODEX_WRITABLE_ROOTS_PREFIX) == 1
+    assert "/data/demo/db、/data/demo/x。" in text
+    # 顺序：F12 协议 → git 写法 → 可写清单 → 正文
+    assert text.index(store.CODEX_BACKGROUND_INSTRUCTION) < text.index(store.CODEX_GIT_INSTRUCTION) \
+        < text.index(store.CODEX_WRITABLE_ROOTS_PREFIX) < text.index("用户自己的正文。")
+    # 正文已带这句 → 不再追加
+    dup = {**task, "prompt_final": text}
+    assert launcher._prompt_text(dup, config).count(store.CODEX_WRITABLE_ROOTS_PREFIX) == 1
+    # 不传 config / 没配 / 别的项目 / Claude 班 → 没有这句
+    assert store.CODEX_WRITABLE_ROOTS_PREFIX not in launcher._prompt_text(task)
+    assert store.CODEX_WRITABLE_ROOTS_PREFIX not in launcher._prompt_text(task, CODEX_CONFIG)
+    assert store.CODEX_WRITABLE_ROOTS_PREFIX not in launcher._prompt_text({**task, "project": "moving"}, config)
+    assert store.CODEX_WRITABLE_ROOTS_PREFIX not in launcher._prompt_text(
+        {**task, "runner": "claude", "model": "claude-fable-5-1"}, config
+    )

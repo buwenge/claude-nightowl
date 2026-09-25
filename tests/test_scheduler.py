@@ -4738,3 +4738,65 @@ def test_delivery_pending_still_nudges_when_turns_unchanged_same_second(monkeypa
     assert fakes.send_keys_calls == [("@1", "")]
     status = store.read_status(tid)
     assert status["delivery_pending"]["nudged"] is True
+
+
+def test_codex_waiting_wakeup_resumes_early_when_quota_reading_drops_below_line(monkeypatch):
+    """9/14：Codex 因五小时额度到线转 waiting_wakeup 后，quota.json 的读数在
+    paused_until 之前就回落到线下（用户用了 reset credit），调度器不该死等
+    paused_until——按"刷新时间已到"敲它继续、清 quota_paused_until、记事件。
+    读数还在线上则照旧等。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t) or subprocess.CompletedProcess([], 0))
+    monkeypatch.setattr(sched.launcher, "open_notice_window", lambda *a, **k: None)
+    tid = make_task_codex(guards={"session_pct_max": 80, "weekly_pct_max": 95})
+    quota.write_quota_runner("codex", {
+        "usage": {"session_pct": 100, "session_resets": "2026-08-27T20:00:00Z",
+                  "week_all_pct": 1, "per_model": {}},
+        "fetched_at": scheduler.to_iso(NOW), "error": None,
+    })
+    store.update_status(tid, state="waiting_wakeup", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW),
+                        quota_paused_until="2026-08-27T20:00:00Z", quota_resume_sent=False)
+    later = NOW + timedelta(minutes=10)
+    sched.tick(CODEX_CONFIG, later)
+    assert sent == [] and store.read_status(tid)["state"] == "waiting_wakeup"
+    # 读数回落到 51%（< 80 线）→ 不等 20:00，直接敲继续
+    quota.write_quota_runner("codex", {
+        "usage": {"session_pct": 51, "session_resets": "2026-08-27T20:17:00Z",
+                  "week_all_pct": 1, "per_model": {}},
+        "fetched_at": scheduler.to_iso(later), "error": None,
+    })
+    sched.tick(CODEX_CONFIG, later + timedelta(minutes=1))
+    assert len(sent) == 1
+    st = store.read_status(tid)
+    assert st["quota_resume_sent"] and st["quota_paused_until"] is None
+    events = (store.task_dir(tid) / "events.log").read_text(encoding="utf-8")
+    assert "已回落到 51%" in events and "提前恢复" in events
+    sched.tick(CODEX_CONFIG, later + timedelta(minutes=2))
+    assert len(sent) == 1  # 只敲一次
+
+
+def test_claude_waiting_wakeup_ignores_codex_quota_reading(monkeypatch):
+    """9/14 反向：Claude 班挂着额度闹钟时，codex 分片读数低不影响它——闹钟归
+    它自己醒。"""
+    import nightshift.scheduler as sched
+    monkeypatch.setattr(sched.launcher, "window_alive", lambda *a, **k: True)
+    monkeypatch.setattr(sched.launcher, "pid_alive", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sched.launcher, "send_keys", lambda w, t: sent.append(t) or subprocess.CompletedProcess([], 0))
+    monkeypatch.setattr(sched.quota, "fetch_usage_claude",
+                        lambda c: {"session_pct": 1, "week_all_pct": 1, "per_model": {}, "raw": ""})
+    quota.write_quota_runner("codex", {
+        "usage": {"session_pct": 1, "session_resets": "2026-08-27T20:00:00Z",
+                  "week_all_pct": 1, "per_model": {}},
+        "fetched_at": scheduler.to_iso(NOW), "error": None,
+    })
+    tid = make_task(guards={"session_pct_max": 80, "weekly_pct_max": 95})
+    store.update_status(tid, state="waiting_wakeup", window_id="@1", pane_pid=1,
+                        last_event_at=scheduler.to_iso(NOW),
+                        quota_paused_until="2026-08-27T20:00:00Z")
+    sched.tick(CODEX_CONFIG, NOW + timedelta(minutes=10))
+    assert sent == [] and store.read_status(tid)["quota_paused_until"] == "2026-08-27T20:00:00Z"

@@ -313,6 +313,35 @@ def _claude_command(
     return " ".join(parts)
 
 
+def codex_extra_writable_roots(task: dict, config: dict) -> list[str]:
+    """config.runners.codex.extra_writable_roots 里本任务该额外放开写权限的
+    目录（绝对路径，去重保序）：键是项目名，"*" 对所有项目生效；只对 build
+    角色有意义（review 是 read-only 沙箱，永远空列表）。没配就是空列表——
+    命令行与提示词字节级不变。
+
+    9/14：某个项目的班要把数据合并进该项目的生产库
+    `/data/myproject/db`，workspace-write 沙箱只放开仓库与 F12
+    登记簿目录，落库报 Read-only file system，班停下来等人加目录——无人
+    值守断在人工这一环。生产数据目录按项目写在 config 里，起班时一并放开。
+    """
+    if store.role_of(task) == "review":
+        return []
+    rc = store.runner_config(config).get("codex") or {}
+    table = rc.get("extra_writable_roots") or {}
+    if not isinstance(table, dict):
+        return []
+    out: list[str] = []
+    for key in ("*", task.get("project")):
+        entries = table.get(key) if key is not None else None
+        if not isinstance(entries, list):
+            continue
+        for p in entries:
+            p = str(p).strip()
+            if p and p not in out:
+                out.append(p)
+    return out
+
+
 def _codex_command(
     task: dict, config: dict, workdir: str, resume_thread_id: str | None,
     *, prompt_file: Path | None = None,
@@ -360,8 +389,12 @@ def _codex_command(
         f"-c {_sq(effort_override)}",
     ]
     if not is_review:
-        bg_dir_literal = json.dumps(str(background_runner.background_dir(task["id"])))
-        writable_roots_override = f"sandbox_workspace_write.writable_roots=[{bg_dir_literal}]"
+        # 9/14：F12 登记簿目录之外再拼上 config 按项目声明的额外可写目录
+        # （codex_extra_writable_roots）；没配时数组只有登记簿一项，字节级不变。
+        roots = [str(background_runner.background_dir(task["id"]))]
+        roots += [r for r in codex_extra_writable_roots(task, config) if r not in roots]
+        roots_literal = ", ".join(json.dumps(r) for r in roots)
+        writable_roots_override = f"sandbox_workspace_write.writable_roots=[{roots_literal}]"
         parts.append(f"-c {_sq(writable_roots_override)}")
     parts += [
         f"--profile {_sq(profile)}",
@@ -451,8 +484,12 @@ def run_sh_text(
     return "\n".join(lines) + "\n"
 
 
-def _prompt_text(task: dict) -> str:
+def _prompt_text(task: dict, config: dict | None = None) -> str:
     """真正写进 prompt.txt 的提示词。
+
+    9/14：`config` 给了才知道 Codex 班额外放开了哪些可写目录
+    （codex_extra_writable_roots），据此追加一句可写清单前言；不给（或没配）
+    则不追加，输出与以前字节级一致。
 
     工作树任务保证带上运行时安全前言（不要 commit、只在工作树施工）：
     模板经 {worktree_instruction} 渲染过就已有这句；用户用 --prompt-file
@@ -477,9 +514,23 @@ def _prompt_text(task: dict) -> str:
     # S7.1 阻断五：F12 后台协议只适用于可写的 build 角色（起长任务、等
     # 后台完成）——review 角色只读、不该起后台进程，硬塞这段协议只会诱导
     # 它去做不该做的事。
+    # 9/14：Codex build 班若按 config 额外放开了仓库之外的可写目录，把清单
+    # 告诉模型（最先拼进去（后拼的排前面），最终顺序 F12 协议 → git 写法 → 可写清单
+    # → 正文）；没配就不出现这句。去重按固定前缀判，路径随项目变。
+    extra_roots = codex_extra_writable_roots(task, config) if config else []
+    if (
+        extra_roots
+        and store.effective_runner(task) == "codex"
+        and store.role_of(task) == "build"
+        and store.CODEX_WRITABLE_ROOTS_PREFIX not in text
+    ):
+        roots_line = store.render(
+            store.CODEX_WRITABLE_ROOTS_INSTRUCTION, roots="、".join(extra_roots)
+        )
+        text = roots_line + "\n\n" + text
     # 9/12：不建工作树的 Codex build 班再追加 git 提交写法前言（.git 只读、
     # 只有纯 git 命令才在沙箱外跑），先于 F12 那条拼进去，最终顺序是
-    # F12 协议 → git 写法 → 正文。
+    # F12 协议 → git 写法 → 可写清单 → 正文。
     if (
         store.effective_runner(task) == "codex"
         and store.role_of(task) == "build"
@@ -523,7 +574,7 @@ def write_task_files(
     (d / "exit_code").unlink(missing_ok=True)
     if store.effective_runner(task) != "codex":
         store.atomic_write_json(d / "settings.json", hook_settings(task["id"]))
-    store.atomic_write_text(d / "prompt.txt", _prompt_text(task))
+    store.atomic_write_text(d / "prompt.txt", _prompt_text(task, config))
     run_sh = d / "run.sh"
     store.atomic_write_text(
         run_sh, run_sh_text(task, config, session_id, resume_thread_id=resume_thread_id)
