@@ -5,14 +5,25 @@
 settings.json 里挂上即可：
     "statusLine": {"type": "command", "command": "python3 /path/to/statusline_rate_limits.py"}
 状态栏文字随便改；只要 record_rate_limits() 那段留着就行。
+
+好几个窗口会同时刷新状态栏，别的程序也可能往这个文件合并读数，所以"读出→合并→写回"
+要排队：所有写方都锁同一个 `~/.claude/.rate_limits.json.lock`（fcntl.flock 独占）。
+不排队的话后写的会冲掉先写的（实测 50 条读数丢 7 条）。状态栏最多等 1 秒，拿不到锁就
+跳过这次记录，不能让状态栏卡住。
 """
 
+import fcntl
 import json
+import os
 import pathlib
 import sys
+import tempfile
+import time
 from datetime import datetime, timezone
 
 RATE_LIMITS_FILE = pathlib.Path.home() / ".claude" / "rate_limits.json"
+RATE_LIMITS_LOCK = RATE_LIMITS_FILE.with_name(f".{RATE_LIMITS_FILE.name}.lock")
+LOCK_WAIT_SECONDS = 1.0
 
 
 def record_rate_limits(data: dict) -> None:
@@ -32,6 +43,25 @@ def record_rate_limits(data: dict) -> None:
         if not windows:
             return
         model = (data.get("model") or {}).get("id") or (data.get("model") or {}).get("display_name")
+        RATE_LIMITS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(RATE_LIMITS_LOCK, "a+") as lock_file:
+            deadline = time.monotonic() + LOCK_WAIT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        return  # 别的写方占着：这次不记，下次刷新再记
+                    time.sleep(0.01)
+            _merge_and_write(windows, model, now)
+    except Exception:
+        pass
+
+
+def _merge_and_write(windows: dict, model: str | None, now: float) -> None:
+    """持锁期间调用：读出、合并、原子写回。"""
+    try:
         try:
             doc = json.loads(RATE_LIMITS_FILE.read_text(encoding="utf-8"))
             if not isinstance(doc, dict):
@@ -52,10 +82,22 @@ def record_rate_limits(data: dict) -> None:
             "windows": merged,
             "models": models,
         })
-        RATE_LIMITS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = RATE_LIMITS_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-        tmp.replace(RATE_LIMITS_FILE)
+        # 临时文件名每次不同（固定名的话两个写方会抢同一个临时文件），权限跟原文件一致
+        fd, tmp_name = tempfile.mkstemp(dir=str(RATE_LIMITS_FILE.parent), prefix=f".{RATE_LIMITS_FILE.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=1)
+            try:
+                os.chmod(tmp_name, RATE_LIMITS_FILE.stat().st_mode & 0o777)
+            except FileNotFoundError:
+                os.chmod(tmp_name, 0o644)
+            os.replace(tmp_name, RATE_LIMITS_FILE)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
     except Exception:
         pass
 
