@@ -875,6 +875,10 @@ def _copy_common_fields(parent_task: dict) -> dict:
         task["guards"] = parent_task["guards"]
     if parent_task.get("chain"):
         task["chain"] = parent_task["chain"]
+    # 保活是整条流水线的长期开关：建任务时关了，后继也得关（2026-11-07 以前漏了，
+    # 后继吃 create_task 缺省 true）；旧任务没这个字段就不传，后继照旧按开
+    if isinstance(parent_task.get("keepalive"), dict):
+        task["keepalive"] = dict(parent_task["keepalive"])
     return task
 
 

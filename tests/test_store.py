@@ -438,6 +438,29 @@ def test_keepalive_validation_rejects_bad_shapes():
 
 
 
+
+def test_successors_inherit_keepalive():
+    """建任务时关掉保活（长期开关），续班、起审稿、返工班都要沿用——以前
+    _copy_common_fields 漏了这一项，后继吃 create_task 的缺省 true，只有
+    第一班是关的（2026-11-07 修）。旧任务没这个字段的后继照旧按开。"""
+    config = dict(CONFIG)
+    config["models"] = {"claude-fable-5": {"context_limit": 500000}}
+    config["default_context_limit"] = 200000
+    config["chain_template"] = "{task} 第 {shift} 班 {handover}"
+    for enabled in (False, True, None):
+        over = {} if enabled is None else {"keepalive": {"enabled": enabled}}
+        parent = store.load_task(store.create_task(make_task(**over), config))
+        if enabled is None:
+            del parent["keepalive"]  # 退回 S8 之前的旧记录形状
+        same = store.load_task(store.create_same_role_successor(parent, "交接", config))
+        cross = store.load_task(store.create_cross_role_successor(
+            parent, config, role="build", round_=2, prompt_final="返工",
+            parent_next_state="chained",
+        ))
+        want = {"enabled": enabled is not False}
+        assert same["keepalive"] == want
+        assert cross["keepalive"] == want
+
 # ---------- 2026-11-07：deny_prompts（要授权的操作自动拒掉，不弹窗等人）----------
 
 
