@@ -580,6 +580,32 @@ def test_update_task_keepalive_rejects_extra_key(authed):
     assert status == 400
 
 
+
+# ---------- 2026-11-07：deny_prompts 表单落盘口 ----------
+
+
+def test_create_and_update_task_deny_prompts(authed):
+    task_id = make_task(authed, "缺省会弹窗")
+    assert store.load_task(task_id)["deny_prompts"] is False
+    base = {
+        "title": "无人值守", "project": "demo", "model": "claude-fable-5",
+        "effort": "high", "run_at": "2026-08-28T18:00:00Z",
+        "task_text": "正文", "prompt_final": "提示词",
+    }
+    status, _, body = authed.request("POST", "/api/tasks", {**base, "deny_prompts": True})
+    assert status == 201, body
+    assert store.load_task(body["id"])["deny_prompts"] is True
+    status, _, body = authed.request("POST", "/api/tasks", {**base, "deny_prompts": "yes"})
+    assert status == 400
+    # 未跑可改；起跑后这一班的设置文件已经写好，不许再改
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {"deny_prompts": True})
+    assert status == 200, body
+    assert store.load_task(task_id)["deny_prompts"] is True
+    store.update_status(task_id, state="working")
+    status, _, body = authed.request("PUT", f"/api/tasks/{task_id}", {"deny_prompts": False})
+    assert status == 400
+    assert store.load_task(task_id)["deny_prompts"] is True
+
 # ---------- S5①：worktree / review 字段与孤儿工作树 API ----------
 
 

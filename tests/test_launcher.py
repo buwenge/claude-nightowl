@@ -470,6 +470,25 @@ def test_relaunch_resume_new_window_failure_returns_error(monkeypatch):
     assert "new-window" in result
 
 
+
+def test_write_task_files_deny_prompts_adds_permission_setting(tmp_path):
+    """勾了"无人值守"的 Claude 班：settings.json 多一条 denyInsteadOfPrompting
+    （CC 2.1.319 起，要人点授权的操作直接拒、这一轮接着干），hooks 照旧；
+    没勾的不带 permissions 键，跟以前一样。"""
+    for flag in (True, False):
+        task_id, config = make_task(project_path="/home/user/projects/demo", deny_prompts=flag)
+        launcher.write_task_files(
+            store.load_task(task_id), config, "01234567-89ab-cdef-0123-456789abcdef"
+        )
+        settings = json.loads(
+            (store.task_dir(task_id) / "settings.json").read_text(encoding="utf-8")
+        )
+        assert len(settings["hooks"]) == 6
+        if flag:
+            assert settings["permissions"] == {"denyInsteadOfPrompting": True}
+        else:
+            assert "permissions" not in settings
+
 def test_write_task_files_codex_skips_settings_json(tmp_path):
     task_id, config = make_task_codex(project_path="/home/user/projects/demo")
     task = store.load_task(task_id)

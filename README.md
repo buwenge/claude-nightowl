@@ -110,7 +110,7 @@ Everything lives in `~/.nightshift/config.json` (override the directory with `NI
 | `warmup` | Optional: send one cheap message at a fixed local time so your five-hour window starts earlier in the day. |
 | `*_template`, `*_text` | Every message the system ever sends into a session — the task prompt, the handover prompt, context/quota notices, review instructions, keepalive probes. All editable in the web UI's *Templates* tab; placeholders are filled in for you. |
 
-Per-task overrides (`guards`, `chain`, `review`, `keepalive`, `worktree`, `trigger`) are set in the new-task form or in `tasks/<id>/task.json`.
+Per-task overrides (`guards`, `chain`, `review`, `keepalive`, `worktree`, `trigger`, `deny_prompts`) are set in the new-task form or in `tasks/<id>/task.json`.
 
 ## The handover protocol
 

@@ -1106,7 +1106,8 @@ function taskCard(item, now, chainIds, opts) {
   }
   card.appendChild(el("div", { class: "task-head" }, headKids));
   var metaText = "项目 " + task.project + " · 模型 " + task.model + " · 档位 " + task.effort +
-    (chainIds && chainIds.length > 1 ? " · 共 " + chainIds.length + " 班" : "");
+    (chainIds && chainIds.length > 1 ? " · 共 " + chainIds.length + " 班" : "") +
+    (task.deny_prompts === true && runner !== "codex" ? " · 无人值守（授权自动拒）" : "");
   // 有 thread_id 只展示短后缀，不把本机 rollout 路径/完整会话 id 露给网页
   if (runner === "codex" && status.thread_id) {
     metaText += " · 会话 …" + String(status.thread_id).slice(-8);
@@ -1448,6 +1449,7 @@ function worktreeFromForm() {
   return {
     worktree: wtOn,
     keepalive: { enabled: $("f-keepalive").checked },
+    deny_prompts: $("f-deny-prompts").checked,
     review: review
   };
 }
@@ -1482,6 +1484,7 @@ function applyEditMode() {
   // S5③：活跃编辑不许改工作树开关（这一班已经在某个目录里干了）
   $("f-worktree").disabled = active;
   $("f-keepalive").disabled = active;  // S8：长期开关只在未跑状态可改
+  $("f-deny-prompts").disabled = active;  // 这一班的设置文件起跑时已写好
   setTriggerMode(document.querySelector('input[name="f-trigger"]:checked').value);
   syncWorktreeUI();
 }
@@ -1506,6 +1509,7 @@ function enterCreate() {
   populateModelEffortForRunner("claude");
   $("f-worktree").checked = true;   // 新建默认建树
   $("f-keepalive").checked = true;  // 新建默认开保活
+  $("f-deny-prompts").checked = false;  // 新建默认照旧弹窗，人不在才勾
   $("f-mergepolicy").value = "manual";
   $("f-review-enabled").checked = false;  // 新建默认关审稿
   var reviewRadio = document.querySelector('input[name="f-review-runner"][value="claude"]');
@@ -1564,6 +1568,7 @@ function enterEditWith(item) {
   $("f-worktree").checked = task.worktree === true;
   // S8②：keepalive 缺字段（旧任务）按开显示，跟 scheduler 的兜底口径一致
   $("f-keepalive").checked = !task.keepalive || task.keepalive.enabled !== false;
+  $("f-deny-prompts").checked = task.deny_prompts === true;  // 旧任务缺字段按没勾显示
   var review = task.review || {};
   $("f-mergepolicy").value = review.merge_policy || "manual";
   // 未跑任务必须完整回填 review，包括关闭审稿的旧 S5 任务（占位对象没有
@@ -1821,7 +1826,8 @@ function submitNewForm(ev) {
       title: title, project: project, runner: currentRunner(), model: model, effort: effort,
       task_text: text, prompt_final: prompt, guards: guards, chain: chain,
       trigger: trigger || { type: "time" },
-      worktree: wt.worktree, keepalive: wt.keepalive, review: wt.review
+      worktree: wt.worktree, keepalive: wt.keepalive, deny_prompts: wt.deny_prompts,
+      review: wt.review
     };
     if (mode !== "after") body.run_at = runAtIso;  // after 模式不发
   }

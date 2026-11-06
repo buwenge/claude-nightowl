@@ -110,7 +110,7 @@ python3 -m nightshift passwd                    # 设置/覆盖网页口令
 | `warmup` | 可选：每天固定时刻发一句便宜的话，让五小时窗口早点开始算。 |
 | `*_template`、`*_text` | 系统往会话里发的每一句话——任务提示词、续班提示词、上下文/额度提醒、审稿指令、保活探针。网页"模板"页都能改；占位符自动填。 |
 
-按任务的覆盖项（`guards`、`chain`、`review`、`keepalive`、`worktree`、`trigger`）在新建表单里设，或直接改 `tasks/<id>/task.json`。
+按任务的覆盖项（`guards`、`chain`、`review`、`keepalive`、`worktree`、`trigger`、`deny_prompts`）在新建表单里设，或直接改 `tasks/<id>/task.json`。
 
 ## 交接协议
 

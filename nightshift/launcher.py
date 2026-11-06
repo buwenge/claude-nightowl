@@ -573,7 +573,13 @@ def write_task_files(
     # 上一轮窗口留下的 exit_code 先删：那是旧工人的死讯，不能拿来误判新窗口
     (d / "exit_code").unlink(missing_ok=True)
     if store.effective_runner(task) != "codex":
-        store.atomic_write_json(d / "settings.json", hook_settings(task["id"]))
+        settings = hook_settings(task["id"])
+        if task.get("deny_prompts") is True:
+            # CC 2.1.319 起：要人点授权的操作直接拒、这一轮接着干；工人收到的
+            # 是"没人能点、自动拒了"，不是"用户拒绝"。这个开关只认用户级、
+            # --settings、托管设置，写在项目自己的 settings 文件里不生效。
+            settings["permissions"] = {"denyInsteadOfPrompting": True}
+        store.atomic_write_json(d / "settings.json", settings)
     store.atomic_write_text(d / "prompt.txt", _prompt_text(task, config))
     run_sh = d / "run.sh"
     store.atomic_write_text(

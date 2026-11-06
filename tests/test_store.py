@@ -437,6 +437,43 @@ def test_keepalive_validation_rejects_bad_shapes():
             store.create_task(make_task(**over), CONFIG)
 
 
+
+# ---------- 2026-11-07：deny_prompts（要授权的操作自动拒掉，不弹窗等人）----------
+
+
+def test_new_task_deny_prompts_defaults_false():
+    tid = store.create_task(make_task(), CONFIG)
+    assert store.load_task(tid)["deny_prompts"] is False
+
+
+def test_create_task_deny_prompts_true_persists_and_rejects_non_bool():
+    tid = store.create_task(make_task(deny_prompts=True), CONFIG)
+    assert store.load_task(tid)["deny_prompts"] is True
+    for bad in ("true", 1, {"enabled": True}):
+        with pytest.raises(ValueError):
+            store.create_task(make_task(deny_prompts=bad), CONFIG)
+
+
+def test_successors_inherit_deny_prompts():
+    """续班、返工班都沿用建任务时的选择——勾了只管第一班就等于没勾；
+    旧任务（没这个字段）的后继是 False，跟以前一样会弹窗。"""
+    config = dict(CONFIG)
+    config["models"] = {"claude-fable-5": {"context_limit": 500000}}
+    config["default_context_limit"] = 200000
+    config["chain_template"] = "{task} 第 {shift} 班 {handover}"
+    for flag in (True, False, None):
+        over = {} if flag is None else {"deny_prompts": flag}
+        parent = store.load_task(store.create_task(make_task(**over), config))
+        if flag is None:
+            del parent["deny_prompts"]  # 退回旧记录形状
+        same = store.load_task(store.create_same_role_successor(parent, "交接", config))
+        cross = store.load_task(store.create_cross_role_successor(
+            parent, config, role="build", round_=2, prompt_final="返工",
+            parent_next_state="chained",
+        ))
+        assert same["deny_prompts"] is bool(flag)
+        assert cross["deny_prompts"] is bool(flag)
+
 def test_old_task_json_missing_keepalive_stays_absent():
     """旧任务（S8 上线前落盘）没有 keepalive 字段——不加载即回写，
     scheduler._maybe_keepalive 读不到时按 guards.keepalive 的兜底走。"""

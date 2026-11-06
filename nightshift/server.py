@@ -97,6 +97,7 @@ _EDITABLE_UNRUN = (
     "task_text", "prompt_final", "guards", "chain", "trigger",
     "worktree", "review",  # S5：没起跑还能改工作树/审稿占位形状
     "keepalive",  # S8：长期保活开关——只在未跑状态可改，活跃态走 /keepalive 控制 API
+    "deny_prompts",  # 2026-11-07：起跑后这一班的 settings.json 已写好，改了也不生效
 )
 # 活跃状态（launching/working/waiting_background/waiting_wakeup/idle）：
 # 只许改标题/任务内容/额度与上下文线/换班设置/触发方式
@@ -1010,6 +1011,8 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(data["worktree"], bool):
                 return self._send_json(400, {"error": "worktree 必须是布尔值"})
             task["worktree"] = data["worktree"]
+        if data.get("deny_prompts") is not None:
+            task["deny_prompts"] = data["deny_prompts"]  # 类型由 store.validate_task 查
         try:
             task_id = store.create_task(task, store.load_config())
         except ValueError as exc:

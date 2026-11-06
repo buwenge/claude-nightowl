@@ -598,6 +598,9 @@ def validate_task(task: dict, config: dict, *, task_id: str | None = None) -> st
     # S5：worktree 只有显式 true/false 两种
     if task.get("worktree") is not None and not isinstance(task.get("worktree"), bool):
         raise ValueError("worktree 必须是布尔值")
+    # 2026-11-07：无人值守——要授权的操作自动拒掉、不弹窗等人（只写进 Claude 班的 settings.json）
+    if task.get("deny_prompts") is not None and not isinstance(task.get("deny_prompts"), bool):
+        raise ValueError("deny_prompts 必须是布尔值")
     # S8：keepalive 是任务自己的长期显式覆盖（跟 guards.keepalive 那个全局
     # 兜底开关并存，保活判断在 scheduler._check_running 里），只认 enabled 一个键。
     keepalive = task.get("keepalive")
@@ -707,6 +710,8 @@ def create_task(task: dict, config: dict) -> str:
     data["runner"] = data.get("runner") or "claude"  # S6：新任务显式落盘缺省值
     if data.get("worktree") is None:
         data["worktree"] = True  # 新任务缺省建树
+    if data.get("deny_prompts") is None:
+        data["deny_prompts"] = False  # 缺省照旧弹窗：开夜班时人常常还在，人不在才自己勾
     validate_task(data, config)  # 先原样校验：review 形状不对在这里报人话错误
     review = data.get("review")
     if not isinstance(review, dict):
@@ -861,6 +866,8 @@ def _copy_common_fields(parent_task: dict) -> dict:
         "pipeline_id": pipeline_id_of(parent_task),
         "worktree": worktree_enabled(parent_task),
         "review": dict(parent_task.get("review") or {}),
+        # 旧任务没这个字段 → False，跟以前一样会弹窗
+        "deny_prompts": parent_task.get("deny_prompts") is True,
     }
     if parent_task.get("retry_max") is not None:
         task["retry_max"] = parent_task["retry_max"]

@@ -149,6 +149,11 @@
       <p class="hint" id="f-worktree-off-hint" hidden>老式模式：直接在项目目录施工，不打存档点；联动审稿只能关。</p>
 
       <div class="choice-row">
+        <label class="inline"><input type="checkbox" id="f-deny-prompts"> 无人值守（要点授权的操作直接拒掉、接着干别的，不弹窗等人）</label>
+      </div>
+      <p class="hint">人不在电脑前才勾。施工方会被告知"没人能点、自动拒了"，不会当成你不让做；被拒的事它会写进交接。续班、返工班跟着沿用；只管 Claude Code 施工班（Codex 和审稿班本来就不弹窗）。</p>
+
+      <div class="choice-row">
         <label class="inline"><input type="checkbox" id="f-keepalive" checked> 保活（施工/审稿会话长时间没动静时探一下；这是长期开关，运行中"暂停/恢复保活"在任务卡上单独控制）</label>
       </div>
 

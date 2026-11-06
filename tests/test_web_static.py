@@ -82,9 +82,10 @@ def test_app_js_has_merge_discard_orphan_and_state_texts():
         "task.worktree === true",
         # POST/PUT/preview 都带 worktree
         "worktree: $(\"f-worktree\").checked",
-        # S8②：提交体扩成 worktree + keepalive + review 三件套（旧断言字符串
-        # 同步更新，新字符串见 test_app_js_review_block_helpers_and_submission_fields）
-        "worktree: wt.worktree, keepalive: wt.keepalive, review: wt.review",
+        # S8②：提交体扩成 worktree + keepalive + review 三件套，2026-11-07 再加
+        # deny_prompts（旧断言字符串同步更新，完整字段见
+        # test_app_js_review_block_helpers_and_submission_fields）
+        "worktree: wt.worktree, keepalive: wt.keepalive, deny_prompts: wt.deny_prompts,",
         # 有树时不展示必然被后端 409 的“删除”假按钮
         "TERMINAL_STATES.indexOf(state) >= 0 && !hasTree",
     ):
@@ -247,6 +248,7 @@ def test_index_has_keepalive_and_review_form_controls():
     html = (WEB / "index.html").read_text(encoding="utf-8")
     for piece in (
         'id="f-keepalive"',
+        'id="f-deny-prompts"',
         'id="box-review"', 'id="f-review-enabled"', 'id="f-review-worktree-hint"',
         'id="review-fields"',
         'name="f-review-runner"',
@@ -269,8 +271,13 @@ def test_app_js_review_block_helpers_and_submission_fields():
         # 关工作树时提交强制 review.enabled=false，不只靠 disabled 样式
         "var reviewOn = wtOn && $(\"f-review-enabled\").checked;",
         "review.on_no_quota = (onnq && onnq.value) || rd.on_no_quota || \"release\";",
-        # 提交体：worktree + keepalive + review 一起发
-        "worktree: wt.worktree, keepalive: wt.keepalive, review: wt.review",
+        # 提交体：worktree + keepalive + deny_prompts + review 一起发
+        "worktree: wt.worktree, keepalive: wt.keepalive, deny_prompts: wt.deny_prompts,",
+        "deny_prompts: $(\"f-deny-prompts\").checked,",
+        # 新建默认不勾、编辑回填旧任务缺字段按没勾、起跑后不许改
+        "$(\"f-deny-prompts\").checked = false;",
+        "$(\"f-deny-prompts\").checked = task.deny_prompts === true;",
+        "$(\"f-deny-prompts\").disabled = active;",
         "keepalive: { enabled: $(\"f-keepalive\").checked }",
         # 预览带 runner，Codex 任务不会仍按 Claude 上下文渲染
         "worktree: $(\"f-worktree\").checked, runner: currentRunner()",
